@@ -67,14 +67,23 @@ for path, true_bpm, true_key in files:
     timeline = []
     comp = 0.0
     margin = 0.0
+    raw_out = 0
+    raw_n = 0
     t = WIN / 2
     while t <= len(y) / SR:
         seg = y[max(0, int((t - WIN) * SR)):int(t * SR)]
         c0 = time.perf_counter()
+        y_h, y_p = core.split_harmonic_percussive(seg)
         prev = float(np.median(bpm_hist)) if bpm_hist else 0.0
-        bpm = core.fold_bpm(core.estimate_tempo(seg, SR, prev))
-        res = core.chroma_pcp(seg, SR)
+        bpm = core.fold_bpm(core.estimate_tempo(y_p, SR, prev))
+        if bpm <= 0:
+            bpm = core.fold_bpm(core.estimate_tempo(seg, SR, prev))
+        res = core.chroma_pcp(seg, SR, y_harm=y_h)
         comp += time.perf_counter() - c0
+        if bpm > 0:
+            raw_n += 1
+            if abs(bpm - true_bpm) / true_bpm > 0.03:
+                raw_out += 1
         if res is not None:
             p, b = res
             ema_p = p if ema_p is None else (1 - key_a) * ema_p + key_a * p
@@ -135,4 +144,5 @@ for path, true_bpm, true_key in files:
     print(f"  {path:24s} BPM-Lock: {bl_s}"
           f" | Tonart-Lock: {kl_s}"
           f" | Ende: {b_end:6.1f} BPM, {k_end:8s} (Vorsprung {margin:.3f})"
+          f" | Roh-Ausreisser {raw_out}/{raw_n}"
           f" | {comp / len(timeline) * 1000:4.0f} ms/Analyse")

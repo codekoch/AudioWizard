@@ -196,17 +196,22 @@ class Shared:
 def estimate_tempo(y, sr, prev_bpm=0.0):
     """Schaetzt das Tempo direkt aus der Autokorrelation der Onset-Huellkurve.
 
+    Am besten bekommt diese Funktion den PERKUSSIVEN Anteil des Signals
+    (siehe split_harmonic_percussive): dann bestimmen die Drums das Tempo,
+    und dazukommende Instrumente/Flaechen koennen die Onset-Kurve nicht
+    verschmutzen.
+
     Statt sich auf librosas grobe (und durch einen 120-BPM-Prior verzerrte)
     tempo()-Schaetzung zu verlassen, wird die staerkste Periodizitaet direkt im
     erlaubten Bereich [MIN_BPM, MAX_BPM] gesucht:
-      1. Onset-Huellkurve (Median ueber die Mel-Baender -- robuster gegen
-         einzelne breitbandige Stoerer als das Mittel) -> Autokorrelation.
+      1. Onset-Huellkurve -> Autokorrelation. (Aggregation ueber die
+         Mel-Baender per Mittelwert: im Test auf dem perkussiven Anteil
+         und auch auf dem Voll-Mix treffsicherer als der Median.)
       2. Autokorrelation pro Lag auf die Zahl der Summanden normieren --
          die rohe Autokorrelation faellt linear mit dem Lag und bevorzugt
          sonst systematisch hohe BPM.
       3. Kammfilter: jeder Lag-Kandidat wird durch seine 2- und 3-fache
-         Periode gestuetzt. Das echte Tempo hat solche Vielfachen, ein
-         zufaelliger Peak nicht -> weniger Ausreisser.
+         Periode sowie das Achtelraster der halben Periode gestuetzt.
       4. Sanfter Tempo-Prior (log-normal um TEMPO_CENTER_BPM), um Oktav-
          Mehrdeutigkeiten (halbes/doppeltes Tempo) aufzuloesen.
       5. Peak parabolisch interpolieren -> sub-Frame-genaues Tempo.
@@ -214,12 +219,20 @@ def estimate_tempo(y, sr, prev_bpm=0.0):
          geliefert -- besser keine Schaetzung als eine zufaellige.
     """
     try:
-        onset_env = librosa.onset.onset_strength(y=y, sr=sr, hop_length=ONSET_HOP,
-                                                 aggregate=np.median)
+        onset_env = librosa.onset.onset_strength(y=y, sr=sr,
+                                                 hop_length=ONSET_HOP)
+    except Exception:
+        return 0.0
+    return _tempo_from_onset_env(onset_env, sr / ONSET_HOP, prev_bpm)
+
+
+def _tempo_from_onset_env(onset_env, fr, prev_bpm=0.0):
+    """Tempo-Scoring (Schritte 2-5 von estimate_tempo) auf einer fertigen
+    Onset-Huellkurve mit fr Frames pro Sekunde."""
+    try:
         if not np.any(onset_env):
             return 0.0
 
-        fr = sr / ONSET_HOP                       # Frames pro Sekunde
         oe = onset_env - onset_env.mean()
         n = len(oe)
         ac = np.correlate(oe, oe, mode='full')[n - 1:]
@@ -290,7 +303,25 @@ def fold_bpm(bpm):
     return bpm
 
 
-def chroma_pcp(y, sr):
+def split_harmonic_percussive(y):
+    """EINE HPSS-Zerlegung fuer beide Analyse-Pfade: (y_harm, y_perc).
+
+    Der harmonische Anteil (Flaechen, Bass, Gesang) geht in die Tonart-
+    Erkennung, der perkussive (Drums: kurze, breitbandige Transienten)
+    in die Tempo-Erkennung. Die Trennung erfolgt nach Signalstruktur,
+    nicht nach Frequenz -- ein Basslauf im Kick-Bereich landet trotzdem
+    im harmonischen Teil. Bei Fehlern wird (y, y) geliefert."""
+    try:
+        D = librosa.stft(y)
+        H, P = librosa.decompose.hpss(D, margin=4.0)
+        y_h = librosa.istft(H, length=len(y))
+        y_p = librosa.istft(P, length=len(y))
+        return y_h, y_p
+    except Exception:
+        return y, y
+
+
+def chroma_pcp(y, sr, y_harm=None):
     """Chroma-Gesamtprofil + Bass-Profil: (pcp, bass) mit je 12 Werten
     (auf Summe 1 normiert) oder None.
 
@@ -306,10 +337,11 @@ def chroma_pcp(y, sr):
     Dur von der Mollparallele zu unterscheiden (gleiches Tonmaterial!).
     """
     try:
-        try:
-            y_harm = librosa.effects.harmonic(y, margin=4.0)
-        except Exception:
-            y_harm = y
+        if y_harm is None:      # kein vorab getrennter Anteil uebergeben
+            try:
+                y_harm = librosa.effects.harmonic(y, margin=4.0)
+            except Exception:
+                y_harm = y
         chroma = librosa.feature.chroma_cqt(y=y_harm, sr=sr)
         pcp = chroma.mean(axis=1)
         s = pcp.sum()
@@ -381,12 +413,13 @@ def estimate_beat_phase(y, sr, bpm):
 
     Die Onset-Huellkurve wird auf die Beat-Periode gefaltet (Histogramm der
     Phasenlage, spaete Frames staerker gewichtet, damit die Phase zum
-    aktuellen Fensterende passt); der staerkste Phasen-Bin ist der Beat."""
+    aktuellen Fensterende passt); der staerkste Phasen-Bin ist der Beat.
+    Wie estimate_tempo arbeitet die Funktion am besten auf dem perkussiven
+    Anteil des Signals."""
     try:
         if bpm <= 0:
             return None
-        oe = librosa.onset.onset_strength(y=y, sr=sr, hop_length=ONSET_HOP,
-                                          aggregate=np.median)
+        oe = librosa.onset.onset_strength(y=y, sr=sr, hop_length=ONSET_HOP)
         if not np.any(oe):
             return None
         fr = sr / ONSET_HOP
@@ -542,9 +575,15 @@ def analysis_worker(shared, audio_q, stop_event):
         try:
             y = buf                 # liegt bereits in ANALYSIS_SR vor
             sr = ANALYSIS_SR
+            # Drums von Flaechen/Bass/Gesang trennen: das Tempo kommt aus
+            # dem perkussiven, die Tonart aus dem harmonischen Anteil.
+            y_harm, y_perc = split_harmonic_percussive(y)
             prev = float(np.median(bpm_hist)) if bpm_hist else 0.0
-            bpm = fold_bpm(estimate_tempo(y, sr, prev))
-            chroma_res = chroma_pcp(y, sr)
+            bpm = fold_bpm(estimate_tempo(y_perc, sr, prev))
+            if bpm <= 0:
+                # kaum Perkussives (z. B. Ballade) -> Voll-Mix versuchen
+                bpm = fold_bpm(estimate_tempo(y, sr, prev))
+            chroma_res = chroma_pcp(y, sr, y_harm=y_harm)
         except Exception as e:
             if not err_shown:
                 msg = f"[Analyse-Fehler: {type(e).__name__}: {e}]"
@@ -624,7 +663,7 @@ def analysis_worker(shared, audio_q, stop_event):
             want_beat = shared.beat_sync
         beat_update = None
         if want_beat and target > 0:
-            offs = estimate_beat_phase(y, sr, target)
+            offs = estimate_beat_phase(y_perc, sr, target)
             if offs is not None:
                 beat_update = (buf_end_wall - offs, 60.0 / target)
 
