@@ -58,6 +58,7 @@ for path, true_bpm, true_key in files:
     y, _ = librosa.load(os.path.join(HERE, path), sr=SR, mono=True,
                         duration=DUR)
     bpm_hist = deque(maxlen=core.BPM_MEDIAN_LEN)
+    tuner = core.TuningEstimator()
     key_a = min(1.0, STEP / core.KEY_EMA_SEC)
     ema_p = ema_b = None
     cum_p = np.zeros(12)
@@ -75,10 +76,11 @@ for path, true_bpm, true_key in files:
         c0 = time.perf_counter()
         y_h, y_p = core.split_harmonic_percussive(seg)
         prev = float(np.median(bpm_hist)) if bpm_hist else 0.0
-        bpm = core.fold_bpm(core.estimate_tempo(y_p, SR, prev))
+        bpm = core.fold_bpm(core.estimate_tempo(y_p, SR, prev), prev)
         if bpm <= 0:
-            bpm = core.fold_bpm(core.estimate_tempo(seg, SR, prev))
-        res = core.chroma_pcp(seg, SR, y_harm=y_h)
+            bpm = core.fold_bpm(core.estimate_tempo(seg, SR, prev), prev)
+        tuning = tuner.update(y_h, SR)
+        res = core.chroma_pcp(seg, SR, y_harm=y_h, tuning=tuning)
         comp += time.perf_counter() - c0
         if bpm > 0:
             raw_n += 1
@@ -92,11 +94,11 @@ for path, true_bpm, true_key in files:
             cum_b = cum_b + b
             cum_n += 1
         if cum_n:
-            cand, margin = core.classify_key(
+            cand, margin, cand2 = core.classify_key(
                 0.5 * ema_p + 0.5 * cum_p / cum_n,
                 0.5 * ema_b + 0.5 * cum_b / cum_n, with_margin=True)
         else:
-            cand, margin = "—", 0.0
+            cand, margin, cand2 = "—", 0.0, "—"
         if cand != key_disp:
             if key_disp == "—" or cand == "—":
                 key_disp, key_pend, key_pend_n = cand, None, 0
@@ -108,6 +110,10 @@ for path, true_bpm, true_key in files:
                 key_pend, key_pend_n = cand, 1
         else:
             key_pend, key_pend_n = None, 0
+        # "Sicher"-Logik wie im Worker
+        conf = (cand == key_disp and cand != "—"
+                and margin >= core.KEY_CONFIDENT_MARGIN
+                and cum_n >= core.KEY_CONFIDENT_MIN_N)
         if bpm > 0:
             bpm_hist.append(bpm)
             if len(bpm_hist) >= 10:
@@ -116,33 +122,41 @@ for path, true_bpm, true_key in files:
                 omed = float(np.median(bpm_hist))
                 ratio = rmed / omed
                 alias = any(abs(ratio / h - 1.0) < 0.04
-                            for h in (4 / 3, 3 / 2, 2 / 3, 3 / 4))
+                            for h in (4 / 3, 3 / 2, 2 / 3, 3 / 4, 2.0, 0.5))
                 if (max(recent) / min(recent) - 1.0) < 0.03 and \
                         abs(rmed - omed) / omed > core.TEMPO_FLUSH_DEV and \
                         not alias:
                     while len(bpm_hist) > 5:
                         bpm_hist.popleft()
         tgt = float(np.median(bpm_hist)) if bpm_hist else 0.0
-        timeline.append((t, tgt, key_disp))
+        timeline.append((t, tgt, key_disp, conf))
         t += STEP
 
     def lock_time(good):
         lock = None
-        for tt, b, k in timeline:
-            if good(b, k):
+        for tt, b, k, c in timeline:
+            if good(b, k, c):
                 if lock is None:
                     lock = tt
             else:
                 lock = None
         return lock
 
-    bl = lock_time(lambda b, k: b > 0 and abs(b - true_bpm) / true_bpm <= 0.02)
-    kl = lock_time(lambda b, k: k == true_key)
-    tt, b_end, k_end = timeline[-1]
+    bl = lock_time(lambda b, k, c: b > 0
+                   and abs(b - true_bpm) / true_bpm <= 0.02)
+    kl = lock_time(lambda b, k, c: k == true_key)
+    cl = lock_time(lambda b, k, c: c and k == true_key)
+    falsch_sicher = sum(1 for tt, b, k, c in timeline
+                        if c and k != true_key)
+    tt, b_end, k_end, _c = timeline[-1]
     bl_s = f"{bl:5.1f} s" if bl else "  nie  "
     kl_s = f"{kl:5.1f} s" if kl else "  nie  "
+    cl_s = f"{cl:5.1f} s" if cl else "  nie  "
     print(f"  {path:24s} BPM-Lock: {bl_s}"
           f" | Tonart-Lock: {kl_s}"
-          f" | Ende: {b_end:6.1f} BPM, {k_end:8s} (Vorsprung {margin:.3f})"
+          f" | Sicher: {cl_s}"
+          f" | falsch-sicher {falsch_sicher}x"
+          f" | Ende: {b_end:6.1f} BPM, {k_end:8s}"
+          f" (Vorsprung {margin:.3f} vor {cand2})"
           f" | Roh-Ausreisser {raw_out}/{raw_n}"
           f" | {comp / len(timeline) * 1000:4.0f} ms/Analyse")

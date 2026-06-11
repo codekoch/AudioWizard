@@ -74,6 +74,7 @@ WINDOW_SECONDS        = 8.0     # Laenge des Analysefensters
 ANALYSIS_INTERVAL     = 1.0     # wie oft (Sek.) neu analysiert wird
 ANALYSIS_SR           = 22050   # Analyse-Abtastrate (Fenster wird ggf. heruntergerechnet)
 ONSET_HOP             = 256     # Hop der Onset-Huellkurve (kleiner = feineres Tempo-Raster)
+CHROMA_HOP            = 512     # Hop des Chromagramms (chroma_cqt-Standard)
 PPQN                  = 24      # MIDI-Clock: 24 Pulse pro Viertelnote
 
 INPUT_SR              = 22050   # Wunschrate fuer den Eingangs-Modus (sounddevice)
@@ -98,6 +99,28 @@ TEMPO_CONTINUITY      = 0.15    # leichter Score-Bonus (15 %) fuer Kandidaten na
                                 #   am aktuellen Tempo -> unterdrueckt kurze
                                 #   4/3- und 3/2-Aliase (z. B. 96 statt 72), ohne
                                 #   echte Tempowechsel zu blockieren
+KEY_TUNE_LOCK_N       = 5       # Stimmung des Stuecks ueber so viele Analysen
+                                #   schaetzen (Median), dann bis zum naechsten
+                                #   Song-Reset einfrieren. Faengt Material ab,
+                                #   das nicht auf A440 liegt (gepitchte Tracks,
+                                #   aeltere Aufnahmen) -- mit fest 0.0 landet
+                                #   dessen Energie zwischen den Chroma-Bins.
+                                #   0 = aus (feste Standardstimmung).
+CHROMA_LOG_COMP       = 10.0    # Log-Kompression des Chromas: log1p(K*chroma).
+                                #   Staucht laute Teiltoene, hebt leise an --
+                                #   das Tonprofil haengt dann weniger an der
+                                #   Abmischung (Standard in der Literatur). 0 = aus.
+CHROMA_SALIENCE       = True    # Obertongewichtung vor der Chroma-Faltung
+                                #   (Salience nach Gomez' HPCP-Idee): jeder
+                                #   CQT-Bin wird durch die Energie auf seinen
+                                #   Vielfachen gestuetzt, Nicht-Peaks fallen
+                                #   weg. Daempft die Obertoene gespielter
+                                #   Toene (h3 = Quinte, h5 = grosse Terz!),
+                                #   die sonst das Tonprofil verschmieren.
+                                #   Nebeneffekt: EIN CQT fuer Gesamt- UND
+                                #   Bass-Chroma (statt zwei).
+SAL_HARMONICS         = (1, 2, 3, 4)        # gestuetzt durch diese Vielfachen
+SAL_WEIGHTS           = (1.0, 0.5, 0.33, 0.25)  # ... mit diesen Gewichten
 KEY_EMA_SEC           = 15.0    # Zeitkonstante der schnellen Chroma-Mittelung;
                                 #   die Tonart-Entscheidung nutzt 50 % davon und
                                 #   50 % Gesamtmittel seit Songbeginn -> reagiert
@@ -107,9 +130,65 @@ BASS_TONIC_WEIGHT     = 0.30    # Bonus fuer Tonarten, deren Grundton den Bass
                                 #   Mollparallele -- gleiches Tonmaterial!)
 KEY_SWITCH_CONFIRM    = 2       # Tonartwechsel erst nach N uebereinstimmenden
                                 #   Folge-Schaetzungen anzeigen (gegen Flackern)
-KEY_CONFIDENT_MARGIN  = 0.04    # Mindestvorsprung des besten Tonart-Kandidaten
+KEY_CONFIDENT_MARGIN  = 0.12    # Mindestvorsprung des besten Tonart-Kandidaten
                                 #   vor dem zweitbesten, damit die Tonart als
-                                #   "sicher" gilt (Anzeige sonst gedimmt)
+                                #   "sicher" gilt (Anzeige sonst gedimmt).
+                                #   Skala haengt an der Chroma-Aufbereitung
+                                #   (Log-Kompression, Salience) -- nach
+                                #   Aenderungen dort per Sweep in
+                                #   eval_detection.py neu kalibrieren.
+KEY_CONFIDENT_MIN_N   = 16      # Mindestzahl Analysen (~Sekunden), bevor die
+                                #   Tonart ueberhaupt als "sicher" gelten darf.
+                                #   16 schneidet die hochmargigen Fruehfehler
+                                #   (harmonisch anders zentrierte Intros) weg,
+                                #   die keine Vorsprung-Huerde erwischt, und
+                                #   kostet korrekte Stuecke nur wenige Sekunden
+                                #   "sicher"-Anzeige (per Sweep nachgemessen).
+CHORD_ENABLED         = False   # Akkorderkennung an/aus (GUI-Option). Der
+                                #   Akkord kommt aus dem juengsten Stueck des
+                                #   OHNEHIN berechneten Chromagramms -- kostet
+                                #   praktisch keine zusaetzliche CPU, folgt
+                                #   aber nur im Analyse-Takt (~1 s).
+CHORD_TAIL_SEC        = 2.5     # so viele juengste Sekunden des Chromagramms
+                                #   bestimmen den aktuellen Akkord. 1,5 s war
+                                #   im eval_chords-Proxy klar schlechter
+                                #   (rauschigeres Chroma -> mehr leiterfremde
+                                #   Deutungen und mehr Flackern).
+CHORD_TAIL_BEAT       = False   # Akkord-Fenster an der letzten Beat-Grenze
+                                #   ausrichten (Laenge = Zeit seit letztem Beat
+                                #   + CHORD_TAIL_BEATS Perioden). GETESTET UND
+                                #   VERWORFEN: bei gleicher effektiver Laenge
+                                #   schlechter als das feste Fenster -- die
+                                #   Beat-Phase aus dem 8-s-Fenster jittert zu
+                                #   stark, um als Fensteranker zu taugen.
+CHORD_TAIL_BEATS      = 3       # ganze Beat-Perioden des beat-synchronen
+                                #   Fensters (nur bei CHORD_TAIL_BEAT)
+CHORD_TAIL_MIN        = 0.6     # Klemmen der beat-synchronen Fensterlaenge:
+CHORD_TAIL_MAX        = 2.5     #   nie kuerzer als ~1 Beat Chroma-Substanz,
+                                #   nie laenger als ein typischer Akkord
+CHORD_BASS_WEIGHT     = 0.4     # Bonus, wenn der Akkord-Grundton den Bass
+                                #   dominiert -- trennt Umkehrungen und ton-
+                                #   verwandte Deutungen (C-Dur vs. Am7)
+CHORD_STICKY          = 0.02    # kleiner Score-Bonus fuer den zuletzt
+                                #   erkannten Akkord (nur noch fuer die
+                                #   Einzelbild-Funktion classify_chord; der
+                                #   Worker glaettet stattdessen per HMM, s. u.)
+CHORD_SELF_P          = 0.85    # HMM-Glaettung (ChordTracker): Wahrschein-
+                                #   lichkeit, dass der Akkord von einer Analyse
+                                #   (~1 s) zur naechsten derselbe bleibt --
+                                #   hoeher = traeger, weniger Flackern.
+                                #   (0.85 lag im eval_chords-Proxy gleichauf
+                                #   mit 0.9, reagiert aber schneller auf
+                                #   echte Wechsel.)
+CHORD_TEMP            = 10.0    # Schaerfe der Softmax, die Template-Scores in
+                                #   Beobachtungswahrscheinlichkeiten uebersetzt
+                                #   (hoeher = Beobachtung schlaegt Traegheit
+                                #   schneller)
+KEY_CHORD_PRIOR       = 0.05    # Score-Bonus fuer leitereigene Akkorde der
+                                #   aktuell erkannten Tonart -- unterdrueckt
+                                #   exotische Fehldeutungen (0 = aus)
+CHORD_LOG_PATH        = None    # Textdatei fuers Akkord-Protokoll (GUI-
+                                #   Option); None = kein Protokoll
 ANALYSIS_QUEUE_MAX    = 256     # max. gepufferte Bloecke fuer die Analyse --
                                 #   verhindert unbegrenztes Speicherwachstum,
                                 #   falls die Analyse haengt (aeltester fliegt)
@@ -122,6 +201,8 @@ BEAT_NUDGE_GAIN       = 0.1     # Anteil des Phasenfehlers, der pro Tick
 
 LOG_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)),
                         "audio2midi.log")
+CHORD_LOG_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                              "akkorde.txt")
 
 
 def log_message(text):
@@ -149,6 +230,11 @@ def feed_analysis(audio_q, block):
 SILENCE_DB            = -50.0   # Pegel darunter gilt als Stille
 SILENCE_RESET_SEC     = 2.0     # so lange Stille (Pause/Songwechsel) -> Analyse zuruecksetzen
 CLOCK_SLEW_BPM_PER_S  = 4.0     # max. Tempoaenderung der Clock pro Sekunde
+CLOCK_JUMP_FRAC       = 0.20    # weicht das Zieltempo um mehr als 20 % von der
+                                #   Clock ab, sofort springen statt slewen --
+                                #   das Slewen wuerde sonst ~15+ s dauern, in
+                                #   denen Clock und BPM-Anzeige sichtbar
+                                #   auseinanderlaufen (bis Faktor ~2)
 INITIAL_BPM           = 120.0
 
 AUDIO_BLOCKSIZE       = 2048    # Blockgroesse fuer den Eingangs-Modus
@@ -158,13 +244,51 @@ MONITOR_QUEUE_MAX     = 8       # max. gepufferte Bloecke beim Mithören (begren
 
 # Tonprofile (Index 0 = Grundton). Sha'ath-Profile (wie in "KeyFinder"):
 # unterscheiden Dur und seine Moll-Parallele zuverlaessiger als Krumhansl-Kessler
-# -- im Test gegen echte Stuecke deutlich treffsicherer.
+# -- im Test gegen echte Stuecke deutlich treffsicherer. Auch die
+# Albrecht-Shanahan-Korpusprofile (2013) wurden per eval_detection.py
+# gemessen und VERWORFEN: auf Pop-/Dance-Material klar schlechter
+# (Paralleltonart-Verwechslung; sie stammen aus Klassik-Korpora).
 KS_MAJOR = np.array([6.6, 2.0, 3.5, 2.3, 4.6, 4.0,
                      2.5, 5.2, 2.4, 3.7, 2.3, 3.4])
 KS_MINOR = np.array([6.5, 2.7, 3.5, 5.4, 2.6, 3.5,
                      2.5, 5.2, 4.0, 2.7, 4.3, 3.2])
 NOTE_NAMES = ['C', 'C#', 'D', 'D#', 'E', 'F',
               'F#', 'G', 'G#', 'A', 'A#', 'B']
+
+# Akkord-Schablonen: Intervalle (Halbtoene ueber dem Grundton) -> Gewicht.
+# Septimen schwaecher gewichtet: der Vierklang gewinnt nur, wenn die Septime
+# wirklich klar im Signal liegt, sonst bleibt es der Dreiklang. sus2 fehlt
+# bewusst (Csus2 = gleiche Tonklassen wie Gsus4), aug ebenso (grossterz-
+# symmetrisch, Grundton nicht bestimmbar).
+CHORD_TYPES = [
+    ("",     {0: 1.0, 4: 1.0, 7: 1.0}),            # Dur
+    ("m",    {0: 1.0, 3: 1.0, 7: 1.0}),            # Moll
+    ("7",    {0: 1.0, 4: 1.0, 7: 1.0, 10: 0.7}),   # Dominantseptakkord
+    ("maj7", {0: 1.0, 4: 1.0, 7: 1.0, 11: 0.7}),   # grosse Septime
+    ("m7",   {0: 1.0, 3: 1.0, 7: 1.0, 10: 0.7}),   # Mollseptakkord
+    ("dim",  {0: 1.0, 3: 1.0, 6: 1.0}),            # vermindert
+    ("sus4", {0: 1.0, 5: 1.0, 7: 1.0}),            # Quartvorhalt
+]
+
+
+def _build_chord_templates():
+    """(namen, matrix): je Grundton x Akkordtyp eine zentrierte, normierte
+    12er-Schablone. Damit liefert matrix @ chroma_zentriert_normiert die
+    Pearson-Korrelation ALLER Akkorde in einem Schritt."""
+    names, rows = [], []
+    for i in range(12):
+        for suffix, ivs in CHORD_TYPES:
+            t = np.zeros(12)
+            for iv, w in ivs.items():
+                t[(i + iv) % 12] = w
+            t -= t.mean()
+            rows.append(t / np.linalg.norm(t))
+            names.append(NOTE_NAMES[i] + suffix)
+    return names, np.vstack(rows)
+
+
+CHORD_NAMES, _CHORD_MAT = _build_chord_templates()
+_CHORD_IDX = {n: k for k, n in enumerate(CHORD_NAMES)}
 
 
 # ===========================================================================
@@ -177,6 +301,7 @@ class Shared:
         self.raw_bpm = 0.0
         self.key = "—"
         self.key_confident = False  # Tonart-Vorsprung gross genug? (Anzeige)
+        self.chord = "—"          # aktueller Akkord (nur bei CHORD_ENABLED)
         self.level = 0.0          # aktueller Eingangspegel (RMS, linear)
         self.level_time = 0.0     # perf_counter des letzten Pegel-Updates
         self.capture_sr = float(ANALYSIS_SR)  # aktuelle Aufnahmerate (live aenderbar)
@@ -184,6 +309,10 @@ class Shared:
         self.hold = False         # Analyse eingefroren (lange Breaks):
                                   # Ergebnisse bleiben stehen, kein
                                   # Stille-Reset, Clock laeuft konstant
+        self.reset_request = False  # manueller Neustart der Analyse (GUI):
+                                  # der Worker leert Puffer und Historie
+                                  # und beginnt von vorn; die Clock stoppt
+                                  # bis zur naechsten echten Schaetzung
         self.beat_sync = False    # Clock auf den Beat einrasten (GUI-Option)
         self.beat_anchor = 0.0    # perf_counter-Zeit eines erkannten Beats
         self.beat_period = 0.0    # Beat-Abstand in Sekunden
@@ -293,13 +422,35 @@ def _tempo_from_onset_env(onset_env, fr, prev_bpm=0.0):
         return 0.0
 
 
-def fold_bpm(bpm):
+FOLD_EDGE_TOL = 1.04    # Schaetzungen knapp (< 4 %) ausserhalb des BPM-Bereichs
+                        #   sind DOPPELDEUTIG: z. B. 141 kann Mess-Jitter eines
+                        #   140-BPM-Stuecks sein (richtig: 140) ODER das
+                        #   Doppeltempo eines 70.5-BPM-Stuecks (richtig: 70.5).
+                        #   Stures Oktav-Falten liess die Anzeige bei
+                        #   Grenz-Tempi aufs halbe Tempo kippen, waehrend die
+                        #   Clock nur langsam nachzog ("fast doppelt so
+                        #   schnell") -> mit bisherigem Tempo als Kontext
+                        #   gewinnt der Kandidat, der ihm naeher liegt.
+
+
+def fold_bpm(bpm, prev=0.0):
+    """BPM per Oktav-Falten in [MIN_BPM, MAX_BPM] bringen. Liegt der Wert nur
+    knapp ausserhalb (FOLD_EDGE_TOL) und gibt es ein bisheriges Tempo (prev),
+    entscheidet die Naehe zu prev zwischen Bereichsgrenze und Oktav-Faltung."""
     if bpm <= 0:
         return bpm
+    edge = 0.0
+    if MAX_BPM < bpm <= MAX_BPM * FOLD_EDGE_TOL:
+        edge = MAX_BPM
+    elif MIN_BPM > bpm >= MIN_BPM / FOLD_EDGE_TOL:
+        edge = MIN_BPM
     while bpm < MIN_BPM:
         bpm *= 2.0
     while bpm > MAX_BPM:
         bpm /= 2.0
+    if edge > 0 and prev > 0 and \
+            abs(math.log2(edge / prev)) < abs(math.log2(bpm / prev)):
+        return edge
     return bpm
 
 
@@ -321,9 +472,53 @@ def split_harmonic_percussive(y):
         return y, y
 
 
-def chroma_pcp(y, sr, y_harm=None):
+class TuningEstimator:
+    """Stimmung (Abweichung von A440) des laufenden Stuecks schaetzen.
+
+    Die ersten KEY_TUNE_LOCK_N Analysen wird die Stimmung aus dem
+    harmonischen Anteil geschaetzt und der Median gebildet, danach ist
+    der Wert bis reset() eingefroren. So bleibt die Chroma-Zuordnung
+    innerhalb eines Stuecks stabil (das Problem der frueheren
+    Pro-Fenster-Schaetzung), aber nicht-A440-Material (gepitchte Tracks,
+    aeltere Aufnahmen) landet trotzdem auf den richtigen Bins.
+    Einheit: Bruchteile eines CQT-Bins bei 36 Bins/Oktave -- direkt an
+    chroma_cqt(tuning=...) durchreichbar."""
+
+    def __init__(self):
+        self.hist = []
+        self.value = 0.0
+
+    def reset(self):
+        self.hist = []
+        self.value = 0.0
+
+    def update(self, y_harm, sr):
+        """Naechstes Analysefenster einarbeiten; liefert die aktuelle
+        (ggf. schon eingefrorene) Stimmung."""
+        if len(self.hist) >= KEY_TUNE_LOCK_N:
+            return self.value
+        try:
+            with warnings.catch_warnings():
+                warnings.simplefilter("ignore")  # "empty frequency set" u. ae.
+                t = float(librosa.estimate_tuning(y=y_harm, sr=sr,
+                                                  bins_per_octave=36))
+            if math.isfinite(t):
+                self.hist.append(t)
+                self.value = float(np.median(self.hist))
+        except Exception:
+            pass
+        return self.value
+
+
+def chroma_pcp(y, sr, y_harm=None, tail_sec=0.0, tuning=0.0):
     """Chroma-Gesamtprofil + Bass-Profil: (pcp, bass) mit je 12 Werten
     (auf Summe 1 normiert) oder None.
+
+    Mit tail_sec > 0 kommen zwei weitere Profile dazu -- (pcp, bass,
+    tail, tail_bass) -- die nur die juengsten tail_sec Sekunden des
+    Chromagramms mitteln: "was klingt gerade" fuer die Akkorderkennung.
+    Das Chromagramm liegt fuer die Tonart ohnehin vor, der Schwanz kostet
+    also nur zwei kleine Mittelwerte extra.
 
     Vor der Chroma-Berechnung wird der harmonische Anteil isoliert (HPSS).
     So verwaschen Schlagzeug/Perkussion das Tonprofil nicht -- gerade bei
@@ -342,23 +537,67 @@ def chroma_pcp(y, sr, y_harm=None):
                 y_harm = librosa.effects.harmonic(y, margin=4.0)
             except Exception:
                 y_harm = y
-        chroma = librosa.feature.chroma_cqt(y=y_harm, sr=sr)
+        # tuning: FESTER Wert je Stueck (TuningEstimator) statt der
+        # chroma_cqt-eigenen Schaetzung pro Fenster. Die warnt bei tonlosen
+        # Fenstern ("empty frequency set"), kostet CPU und laesst die
+        # Chroma-Zuordnung zwischen den Analysefenstern springen.
+        fmin = librosa.note_to_hz('C1')
+        bchroma = None
+        if CHROMA_SALIENCE:
+            # CQT einmal ueber 7 Oktaven, Obertongewichtung, dann Faltung;
+            # das Bass-Chroma kommt aus den unteren 3 Oktaven DERSELBEN CQT.
+            n_bins = 7 * 36
+            C = np.abs(librosa.cqt(y_harm, sr=sr, fmin=fmin, n_bins=n_bins,
+                                   bins_per_octave=36, tuning=tuning,
+                                   hop_length=CHROMA_HOP))
+            freqs = librosa.cqt_frequencies(n_bins=n_bins, fmin=fmin,
+                                            bins_per_octave=36)
+            C = librosa.salience(C, freqs=freqs, harmonics=SAL_HARMONICS,
+                                 weights=SAL_WEIGHTS, fill_value=0.0)
+            chroma = librosa.feature.chroma_cqt(
+                C=C, sr=sr, fmin=fmin, n_octaves=7, bins_per_octave=36,
+                hop_length=CHROMA_HOP)
+            if BASS_TONIC_WEIGHT > 0:
+                bchroma = librosa.feature.chroma_cqt(
+                    C=C[:3 * 36], sr=sr, fmin=fmin, n_octaves=3,
+                    bins_per_octave=36, hop_length=CHROMA_HOP)
+        else:
+            chroma = librosa.feature.chroma_cqt(y=y_harm, sr=sr,
+                                                tuning=tuning,
+                                                hop_length=CHROMA_HOP)
+            if BASS_TONIC_WEIGHT > 0:   # = 0 spart das zweite CQT
+                try:
+                    bchroma = librosa.feature.chroma_cqt(
+                        y=y_harm, sr=sr, fmin=fmin,
+                        n_octaves=3, tuning=tuning, hop_length=CHROMA_HOP)
+                except Exception:
+                    bchroma = None
+        if CHROMA_LOG_COMP > 0:
+            chroma = np.log1p(CHROMA_LOG_COMP * chroma)
+            if bchroma is not None:
+                bchroma = np.log1p(CHROMA_LOG_COMP * bchroma)
         pcp = chroma.mean(axis=1)
         s = pcp.sum()
         if s <= 0:
             return None
         pcp = pcp / s             # Normierung -> laute Stellen dominieren nicht
         bass = np.zeros(12)
-        if BASS_TONIC_WEIGHT > 0:   # = 0 spart das zweite CQT (z. B. Pi 4)
-            try:
-                bchroma = librosa.feature.chroma_cqt(
-                    y=y_harm, sr=sr, fmin=librosa.note_to_hz('C1'), n_octaves=3)
-                bass = bchroma.mean(axis=1)
-                bs = bass.sum()
-                bass = bass / bs if bs > 0 else np.zeros(12)
-            except Exception:
-                pass
-        return pcp, bass
+        if bchroma is not None:
+            bass = bchroma.mean(axis=1)
+            bs = bass.sum()
+            bass = bass / bs if bs > 0 else np.zeros(12)
+        if tail_sec <= 0:
+            return pcp, bass
+        k = max(1, int(round(tail_sec * sr / CHROMA_HOP)))
+        tail = chroma[:, -k:].mean(axis=1)
+        ts = tail.sum()
+        tail = tail / ts if ts > 0 else None
+        tail_bass = np.zeros(12)
+        if bchroma is not None:
+            tail_bass = bchroma[:, -k:].mean(axis=1)
+            bts = tail_bass.sum()
+            tail_bass = tail_bass / bts if bts > 0 else np.zeros(12)
+        return pcp, bass, tail, tail_bass
     except Exception:
         return None
 
@@ -380,49 +619,208 @@ def classify_key(pcp, bass=None, with_margin=False):
     Tonmaterial her identisch sind (z. B. C-Dur vs. A-Moll: liegt vor
     allem C im Bass, ist es C-Dur; liegt A im Bass, A-Moll).
 
-    with_margin=True liefert (name, vorsprung) -- der Vorsprung des besten
-    vor dem zweitbesten Kandidaten ist ein brauchbares Konfidenzmass."""
+    with_margin=True liefert (name, vorsprung, zweiter) -- der Vorsprung des
+    besten vor dem zweitbesten Kandidaten ist ein brauchbares Konfidenzmass,
+    und WER der Zweite ist, zeigt beim Nachmessen (eval_detection.py), worin
+    die Ambiguitaet besteht (z. B. Paralleltonart vs. Quint-Nachbar)."""
     if pcp is None or not np.any(pcp):
-        return ("—", 0.0) if with_margin else "—"
-    best_score = -2.0
-    second = -2.0
-    best_name = "—"
+        return ("—", 0.0, "—") if with_margin else "—"
     use_bass = bass is not None and np.any(bass)
+    scores = []
     for i in range(12):
         bonus = 0.0
         if use_bass:
             bonus = BASS_TONIC_WEIGHT * (bass[i] + 0.5 * bass[(i + 7) % 12])
         maj = np.corrcoef(pcp, np.roll(KS_MAJOR, i))[0, 1] + bonus
         mino = np.corrcoef(pcp, np.roll(KS_MINOR, i))[0, 1] + bonus
-        for score, name in ((maj, f"{NOTE_NAMES[i]} Dur"),
-                            (mino, f"{NOTE_NAMES[i]} Moll")):
-            if score > best_score:
-                if best_name != name:
-                    second = best_score
-                best_score, best_name = score, name
-            elif score > second:
-                second = score
+        scores.append((maj, f"{NOTE_NAMES[i]} Dur"))
+        scores.append((mino, f"{NOTE_NAMES[i]} Moll"))
+    scores.sort(key=lambda t: t[0], reverse=True)
     if with_margin:
-        return best_name, best_score - second
-    return best_name
+        return scores[0][1], scores[0][0] - scores[1][0], scores[1][1]
+    return scores[0][1]
+
+
+
+def chord_tail_sec(onset_env, fr, bpm):
+    """Laenge des Akkord-Fensters in Sekunden (fuer chroma_pcp/tail_sec).
+
+    Mit bekanntem Tempo wird das Fenster an der letzten Beat-Grenze
+    ausgerichtet: Zeit seit dem letzten Beat plus eine Beat-Periode, geklemmt
+    auf [CHORD_TAIL_MIN, CHORD_TAIL_MAX]. Akkordwechsel liegen auf
+    Zaehlzeiten -- ein beat-ausgerichtetes Fenster mittelt deshalb nicht
+    ueber den Wechsel hinweg, das feste 1,5-s-Fenster tat das regelmaessig.
+    Ohne Tempo oder Beat-Phase: feste CHORD_TAIL_SEC."""
+    if not CHORD_TAIL_BEAT or bpm <= 0:
+        return CHORD_TAIL_SEC
+    offs = _beat_phase_from_onset_env(onset_env, fr, bpm)
+    if offs is None:
+        return CHORD_TAIL_SEC
+    return float(min(CHORD_TAIL_MAX,
+                     max(CHORD_TAIL_MIN,
+                         offs + CHORD_TAIL_BEATS * 60.0 / bpm)))
+
+
+def chord_scores(pcp, bass=None):
+    """Rohe Template-Scores fuer ALLE Akkorde auf einem Chroma-Profil:
+    Pearson-Korrelation je Schablone plus Bass-Bonus. None, wenn das
+    Profil leer/unbrauchbar ist.
+
+    Der Bass-Bonus entscheidet zwischen tonverwandten Deutungen (C-Dur
+    und Am7 teilen drei Toene): Grundton (und schwaecher: Quinte) im
+    Bass spricht fuer den Akkord auf diesem Grundton."""
+    if pcp is None or not np.any(pcp):
+        return None
+    p = pcp - pcp.mean()
+    n = float(np.linalg.norm(p))
+    if n <= 1e-9:
+        return None
+    scores = _CHORD_MAT @ (p / n)          # Pearson je Schablone
+    if bass is not None and np.any(bass):
+        root_bonus = CHORD_BASS_WEIGHT * (bass + 0.5 * np.roll(bass, -7))
+        scores = scores + np.repeat(root_bonus, len(CHORD_TYPES))
+    return scores
+
+
+def classify_chord(pcp, bass=None, prev=None):
+    """Einzelbild-Klassifikation: bester Akkord zum Chroma (ohne HMM).
+    Der kleine Bonus fuer den bisherigen Akkord (prev) verhindert Flackern
+    an der Kippgrenze. Rueckgabe: Akkordname ('C', 'Am7', ...) oder '—'.
+    Im Worker laeuft stattdessen ChordTracker (HMM-Glaettung)."""
+    scores = chord_scores(pcp, bass)
+    if scores is None:
+        return "—"
+    if prev is not None:
+        k = _CHORD_IDX.get(prev)
+        if k is not None:
+            scores[k] += CHORD_STICKY
+    return CHORD_NAMES[int(np.argmax(scores))]
+
+
+_MAJ_SCALE = (0, 2, 4, 5, 7, 9, 11)
+_MIN_SCALE = (0, 2, 3, 5, 7, 8, 10, 11)   # natuerlich + Leitton (V/V7 in Moll)
+_diatonic_masks = {}                       # Tonartname -> Bool-Maske (Cache)
+
+
+def _diatonic_mask(key):
+    """Bool-Maske ueber CHORD_NAMES: liegt der Akkord vollstaendig im
+    Tonmaterial der Tonart ('C Dur', 'D Moll', ...)? None bei unbekanntem
+    Tonartnamen. Moll enthaelt zusaetzlich den erhoehten Leitton, damit
+    die in Moll uebliche Dur-Dominante (A7 in d-Moll) leitereigen zaehlt."""
+    mask = _diatonic_masks.get(key)
+    if mask is not None:
+        return mask
+    try:
+        note, mode = key.rsplit(" ", 1)
+        root = NOTE_NAMES.index(note)
+    except (AttributeError, ValueError):
+        return None
+    scale = {(root + i) % 12
+             for i in (_MAJ_SCALE if mode == "Dur" else _MIN_SCALE)}
+    mask = np.zeros(len(CHORD_NAMES), dtype=bool)
+    k = 0
+    for r in range(12):
+        for _suffix, ivs in CHORD_TYPES:
+            mask[k] = all((r + iv) % 12 in scale for iv in ivs)
+            k += 1
+    _diatonic_masks[key] = mask
+    return mask
+
+
+class ChordTracker:
+    """Online-Glaettung der Akkorderkennung: HMM-Forward-Algorithmus.
+
+    Es wird eine Wahrscheinlichkeitsverteilung ueber alle Akkorde
+    mitgefuehrt. Pro Analyse erst der Uebergang -- mit CHORD_SELF_P bleibt
+    der Akkord derselbe, der Rest verteilt sich gleichmaessig --, dann die
+    Beobachtung (Softmax der Template-Scores). Anders als ein fester
+    Sticky-Bonus ist die Traegheit damit evidenz-abhaengig: klare neue
+    Akkorde setzen sich sofort durch, bei mehrdeutigem Chroma bleibt der
+    bisherige stehen. Das ist das Standard-Glaettungsmodell der Literatur
+    (Sheh & Ellis 2003); mehr als dieses simple Modell bringt kaum etwas
+    (Cho & Bello 2014, Korzeniowski & Widmer 2017).
+
+    Liegt eine erkannte Tonart vor, bekommen deren leitereigene Akkorde
+    zusaetzlich einen kleinen Score-Bonus (KEY_CHORD_PRIOR)."""
+
+    def __init__(self):
+        self.belief = None
+        self.chord = "—"
+
+    def reset(self):
+        self.belief = None
+        self.chord = "—"
+
+    def update(self, pcp, bass=None, key=None):
+        """Neues Chroma-Profil einarbeiten; liefert den aktuellen Akkord."""
+        scores = chord_scores(pcp, bass)
+        if scores is None:
+            return self.chord
+        if KEY_CHORD_PRIOR > 0 and key:
+            mask = _diatonic_mask(key)
+            if mask is not None:
+                scores = scores + KEY_CHORD_PRIOR * mask
+        emis = np.exp(CHORD_TEMP * (scores - scores.max()))
+        s = emis.sum()
+        if not np.isfinite(s) or s <= 0:
+            return self.chord
+        emis /= s
+        if self.belief is None:
+            belief = emis
+        else:
+            pred = CHORD_SELF_P * self.belief \
+                + (1.0 - CHORD_SELF_P) / len(emis)
+            belief = pred * emis
+            s = belief.sum()
+            belief = belief / s if s > 0 else emis
+        self.belief = belief
+        self.chord = CHORD_NAMES[int(np.argmax(belief))]
+        return self.chord
+
+
+_chord_log_header = False   # Sitzungs-Kopfzeile schon geschrieben?
+
+
+def chord_log(line):
+    """Zeile ans Akkord-Protokoll (CHORD_LOG_PATH) anhaengen; vor dem ersten
+    Eintrag der Sitzung eine Kopfzeile mit Datum. Kein Pfad gesetzt = aus;
+    Schreibfehler werden wie bei log_message ignoriert."""
+    global _chord_log_header
+    path = CHORD_LOG_PATH
+    if not path:
+        return
+    try:
+        with open(path, "a", encoding="utf-8") as fh:
+            if not _chord_log_header:
+                fh.write("\n=== Sitzung "
+                         + time.strftime("%Y-%m-%d %H:%M:%S") + " ===\n")
+                _chord_log_header = True
+            fh.write(line + "\n")
+    except Exception:
+        pass
 
 
 def estimate_beat_phase(y, sr, bpm):
     """Zeitpunkt des letzten Beats im Fenster, als Sekunden VOR Fensterende.
-    None, wenn keine brauchbare Phase bestimmbar ist.
+    None, wenn keine brauchbare Phase bestimmbar ist. Wie estimate_tempo
+    arbeitet die Funktion am besten auf dem perkussiven Anteil des Signals."""
+    try:
+        oe = librosa.onset.onset_strength(y=y, sr=sr, hop_length=ONSET_HOP)
+    except Exception:
+        return None
+    return _beat_phase_from_onset_env(oe, sr / ONSET_HOP, bpm)
+
+
+def _beat_phase_from_onset_env(oe, fr, bpm):
+    """Beat-Phase (Schritt 2 von estimate_beat_phase) auf einer fertigen
+    Onset-Huellkurve mit fr Frames pro Sekunde.
 
     Die Onset-Huellkurve wird auf die Beat-Periode gefaltet (Histogramm der
     Phasenlage, spaete Frames staerker gewichtet, damit die Phase zum
-    aktuellen Fensterende passt); der staerkste Phasen-Bin ist der Beat.
-    Wie estimate_tempo arbeitet die Funktion am besten auf dem perkussiven
-    Anteil des Signals."""
+    aktuellen Fensterende passt); der staerkste Phasen-Bin ist der Beat."""
     try:
-        if bpm <= 0:
+        if bpm <= 0 or oe is None or not np.any(oe):
             return None
-        oe = librosa.onset.onset_strength(y=y, sr=sr, hop_length=ONSET_HOP)
-        if not np.any(oe):
-            return None
-        fr = sr / ONSET_HOP
         period = 60.0 * fr / bpm              # Beat-Abstand in Frames
         if period < 4 or len(oe) < 2 * period:
             return None
@@ -467,9 +865,44 @@ def analysis_worker(shared, audio_q, stop_event):
     key_disp = "—"              # aktuell angezeigte Tonart (mit Hysterese)
     key_pend = None             # Wechsel-Kandidat + Zaehler
     key_pend_n = 0
+    chord_disp = "—"            # aktuell erkannter Akkord
+    chord_tracker = ChordTracker()  # HMM-Glaettung ueber die Analysen
+    tuner = TuningEstimator()   # Stimmung des Stuecks (wird eingefroren)
+    chord_logged = False        # seit letzter Trennmarke Akkorde geschrieben?
     silence_rms = 10.0 ** (SILENCE_DB / 20.0)
     silent_since = None
     err_shown = False           # Analyse-Fehler nur einmal melden
+
+    def reset_analysis(mark, clear_shared=True):
+        """Analysezustand komplett leeren -- gemeinsamer Kern fuer
+        Stille-Reset, Quellenwechsel und manuellen Neustart. mark ist die
+        Trennmarke fuers Akkord-Protokoll. Mit clear_shared werden auch
+        die Anzeige-Ergebnisse geloescht (haelt die Clock an, bis eine
+        neue Schaetzung vorliegt)."""
+        nonlocal buf, res_tail, ema_pcp, ema_bass, cum_pcp, cum_bass
+        nonlocal cum_n, key_disp, key_pend, key_pend_n
+        nonlocal chord_disp, chord_logged
+        buf = np.zeros(0, dtype=np.float32)
+        res_tail = np.zeros(0, dtype=np.float32)
+        ema_pcp = ema_bass = None
+        cum_pcp = np.zeros(12)
+        cum_bass = np.zeros(12)
+        cum_n = 0
+        bpm_hist.clear()
+        key_disp, key_pend, key_pend_n = "—", None, 0
+        chord_disp = "—"
+        chord_tracker.reset()
+        tuner.reset()
+        if chord_logged:
+            chord_log("--- " + mark + " ---")
+            chord_logged = False
+        if clear_shared:
+            with shared.lock:
+                shared.have_estimate = False
+                shared.raw_bpm = 0.0
+                shared.key = "—"
+                shared.key_confident = False
+                shared.chord = "—"
 
     while not stop_event.is_set():
         try:
@@ -484,6 +917,15 @@ def analysis_worker(shared, audio_q, stop_event):
                 pass
         except queue.Empty:
             blocks = []
+
+        # ---- Manueller Neustart (GUI-Button "Analyse neu starten")? ----
+        # Wie ein Stille-Reset, nur auf Wunsch: z. B. wenn ein Songwechsel
+        # ohne Pause die Historie mit dem alten Stueck gefuellt hat.
+        with shared.lock:
+            want_reset = shared.reset_request
+            shared.reset_request = False
+        if want_reset:
+            reset_analysis("Reset " + time.strftime("%H:%M:%S"))
 
         # ---- Analyse bewusst angehalten (langer Break)? ----
         # Bloecke verwerfen, Ergebnisse/Clock unveraendert lassen und den
@@ -511,19 +953,7 @@ def analysis_worker(shared, audio_q, stop_event):
                 silent_since = now0
             elif (now0 - silent_since) >= SILENCE_RESET_SEC and (cum_n or bpm_hist):
                 # Pause/Songwechsel: alles leeren, naechstes Stueck startet frisch.
-                buf = np.zeros(0, dtype=np.float32)
-                res_tail = np.zeros(0, dtype=np.float32)
-                ema_pcp = ema_bass = None
-                cum_pcp = np.zeros(12)
-                cum_bass = np.zeros(12)
-                cum_n = 0
-                bpm_hist.clear()
-                key_disp, key_pend, key_pend_n = "—", None, 0
-                with shared.lock:
-                    shared.have_estimate = False
-                    shared.raw_bpm = 0.0
-                    shared.key = "—"
-                    shared.key_confident = False
+                reset_analysis("Stille " + time.strftime("%H:%M:%S"))
         else:
             silent_since = None
 
@@ -536,14 +966,10 @@ def analysis_worker(shared, audio_q, stop_event):
             new_sr = shared.capture_sr
         if new_sr != capture_sr:
             capture_sr = new_sr
-            buf = np.zeros(0, dtype=np.float32)
-            res_tail = np.zeros(0, dtype=np.float32)
-            ema_pcp = ema_bass = None
-            cum_pcp = np.zeros(12)
-            cum_bass = np.zeros(12)
-            cum_n = 0
-            bpm_hist.clear()
-            key_disp, key_pend, key_pend_n = "—", None, 0
+            # Anzeige/Clock NICHT leeren: beim Quellenwechsel laeuft die
+            # Clock auf dem alten Tempo weiter, bis die neue Quelle eine
+            # Schaetzung liefert (bisheriges Verhalten).
+            reset_analysis("Quellenwechsel", clear_shared=False)
 
         new_raw = blocks[0] if len(blocks) == 1 else np.concatenate(blocks)
         if capture_sr != ANALYSIS_SR:
@@ -579,11 +1005,28 @@ def analysis_worker(shared, audio_q, stop_event):
             # dem perkussiven, die Tonart aus dem harmonischen Anteil.
             y_harm, y_perc = split_harmonic_percussive(y)
             prev = float(np.median(bpm_hist)) if bpm_hist else 0.0
-            bpm = fold_bpm(estimate_tempo(y_perc, sr, prev))
+            # Onset-Huellkurve des perkussiven Anteils EINMAL berechnen --
+            # Tempo, Beat-Phase und Akkord-Fenster nutzen alle dieselbe.
+            env_fr = sr / ONSET_HOP
+            try:
+                perc_env = librosa.onset.onset_strength(
+                    y=y_perc, sr=sr, hop_length=ONSET_HOP)
+            except Exception:
+                perc_env = None
+            bpm = 0.0
+            if perc_env is not None:
+                bpm = fold_bpm(_tempo_from_onset_env(perc_env, env_fr, prev),
+                               prev)
             if bpm <= 0:
                 # kaum Perkussives (z. B. Ballade) -> Voll-Mix versuchen
-                bpm = fold_bpm(estimate_tempo(y, sr, prev))
-            chroma_res = chroma_pcp(y, sr, y_harm=y_harm)
+                bpm = fold_bpm(estimate_tempo(y, sr, prev), prev)
+            tail = 0.0
+            if CHORD_ENABLED:
+                tail = chord_tail_sec(perc_env, env_fr,
+                                      prev if prev > 0 else bpm)
+            tuning = tuner.update(y_harm, sr)
+            chroma_res = chroma_pcp(y, sr, y_harm=y_harm, tail_sec=tail,
+                                    tuning=tuning)
         except Exception as e:
             if not err_shown:
                 msg = f"[Analyse-Fehler: {type(e).__name__}: {e}]"
@@ -597,7 +1040,7 @@ def analysis_worker(shared, audio_q, stop_event):
         # reagieren (z. B. Stueck beginnt auf der Mollparallele), das
         # Gesamtmittel verhindert, dass einzelne Akkordwechsel sie kippen.
         if chroma_res is not None:
-            p, b = chroma_res
+            p, b = chroma_res[0], chroma_res[1]
             ema_pcp = p if ema_pcp is None else \
                 (1.0 - key_ema_a) * ema_pcp + key_ema_a * p
             ema_bass = b if ema_bass is None else \
@@ -608,9 +1051,10 @@ def analysis_worker(shared, audio_q, stop_event):
         if cum_n > 0:
             prof = 0.5 * ema_pcp + 0.5 * (cum_pcp / cum_n)
             bprof = 0.5 * ema_bass + 0.5 * (cum_bass / cum_n)
-            cand, cand_margin = classify_key(prof, bprof, with_margin=True)
+            cand, cand_margin, cand_2nd = classify_key(prof, bprof,
+                                                       with_margin=True)
         else:
-            cand, cand_margin = "—", 0.0
+            cand, cand_margin, cand_2nd = "—", 0.0, "—"
 
         # Hysterese: die erste Schaetzung sofort anzeigen, danach erst
         # wechseln, wenn der neue Kandidat KEY_SWITCH_CONFIRM-mal in Folge
@@ -630,7 +1074,25 @@ def analysis_worker(shared, audio_q, stop_event):
         # "Sicher" = Anzeige und aktuelle Klassifikation stimmen ueberein,
         # der Vorsprung ist deutlich und es gibt schon etwas Historie.
         confident = (cand == key_disp and cand != "—"
-                     and cand_margin >= KEY_CONFIDENT_MARGIN and cum_n >= 5)
+                     and cand_margin >= KEY_CONFIDENT_MARGIN
+                     and cum_n >= KEY_CONFIDENT_MIN_N)
+
+        # Akkord: Template-Matching auf dem juengsten Stueck des Chromagramms
+        # (faellt bei der Tonart-Berechnung mit ab, siehe chroma_pcp/tail_sec),
+        # ueber die Analysen per HMM geglaettet (ChordTracker); die erkannte
+        # Tonart gibt leitereigenen Akkorden einen kleinen Vorsprung.
+        # Jeder Wechsel geht -- falls aktiviert -- mit Uhrzeit ins Protokoll.
+        # Pegel-Gate (eff): beim Ausklingen in die Stille -- bevor der
+        # Stille-Reset greift -- liefert das fast leere Chroma sonst noch
+        # 1-2 Zufallsakkorde, die Anzeige und Protokoll verschmutzen.
+        if CHORD_ENABLED and chroma_res is not None and len(chroma_res) > 2 \
+                and eff >= silence_rms:
+            cand_chord = chord_tracker.update(chroma_res[2], chroma_res[3],
+                                              key=key_disp)
+            if cand_chord != "—" and cand_chord != chord_disp:
+                chord_disp = cand_chord
+                chord_log(time.strftime("%H:%M:%S") + "  " + cand_chord)
+                chord_logged = True
 
         # Tempo: Median der letzten Schaetzungen -> robust gegen Ausreisser.
         if bpm > 0:
@@ -640,16 +1102,17 @@ def analysis_worker(shared, audio_q, stop_event):
             # vom bisherigen Median ab, alte Schaetzungen verwerfen -- so
             # springt die Anzeige in ~5 s auf das neue Tempo statt in ~16 s.
             # Liegt der Sprung aber auf einem typischen Alias-Verhaeltnis
-            # (4/3, 3/2 bzw. deren Kehrwerte), ist es fast sicher ein
+            # (4/3, 3/2, 2/1 bzw. deren Kehrwerte), ist es fast sicher ein
             # Schaetzfehler-Lauf und kein echter Wechsel -> nicht verwerfen,
-            # der Median uebersteht solche Laeufe.
+            # der Median uebersteht solche Laeufe. (2/1 faengt vor allem
+            # Oktav-Kipper an den Bereichsgrenzen ab, z. B. 140 <-> 70.)
             if len(bpm_hist) >= 10:
                 recent = list(bpm_hist)[-5:]
                 rmed = float(np.median(recent))
                 omed = float(np.median(bpm_hist))
                 ratio = rmed / omed
                 alias = any(abs(ratio / h - 1.0) < 0.04
-                            for h in (4 / 3, 3 / 2, 2 / 3, 3 / 4))
+                            for h in (4 / 3, 3 / 2, 2 / 3, 3 / 4, 2.0, 0.5))
                 if (max(recent) / min(recent) - 1.0) < 0.03 and \
                         abs(rmed - omed) / omed > TEMPO_FLUSH_DEV and \
                         not alias:
@@ -663,7 +1126,7 @@ def analysis_worker(shared, audio_q, stop_event):
             want_beat = shared.beat_sync
         beat_update = None
         if want_beat and target > 0:
-            offs = estimate_beat_phase(y_perc, sr, target)
+            offs = _beat_phase_from_onset_env(perc_env, env_fr, target)
             if offs is not None:
                 beat_update = (buf_end_wall - offs, 60.0 / target)
 
@@ -675,6 +1138,7 @@ def analysis_worker(shared, audio_q, stop_event):
                 shared.raw_bpm = bpm
             shared.key = key
             shared.key_confident = confident
+            shared.chord = chord_disp if CHORD_ENABLED else "—"
             if beat_update is not None:
                 shared.beat_anchor = beat_update[0]
                 shared.beat_period = beat_update[1]
@@ -779,7 +1243,9 @@ def clock_worker(shared, midi_out, stop_event):
 
         max_step = CLOCK_SLEW_BPM_PER_S * dt
         diff = target - cur_bpm
-        if abs(diff) <= max_step:
+        if abs(diff) > cur_bpm * CLOCK_JUMP_FRAC:
+            cur_bpm = target            # grosser Sprung: sofort uebernehmen
+        elif abs(diff) <= max_step:
             cur_bpm = target
         else:
             cur_bpm += math.copysign(max_step, diff)

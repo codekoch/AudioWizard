@@ -143,6 +143,12 @@ class DisplayApp:
         self._begin_args = None               # vom Warmup-Thread gesetzt;
                                               # _tick() startet dann die Session
                                               # (Tk darf nur im Main-Thread laufen)
+        self._session_gen = 0                 # Generationszaehler: entwertet
+                                              # einen noch laufenden Warmup,
+                                              # wenn die Session inzwischen
+                                              # gestoppt wurde (sonst koennten
+                                              # zwei Sessions parallel starten
+                                              # -> doppelte Clock/Aufnahme)
         self._last_height = 0
         self._bpm_big = True                  # BPM-Label gerade gross/aktiv?
         self.hold = False                     # Analyse eingefroren?
@@ -188,6 +194,13 @@ class DisplayApp:
         cfg = load_config()
         self.opt_bpm_decimal = bool(cfg.get("bpm_dezimal", False))
         self.opt_beat_sync = bool(cfg.get("beat_sync", False))
+        self.opt_chords = bool(cfg.get("akkorde", False))
+        self.opt_chord_log = bool(cfg.get("akkorde_datei", False))
+        # Akkorde berechnen, sobald Anzeige ODER Protokoll sie braucht;
+        # geschrieben wird nur, wenn das Protokoll gewaehlt ist.
+        core.CHORD_ENABLED = self.opt_chords or self.opt_chord_log
+        core.CHORD_LOG_PATH = (core.CHORD_LOG_FILE
+                               if self.opt_chord_log else None)
         try:
             mn = float(cfg.get("min_bpm", 70))
             mx = float(cfg.get("max_bpm", 140))
@@ -253,16 +266,29 @@ class DisplayApp:
         tk.Label(f, text="BPM", font=self.f_cap,
                  bg=COL_BG, fg=COL_MUTED).grid(row=3, column=0)
 
-        keyrow = tk.Frame(f, bg=COL_BG)
-        keyrow.grid(row=5, column=0)
+        # Tonart und (optional) Akkord nebeneinander, je mit eigener
+        # Beschriftung; der Akkord-Block wird in show_main() nur gepackt,
+        # wenn die Option aktiv ist.
+        keyarea = tk.Frame(f, bg=COL_BG)
+        keyarea.grid(row=5, column=0)
+        keyblock = tk.Frame(keyarea, bg=COL_BG)
+        keyblock.pack(side="left")
+        keyrow = tk.Frame(keyblock, bg=COL_BG)
+        keyrow.pack()
         self.key_label = tk.Label(keyrow, text="—", font=self.f_key,
                                   bg=COL_BG, fg=COL_ACCENT)
         self.key_label.pack(side="left", anchor="s")
         self.key_par_label = tk.Label(keyrow, text="", font=self.f_key_par,
                                       bg=COL_BG, fg=COL_MUTED)
         self.key_par_label.pack(side="left", anchor="s", pady=(0, 8))
-        tk.Label(f, text="TONART", font=self.f_cap,
-                 bg=COL_BG, fg=COL_MUTED).grid(row=6, column=0)
+        tk.Label(keyblock, text="TONART", font=self.f_cap,
+                 bg=COL_BG, fg=COL_MUTED).pack()
+        self.chord_block = tk.Frame(keyarea, bg=COL_BG)
+        self.chord_label = tk.Label(self.chord_block, text="—",
+                                    font=self.f_key, bg=COL_BG, fg=COL_MUTED)
+        self.chord_label.pack()
+        tk.Label(self.chord_block, text="AKKORD", font=self.f_cap,
+                 bg=COL_BG, fg=COL_MUTED).pack()
 
         lvl = tk.Frame(f, bg=COL_BG)
         lvl.grid(row=8, column=0, sticky="ew", padx=24, pady=(0, 4))
@@ -287,6 +313,14 @@ class DisplayApp:
                                   pady=6, highlightthickness=0, takefocus=0,
                                   cursor="hand2")
         self.hold_btn.pack(side="left")
+        self.reset_btn = tk.Button(btns, text="Analyse neu starten",
+                                   command=self.reset_analysis,
+                                   font=self.f_small, bg=COL_SURFACE,
+                                   fg=COL_FG, activebackground=COL_SURF_HI,
+                                   activeforeground=COL_FG, bd=0, padx=16,
+                                   pady=6, highlightthickness=0, takefocus=0,
+                                   cursor="hand2")
+        self.reset_btn.pack(side="left", padx=(8, 0))
         self._small_button(btns, "Beenden", self.quit_app).pack(side="right")
         self._small_button(btns, "Einstellungen",
                            self.on_settings).pack(side="right", padx=(0, 8))
@@ -341,6 +375,16 @@ class DisplayApp:
         tk.Checkbutton(opts, text="Beat-synchrone Clock (experimentell)",
                        variable=self.var_beat, **ck).pack(side="left",
                                                           padx=(16, 0))
+        opts2 = tk.Frame(f, bg=COL_BG)
+        opts2.pack(fill="x", padx=24, pady=(4, 0))
+        self.var_chord = tk.BooleanVar()
+        self.var_chordlog = tk.BooleanVar()
+        tk.Checkbutton(opts2, text="Akkorde anzeigen",
+                       variable=self.var_chord, **ck).pack(side="left")
+        tk.Checkbutton(opts2,
+                       text="Akkorde in Textdatei schreiben (akkorde.txt)",
+                       variable=self.var_chordlog, **ck).pack(side="left",
+                                                              padx=(16, 0))
         rng = tk.Frame(opts, bg=COL_BG)
         rng.pack(side="right")
         tk.Label(rng, text="BPM-Bereich", font=self.f_small, bg=COL_BG,
@@ -423,6 +467,8 @@ class DisplayApp:
 
         self.var_dec.set(self.opt_bpm_decimal)
         self.var_beat.set(self.opt_beat_sync)
+        self.var_chord.set(self.opt_chords)
+        self.var_chordlog.set(self.opt_chord_log)
         self.ent_min.delete(0, "end")
         self.ent_min.insert(0, f"{self.opt_min_bpm:.0f}")
         self.ent_max.delete(0, "end")
@@ -439,6 +485,10 @@ class DisplayApp:
 
     def show_main(self):
         self.setup_frame.pack_forget()
+        if self.opt_chords:
+            self.chord_block.pack(side="left", padx=(48, 0))
+        else:
+            self.chord_block.pack_forget()
         self.main_frame.pack(fill="both", expand=True)
 
     def on_settings(self):
@@ -471,6 +521,18 @@ class DisplayApp:
                 return              # noch nichts zu halten
         self._set_hold(not self.hold)
 
+    def reset_analysis(self):
+        """Analyse von vorn beginnen, z. B. wenn ein Songwechsel ohne
+        Pause die Historie mit dem alten Stueck gefuellt hat: der Worker
+        verwirft Puffer und Historie, Anzeige und MIDI-Clock stoppen und
+        kommen mit der naechsten echten Tempo-Schaetzung (~4 s) zurueck."""
+        if self.stream is None and self.cap_thread is None:
+            return                  # keine laufende Sitzung
+        if self.hold:
+            self._set_hold(False)   # eingefrorene Analyse erst fortsetzen
+        with self.shared.lock:
+            self.shared.reset_request = True
+
     def on_setup_start(self):
         sel = self.lb_in.curselection()
         if not sel or not self.sources:
@@ -495,6 +557,8 @@ class DisplayApp:
                      "midi_output": midi or "",
                      "bpm_dezimal": bool(self.var_dec.get()),
                      "beat_sync": bool(self.var_beat.get()),
+                     "akkorde": bool(self.var_chord.get()),
+                     "akkorde_datei": bool(self.var_chordlog.get()),
                      "min_bpm": mn, "max_bpm": mx})
         self._load_options()
         self.start_session((kind, ident), midi)
@@ -508,9 +572,10 @@ class DisplayApp:
         self.status_override = "INITIALISIERE ANALYSE …"
         self.src_label.config(text="")
         threading.Thread(target=self._warmup_then_begin,
-                         args=(src, midi_name), daemon=True).start()
+                         args=(src, midi_name, self._session_gen),
+                         daemon=True).start()
 
-    def _warmup_then_begin(self, src, midi_name):
+    def _warmup_then_begin(self, src, midi_name, gen):
         # librosa/numba einmalig aufwaermen (erster Aufruf kompiliert sonst
         # mitten im Betrieb und blockiert die Analyse mehrere Sekunden).
         if not self.warmed:
@@ -524,7 +589,7 @@ class DisplayApp:
                 pass
             self.warmed = True
         if not self.app_stop.is_set():
-            self._begin_args = (src, midi_name)
+            self._begin_args = (gen, src, midi_name)
 
     def _begin(self, src, midi_name):
         if self.app_stop.is_set():
@@ -564,6 +629,7 @@ class DisplayApp:
             self.shared.raw_bpm = 0.0
             self.shared.key = "—"
             self.shared.key_confident = False
+            self.shared.chord = "—"
             self.shared.beat_sync = self.opt_beat_sync
         core.drain_queue(self.audio_q)
 
@@ -605,6 +671,7 @@ class DisplayApp:
         self.status_override = None
 
     def stop_session(self):
+        self._session_gen += 1                # laufenden Warmup entwerten
         self._begin_args = None
         self.status_override = None
         if self.hold:
@@ -629,6 +696,7 @@ class DisplayApp:
             self.shared.have_estimate = False
             self.shared.raw_bpm = 0.0
             self.shared.key = "—"
+            self.shared.chord = "—"
 
     def quit_app(self):
         try:
@@ -648,9 +716,10 @@ class DisplayApp:
     # ------------------------------------------------------------------
     def _tick(self):
         if self._begin_args is not None:
-            args = self._begin_args
+            gen, src, midi_name = self._begin_args
             self._begin_args = None
-            self._begin(*args)
+            if gen == self._session_gen:      # sonst: Session wurde inzwischen
+                self._begin(src, midi_name)   # gestoppt -> Warmup verfallen
 
         if (self.cap_stop is not None and self.cap_stop.is_set()
                 and (self.stream is not None or self.cap_thread is not None)):
@@ -675,6 +744,7 @@ class DisplayApp:
             bpm = self.shared.target_bpm
             key = self.shared.key
             key_conf = self.shared.key_confident
+            chord = self.shared.chord
             level = self.shared.level
             level_time = self.shared.level_time
             have = self.shared.have_estimate
@@ -703,6 +773,9 @@ class DisplayApp:
                               fg=COL_ACCENT if key_conf else COL_MUTED)
         par = parallel_key(key)
         self.key_par_label.config(text=f"   {par}" if par else "")
+        if self.opt_chords:
+            self.chord_label.config(text=chord,
+                                    fg=COL_FG if chord != "—" else COL_MUTED)
         self.db_label.config(text=f"{db:4.0f} dB")
 
         w = self.level_canvas.winfo_width()
