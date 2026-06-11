@@ -187,6 +187,39 @@ CHORD_TEMP            = 10.0    # Schaerfe der Softmax, die Template-Scores in
 KEY_CHORD_PRIOR       = 0.05    # Score-Bonus fuer leitereigene Akkorde der
                                 #   aktuell erkannten Tonart -- unterdrueckt
                                 #   exotische Fehldeutungen (0 = aus)
+CHORD_FAST            = False   # Schneller Akkord-Pfad (GUI-Option): eigene,
+                                #   leichte Analyse NUR fuer den Akkord im
+                                #   CHORD_FAST_INTERVAL-Takt auf den juengsten
+                                #   CHORD_FAST_WIN Sekunden -- der Akkord folgt
+                                #   dann ~3x pro Sekunde statt im 1-s-Takt der
+                                #   grossen Analyse. Kostet zusaetzliche CPU;
+                                #   auf schwacher Hardware (Pi) aus lassen,
+                                #   dann laeuft der bisherige 1-s-Pfad.
+CHORD_FAST_INTERVAL   = 0.3     # Abstand der schnellen Akkord-Analysen (Sek.)
+CHORD_FAST_WIN        = 2.0     # so viele juengste Sekunden verarbeitet der
+                                #   schnelle Pfad (= das Akkordfenster; eine
+                                #   eigene Tail-Mittelung entfaellt). Kuerzer
+                                #   als die 2,5 s des 1-s-Pfads: die ~3x
+                                #   hoehere Beobachtungsrate mittelt das
+                                #   Rauschen ueber die ueberlappenden Fenster
+                                #   weg -- Qualitaet hielt im eval_chords-
+                                #   Proxy stand, 1,5 s war zu kurz.
+CHORD_FAST_HOP        = 1024    # groesserer Chroma-Hop im schnellen Pfad:
+                                #   das Fenster wird ohnehin gemittelt,
+                                #   weniger Frames = weniger CQT/Salience-CPU
+CHORD_FAST_OCTAVES    = 5       # CQT-Umfang des schnellen Pfads, ab C2:
+                                #   die sehr langen Filter der C1-Oktave
+                                #   lohnen auf 2,5 s nicht; Bass-Profil aus
+                                #   den unteren 2 Oktaven derselben CQT
+CHORD_FAST_HALF_LIFE  = 1.0     # Recency-Gewichtung im schnellen Fenster:
+                                #   Frame-Gewicht halbiert sich je so viele
+                                #   Sekunden Alter -- ein neuer Akkord
+                                #   dominiert das Profil frueher, der alte
+                                #   Schwanz stabilisiert weiter (0 = aus).
+                                #   1,0 s: gleiche Diatonik-Quote wie der
+                                #   1-s-Pfad bei ~1,8 s Wechsel-Latenz
+                                #   (statt ~2-3 s); 0,7 s war minimal
+                                #   schneller, aber messbar flackriger.
 CHORD_LOG_PATH        = None    # Textdatei fuers Akkord-Protokoll (GUI-
                                 #   Option); None = kein Protokoll
 ANALYSIS_QUEUE_MAX    = 256     # max. gepufferte Bloecke fuer die Analyse --
@@ -602,6 +635,56 @@ def chroma_pcp(y, sr, y_harm=None, tail_sec=0.0, tuning=0.0):
         return None
 
 
+def chroma_pcp_fast(y, sr, tuning=0.0):
+    """Leichtgewichtiges Chroma NUR fuer den schnellen Akkord-Pfad:
+    (pcp, bass) ueber das ganze -- kurze -- Fenster, oder None.
+
+    Gegenueber chroma_pcp eingespart: die HPSS-Trennung (die Salience-
+    Peak-Filterung daempft breitbandige Drums bereits), groeberer Hop
+    (CHORD_FAST_HOP statt CHROMA_HOP -- das Fenster wird ohnehin
+    gemittelt) und 5 statt 7 Oktaven ab C2 (CHORD_FAST_OCTAVES).
+    Aufbereitung sonst wie im grossen Pfad: Salience-Obertongewichtung,
+    Log-Kompression, Bass-Profil aus den unteren 2 Oktaven derselben CQT."""
+    try:
+        if y is None or not np.any(y):
+            return None
+        fmin = librosa.note_to_hz('C2')
+        n_bins = CHORD_FAST_OCTAVES * 36
+        C = np.abs(librosa.cqt(y, sr=sr, fmin=fmin, n_bins=n_bins,
+                               bins_per_octave=36, tuning=tuning,
+                               hop_length=CHORD_FAST_HOP))
+        freqs = librosa.cqt_frequencies(n_bins=n_bins, fmin=fmin,
+                                        bins_per_octave=36)
+        C = librosa.salience(C, freqs=freqs, harmonics=SAL_HARMONICS,
+                             weights=SAL_WEIGHTS, fill_value=0.0)
+        chroma = librosa.feature.chroma_cqt(
+            C=C, sr=sr, fmin=fmin, n_octaves=CHORD_FAST_OCTAVES,
+            bins_per_octave=36, hop_length=CHORD_FAST_HOP)
+        bchroma = librosa.feature.chroma_cqt(
+            C=C[:2 * 36], sr=sr, fmin=fmin, n_octaves=2,
+            bins_per_octave=36, hop_length=CHORD_FAST_HOP)
+        if CHROMA_LOG_COMP > 0:
+            chroma = np.log1p(CHROMA_LOG_COMP * chroma)
+            bchroma = np.log1p(CHROMA_LOG_COMP * bchroma)
+        if CHORD_FAST_HALF_LIFE > 0 and chroma.shape[1] > 1:
+            n = chroma.shape[1]
+            age = (n - 1 - np.arange(n)) * (CHORD_FAST_HOP / sr)
+            w = 0.5 ** (age / CHORD_FAST_HALF_LIFE)
+            w /= w.sum()
+            pcp = chroma @ w
+            bass = bchroma @ w
+        else:
+            pcp = chroma.mean(axis=1)
+            bass = bchroma.mean(axis=1)
+        s = pcp.sum()
+        if s <= 0:
+            return None
+        bs = bass.sum()
+        return pcp / s, (bass / bs if bs > 0 else np.zeros(12))
+    except Exception:
+        return None
+
+
 def level_bar(rms, width=12, floor_db=-60.0):
     """Pegel als (dBFS, ASCII-Balken) -- zur schnellen Sichtkontrolle."""
     db = 20.0 * math.log10(rms) if rms > 1e-9 else floor_db
@@ -751,8 +834,17 @@ class ChordTracker:
         self.belief = None
         self.chord = "—"
 
-    def update(self, pcp, bass=None, key=None):
-        """Neues Chroma-Profil einarbeiten; liefert den aktuellen Akkord."""
+    def update(self, pcp, bass=None, key=None, dt=None):
+        """Neues Chroma-Profil einarbeiten; liefert den aktuellen Akkord.
+
+        dt = Abstand zur vorigen Beobachtung in Sekunden. CHORD_SELF_P und
+        CHORD_TEMP sind auf den 1-s-Analysetakt bezogen und werden auf dt
+        umgerechnet (Traegheit p^(dt/1s), Evidenzgewicht temp*dt/1s --
+        Likelihood-Potenzierung): pro SEKUNDE wirken Traegheit und Evidenz
+        dann gleich stark, egal ob der langsame 1-s-Pfad oder der schnelle
+        0,3-s-Pfad fuettert. Ohne die Evidenz-Skalierung integriert der
+        schnelle Pfad das ~3-fache Evidenzgewicht und flackert (gemessen:
+        Wechselrate etwa verdoppelt)."""
         scores = chord_scores(pcp, bass)
         if scores is None:
             return self.chord
@@ -760,16 +852,19 @@ class ChordTracker:
             mask = _diatonic_mask(key)
             if mask is not None:
                 scores = scores + KEY_CHORD_PRIOR * mask
-        emis = np.exp(CHORD_TEMP * (scores - scores.max()))
+        if dt is None:
+            dt = ANALYSIS_INTERVAL
+        rel = max(0.05, dt) / ANALYSIS_INTERVAL
+        emis = np.exp(CHORD_TEMP * rel * (scores - scores.max()))
         s = emis.sum()
         if not np.isfinite(s) or s <= 0:
             return self.chord
         emis /= s
+        p_stay = CHORD_SELF_P ** rel
         if self.belief is None:
             belief = emis
         else:
-            pred = CHORD_SELF_P * self.belief \
-                + (1.0 - CHORD_SELF_P) / len(emis)
+            pred = p_stay * self.belief + (1.0 - p_stay) / len(emis)
             belief = pred * emis
             s = belief.sum()
             belief = belief / s if s > 0 else emis
@@ -868,6 +963,7 @@ def analysis_worker(shared, audio_q, stop_event):
     chord_disp = "—"            # aktuell erkannter Akkord
     chord_tracker = ChordTracker()  # HMM-Glaettung ueber die Analysen
     tuner = TuningEstimator()   # Stimmung des Stuecks (wird eingefroren)
+    last_fast = 0.0             # Zeitpunkt der letzten schnellen Akkord-Analyse
     chord_logged = False        # seit letzter Trennmarke Akkorde geschrieben?
     silence_rms = 10.0 ** (SILENCE_DB / 20.0)
     silent_since = None
@@ -991,8 +1087,31 @@ def analysis_worker(shared, audio_q, stop_event):
         if len(buf) > win:
             buf = buf[-win:]
         buf_end_wall = time.perf_counter()
-
         now = time.perf_counter()
+
+        # ---- Schneller Akkord-Pfad (Option CHORD_FAST) ----
+        # Eigene, leichte Analyse NUR fuer den Akkord, zwischen den grossen
+        # Analysen: HPSS + Chroma auf den juengsten CHORD_FAST_WIN Sekunden
+        # statt des ganzen 8-s-Fensters. Der grosse Pfad laesst dann sein
+        # Akkordfenster weg (tail=0, s. u.) -- der Tracker wird nur von
+        # hier gefuettert, mit dt-angepasster Traegheit.
+        if CHORD_ENABLED and CHORD_FAST and eff >= silence_rms \
+                and (now - last_fast) >= CHORD_FAST_INTERVAL \
+                and len(buf) >= int(CHORD_FAST_WIN * ANALYSIS_SR):
+            dt_fast = (now - last_fast) if last_fast > 0 else None
+            last_fast = now
+            fres = chroma_pcp_fast(buf[-int(CHORD_FAST_WIN * ANALYSIS_SR):],
+                                   ANALYSIS_SR, tuning=tuner.value)
+            if fres is not None:
+                cand_chord = chord_tracker.update(fres[0], fres[1],
+                                                  key=key_disp, dt=dt_fast)
+                if cand_chord != "—" and cand_chord != chord_disp:
+                    chord_disp = cand_chord
+                    chord_log(time.strftime("%H:%M:%S") + "  " + cand_chord)
+                    chord_logged = True
+                    with shared.lock:
+                        shared.chord = chord_disp
+
         if len(buf) < win * 0.5 or (now - last_run) < ANALYSIS_INTERVAL:
             continue
         last_run = now
@@ -1021,7 +1140,7 @@ def analysis_worker(shared, audio_q, stop_event):
                 # kaum Perkussives (z. B. Ballade) -> Voll-Mix versuchen
                 bpm = fold_bpm(estimate_tempo(y, sr, prev), prev)
             tail = 0.0
-            if CHORD_ENABLED:
+            if CHORD_ENABLED and not CHORD_FAST:
                 tail = chord_tail_sec(perc_env, env_fr,
                                       prev if prev > 0 else bpm)
             tuning = tuner.update(y_harm, sr)

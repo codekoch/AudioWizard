@@ -29,6 +29,7 @@ Aufruf (Testdateien <BPM>BPM_<Tonart>.mp3 im Skriptordner):
 import os
 import re
 import sys
+import time
 from collections import deque
 
 import numpy as np
@@ -77,7 +78,9 @@ def chord_pcs(chord_name):
 
 
 print(f"Akkord-Fenster: {'beat-synchron' if core.CHORD_TAIL_BEAT else 'fest'}"
-      f" (fest = {core.CHORD_TAIL_SEC} s), Messdauer {DUR:.0f} s je Datei")
+      f" (fest = {core.CHORD_TAIL_SEC} s), "
+      f"Pfad: {'SCHNELL (' + str(core.CHORD_FAST_INTERVAL) + ' s-Takt)' if core.CHORD_FAST else 'normal (1 s-Takt)'}, "
+      f"Messdauer {DUR:.0f} s je Datei")
 for path, true_bpm, true_key in files:
     y, _ = librosa.load(os.path.join(HERE, path), sr=SR, mono=True,
                         duration=DUR)
@@ -98,6 +101,8 @@ for path, true_bpm, true_key in files:
     key_disp, key_pend, key_pend_n = "—", None, 0
     timeline = []               # (t, angezeigter Akkord)
     n_steps = n_diatonic = n_changes = 0
+    ft_next = WIN / 2           # naechster Schritt des schnellen Pfads
+    ccomp, cn = 0.0, 0          # Zeitmessung des schnellen Akkord-Pfads
     t = WIN / 2
     while t <= len(y) / SR:
         seg = y[max(0, int((t - WIN) * SR)):int(t * SR)]
@@ -117,9 +122,11 @@ for path, true_bpm, true_key in files:
             bpm = core.fold_bpm(core.estimate_tempo(seg, SR, prev), prev)
         if bpm > 0:
             bpm_hist.append(bpm)
-        tail = core.chord_tail_sec(perc_env, env_fr,
-                                   prev if prev > 0 else bpm)
         tuning = tuner.update(y_h, SR)
+        # Im schnellen Modus laesst die grosse Analyse ihr Akkordfenster
+        # weg (wie im Worker); der Akkord kommt aus den Fast-Schritten.
+        tail = 0.0 if core.CHORD_FAST else core.chord_tail_sec(
+            perc_env, env_fr, prev if prev > 0 else bpm)
         res = core.chroma_pcp(seg, SR, y_harm=y_h, tail_sec=tail,
                               tuning=tuning)
         if res is not None:
@@ -146,7 +153,30 @@ for path, true_bpm, true_key in files:
                 key_pend, key_pend_n = cand_key, 1
         else:
             key_pend, key_pend_n = None, 0
-        if res is not None and len(res) > 2:
+        if core.CHORD_FAST:
+            # Schnellen Pfad nachbilden: leichte Akkord-Analysen im
+            # CHORD_FAST_INTERVAL-Takt auf den juengsten Sekunden.
+            while ft_next <= t:
+                a = max(0, int((ft_next - core.CHORD_FAST_WIN) * SR))
+                seg_f = y[a:int(ft_next * SR)]
+                c0 = time.perf_counter()
+                fres = core.chroma_pcp_fast(seg_f, SR, tuning=tuning)
+                ccomp += time.perf_counter() - c0
+                cn += 1
+                if fres is not None:
+                    cand = tracker.update(fres[0], fres[1], key=key_disp,
+                                          dt=core.CHORD_FAST_INTERVAL)
+                    if cand != "—" and cand != chord_disp:
+                        chord_disp = cand
+                        n_changes += 1
+                    if chord_disp != "—":
+                        n_steps += 1
+                        pcs = chord_pcs(chord_disp)
+                        if pcs is not None and pcs <= scale:
+                            n_diatonic += 1
+                        timeline.append((ft_next, chord_disp))
+                ft_next += core.CHORD_FAST_INTERVAL
+        elif res is not None and len(res) > 2:
             cand = tracker.update(res[2], res[3], key=key_disp)
             if cand != "—" and cand != chord_disp:
                 chord_disp = cand
@@ -161,9 +191,10 @@ for path, true_bpm, true_key in files:
 
     minutes = max(1e-9, (len(y) / SR - WIN / 2) / 60.0)
     dia = 100.0 * n_diatonic / n_steps if n_steps else 0.0
+    extra = f" | {ccomp / cn * 1000:4.0f} ms/Akkord-Analyse" if cn else ""
     print(f"  {path:24s} ({true_key:8s}) "
           f"diatonisch {dia:5.1f} % ({n_diatonic}/{n_steps})"
-          f" | Wechsel/min {n_changes / minutes:5.1f}")
+          f" | Wechsel/min {n_changes / minutes:5.1f}{extra}")
     if SHOW_TIMELINE:
         out, last = [], None
         for tt, ch in timeline:

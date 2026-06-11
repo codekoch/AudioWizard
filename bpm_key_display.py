@@ -196,11 +196,13 @@ class DisplayApp:
         self.opt_beat_sync = bool(cfg.get("beat_sync", False))
         self.opt_chords = bool(cfg.get("akkorde", False))
         self.opt_chord_log = bool(cfg.get("akkorde_datei", False))
+        self.opt_chord_fast = bool(cfg.get("akkorde_schnell", False))
         # Akkorde berechnen, sobald Anzeige ODER Protokoll sie braucht;
         # geschrieben wird nur, wenn das Protokoll gewaehlt ist.
         core.CHORD_ENABLED = self.opt_chords or self.opt_chord_log
         core.CHORD_LOG_PATH = (core.CHORD_LOG_FILE
                                if self.opt_chord_log else None)
+        core.CHORD_FAST = self.opt_chord_fast
         try:
             mn = float(cfg.get("min_bpm", 70))
             mx = float(cfg.get("max_bpm", 140))
@@ -385,6 +387,11 @@ class DisplayApp:
                        text="Akkorde in Textdatei schreiben (akkorde.txt)",
                        variable=self.var_chordlog, **ck).pack(side="left",
                                                               padx=(16, 0))
+        self.var_chordfast = tk.BooleanVar()
+        tk.Checkbutton(opts2,
+                       text="Akkorde schneller berechnen (mehr CPU-Last)",
+                       variable=self.var_chordfast, **ck).pack(side="left",
+                                                               padx=(16, 0))
         rng = tk.Frame(opts, bg=COL_BG)
         rng.pack(side="right")
         tk.Label(rng, text="BPM-Bereich", font=self.f_small, bg=COL_BG,
@@ -469,6 +476,7 @@ class DisplayApp:
         self.var_beat.set(self.opt_beat_sync)
         self.var_chord.set(self.opt_chords)
         self.var_chordlog.set(self.opt_chord_log)
+        self.var_chordfast.set(self.opt_chord_fast)
         self.ent_min.delete(0, "end")
         self.ent_min.insert(0, f"{self.opt_min_bpm:.0f}")
         self.ent_max.delete(0, "end")
@@ -559,6 +567,7 @@ class DisplayApp:
                      "beat_sync": bool(self.var_beat.get()),
                      "akkorde": bool(self.var_chord.get()),
                      "akkorde_datei": bool(self.var_chordlog.get()),
+                     "akkorde_schnell": bool(self.var_chordfast.get()),
                      "min_bpm": mn, "max_bpm": mx})
         self._load_options()
         self.start_session((kind, ident), midi)
