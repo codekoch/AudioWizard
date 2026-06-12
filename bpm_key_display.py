@@ -6,7 +6,7 @@ bpm_key_display.py
 
 Fullscreen-Anzeige (BPM + Tonart) fuer ein 7-Zoll-Display (800x600),
 gedacht fuer den Raspberry Pi -- laeuft zum Testen aber genauso unter
-Windows in einem normalen Fenster.
+Windows und macOS in einem normalen Fenster.
 
 Der Analyse- und MIDI-Clock-Kern wird aus realtime_bpm_key_midiclock.py
 importiert (gleiche Logik, eine Codebasis). Dieses Skript ersetzt nur die
@@ -18,7 +18,10 @@ Konsolen-Bedienung durch eine Touch-taugliche Oberflaeche:
   * Unter Windows stehen zusaetzlich "Loopback:"-Eintraege in der Liste
     (Ausgabe mithoeren, z. B. Spotify; braucht das Paket 'soundcard').
     Auf dem Pi uebernehmen das die PipeWire/Pulse-"Monitor"-Eingaenge,
-    die als normale Eingaenge erscheinen.
+    die als normale Eingaenge erscheinen; unter macOS ein virtuelles
+    Ausgabegeraet wie BlackHole (erscheint ebenfalls als Eingang).
+  * macOS/Linux: In der MIDI-Liste laesst sich zusaetzlich ein eigener
+    virtueller Port erzeugen (CoreMIDI/ALSA) -- kein IAC/loopMIDI noetig.
   * Hauptbildschirm: BPM gross, Tonart darunter, Pegelbalken, Status.
 
 Start:
@@ -56,6 +59,8 @@ import realtime_bpm_key_midiclock as core
 # Windows: Die Wiedergabe (z. B. Spotify) laesst sich per Loopback mithoeren.
 # Auf dem Raspberry Pi ist das ueberfluessig -- dort erscheinen die
 # PipeWire/Pulse-"Monitor"-Quellen als normale Eingaenge in der Geraeteliste.
+# Unter macOS uebernimmt das ein virtuelles Ausgabegeraet wie BlackHole,
+# das ebenfalls als normaler Eingang erscheint.
 sc = None
 if sys.platform == 'win32':
     try:
@@ -181,7 +186,8 @@ class DisplayApp:
         if not force_setup and cfg.get("input_name"):
             src = self._find_saved_source(cfg)
             midi = cfg.get("midi_output") or None
-            if midi and midi not in mido.get_output_names():
+            if (midi and midi != core.VIRTUAL_MIDI
+                    and midi not in mido.get_output_names()):
                 midi = "?"                    # gespeicherter Port fehlt
             if src is not None and midi != "?":
                 auto = (src, midi)
@@ -368,6 +374,13 @@ class DisplayApp:
         self.lb_in.grid(row=1, column=0, sticky="nsew")
         self.lb_midi = tk.Listbox(body, **kw)
         self.lb_midi.grid(row=1, column=1, sticky="nsew", padx=(16, 0))
+        if sys.platform == 'darwin':
+            # macOS hat kein Loopback -- der uebliche Weg ist BlackHole.
+            tk.Label(body, text="Wiedergabe mithoeren: BlackHole installieren"
+                                " -- erscheint dann als Audio-Eingang.",
+                     font=self.f_tiny, bg=COL_BG, fg=COL_MUTED,
+                     anchor="w").grid(row=2, column=0, sticky="w",
+                                      pady=(4, 0))
 
         # Optionen als Flow-Layout: _flow_options() bricht die Widgets je
         # nach Fensterbreite in so viele Zeilen um wie noetig. Mit den
@@ -515,11 +528,17 @@ class DisplayApp:
             self.lb_in.see(sel_in)
 
         self.midi_names = mido.get_output_names()
+        if sys.platform != 'win32':
+            # CoreMIDI (macOS) / ALSA (Linux) koennen eigene virtuelle Ports
+            # erzeugen -- so braucht es kein IAC-/loopMIDI-Gegenstueck.
+            self.midi_names = self.midi_names + [core.VIRTUAL_MIDI]
         self.lb_midi.delete(0, "end")
         self.lb_midi.insert("end", "  Kein MIDI (nur Anzeige)")
         sel_midi = 0
         for n, name in enumerate(self.midi_names):
-            self.lb_midi.insert("end", f"  {name}")
+            label = (f"  Virtueller Port '{core.VIRTUAL_MIDI_NAME}' erzeugen"
+                     if name == core.VIRTUAL_MIDI else f"  {name}")
+            self.lb_midi.insert("end", label)
             if name == cfg.get("midi_output"):
                 sel_midi = n + 1
         self.lb_midi.selection_set(sel_midi)
@@ -707,7 +726,7 @@ class DisplayApp:
         self.midi_name = midi_name
         if midi_name:
             try:
-                self.midi_out = mido.open_output(midi_name)
+                self.midi_out = core.open_midi_output(midi_name)
             except Exception as e:
                 core.stop_capture(self.stream, self.cap_thread, self.cap_stop)
                 self.stream = self.cap_thread = self.cap_stop = None

@@ -8,5 +8,6 @@ mido
 python-rtmidi
 # Nur Windows: Loopback (Wiedergabe mithoeren). Auf dem Raspberry Pi
 # unnoetig -- dort erscheinen die PipeWire/Pulse-Monitor-Quellen als
-# normale Eingaenge.
+# normale Eingaenge. Unter macOS uebernimmt das ein virtuelles
+# Ausgabegeraet wie BlackHole (https://existential.audio/blackhole/).
 soundcard; sys_platform == 'win32'

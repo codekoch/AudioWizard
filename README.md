@@ -1,7 +1,7 @@
 # Audio2Midi
 
 ![Python](https://img.shields.io/badge/Python-3.9%2B-blue)
-![Plattform](https://img.shields.io/badge/Plattform-Windows%20%C2%B7%20Raspberry%20Pi%20%C2%B7%20Linux-555)
+![Plattform](https://img.shields.io/badge/Plattform-Windows%20%C2%B7%20macOS%20%C2%B7%20Raspberry%20Pi%20%C2%B7%20Linux-555)
 ![MIDI](https://img.shields.io/badge/MIDI-Clock%2C%2024%20PPQN-1D9E75)
 ![Lizenz](https://img.shields.io/badge/Lizenz-GPL--3.0-orange)
 
@@ -15,7 +15,8 @@ Als Quelle dient wahlweise ein Audio-Eingang (Mikrofon/Line-In) oder unter
 Windows direkt die **Wiedergabe selbst** (WASAPI-Loopback) – also z. B. das,
 was gerade in Spotify läuft. Auf dem Raspberry Pi übernehmen die
 PipeWire/Pulse-„Monitor“-Quellen dieselbe Rolle und erscheinen als normale
-Eingänge.
+Eingänge; unter macOS leistet das ein virtuelles Ausgabegerät wie
+[BlackHole](https://existential.audio/blackhole/).
 
 ## Funktionen
 
@@ -38,7 +39,7 @@ Eingänge.
   (sanfte Phasenregelung, gemessen ~1–2 ms Streuung).
 - **Zwei Oberflächen** – Konsolen-Version (`realtime_bpm_key_midiclock.py`)
   und Touch-taugliche Kiosk-GUI (`bpm_key_display.py`) für ein 7-Zoll-Display
-  am Raspberry Pi; unter Windows läuft sie im Fenster.
+  am Raspberry Pi; unter Windows und macOS läuft sie im Fenster.
 - **Praxis-Helfer** – Hold-Funktion für Stücke mit langen Breaks (Anzeige
   friert ein, Clock läuft konstant weiter), manueller Analyse-Neustart für
   Songwechsel ohne Pause, Pegelanzeige, Watchdog und Logdatei für den
@@ -59,6 +60,35 @@ in die Anzeige. Alternativ die Konsolen-Version:
 ```
 python realtime_bpm_key_midiclock.py
 ```
+
+Für die MIDI-Ausgabe an Software auf demselben Rechner braucht es unter
+Windows einen virtuellen MIDI-Port, z. B.
+[loopMIDI](https://www.tobias-erichsen.de/software/loopmidi.html).
+
+## macOS
+
+```
+python3 -m pip install -r requirements.txt
+python3 bpm_key_display.py
+```
+
+Läuft wie unter Windows im Fenster; Bedienung und Konsolen-Version sind
+identisch. Drei Besonderheiten:
+
+- **Mikrofon-Berechtigung:** Beim ersten Zugriff auf einen Audio-Eingang
+  fragt macOS nach der Mikrofon-Freigabe für das Terminal (bzw. die
+  Python-App) – einmal erlauben.
+- **MIDI-Ausgang:** In der MIDI-Liste gibt es den Eintrag „Virtueller Port
+  ‚Audio2Midi Clock‘ erzeugen“ (CoreMIDI) – der Port erscheint dann in der
+  DAW als MIDI-Eingang, ganz ohne IAC-Treiber. Alternativ funktioniert
+  natürlich auch der IAC-Bus aus dem Audio-MIDI-Setup oder ein
+  USB-MIDI-Interface.
+- **Wiedergabe mithören:** WASAPI-Loopback gibt es nur unter Windows. Auf
+  dem Mac ein virtuelles Ausgabegerät wie
+  [BlackHole](https://existential.audio/blackhole/) installieren (kostenlos),
+  die Wiedergabe dorthin routen (z. B. per „Gerät mit mehreren Ausgängen“
+  im Audio-MIDI-Setup, damit weiterhin etwas zu hören ist) – BlackHole
+  erscheint dann als normaler Audio-Eingang in der Quellenliste.
 
 ## Raspberry Pi (Kiosk-Betrieb)
 
@@ -105,6 +135,7 @@ die gemessen und verworfen wurden.
 
 numpy, librosa, soundfile, sounddevice, mido, python-rtmidi – und nur unter
 Windows zusätzlich soundcard für den Loopback (`requirements.txt`).
+python-rtmidi nutzt je nach Plattform WinMM, CoreMIDI (macOS) oder ALSA.
 
 ## Lizenz
 

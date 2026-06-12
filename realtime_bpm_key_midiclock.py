@@ -5,24 +5,36 @@ realtime_bpm_key_midiclock_loopback.py
 ======================================
 
 Echtzeit-Analyse von Audio (BPM + Tonart) mit stabiler MIDI-Clock-Ausgabe.
+Laeuft unter Windows, macOS und Linux (inkl. Raspberry Pi).
 
 NEU gegenueber der Grundversion:
   Du kannst als Quelle entweder
     (1) einen normalen Audio-Eingang / ein Mikrofon (ueber sounddevice)
         ODER
-    (2) die Lautsprecher-/Kopfhoerer-AUSGABE mithoeren (Loopback, ueber
-        soundcard / WASAPI) -- z. B. um zu analysieren, was Spotify gerade
-        ueber deinen Kopfhoerer-Ausgang abspielt.
+    (2) nur Windows: die Lautsprecher-/Kopfhoerer-AUSGABE mithoeren
+        (Loopback, ueber soundcard / WASAPI) -- z. B. um zu analysieren,
+        was Spotify gerade ueber deinen Kopfhoerer-Ausgang abspielt.
   waehlen.
+
+Wiedergabe mithoeren auf den anderen Plattformen:
+  macOS: ein virtuelles Ausgabegeraet wie BlackHole installieren
+         (https://existential.audio/blackhole/) -- es erscheint dann als
+         normaler Audio-Eingang in Modus (1).
+  Linux/Raspberry Pi: die PipeWire/Pulse-"Monitor"-Quellen erscheinen
+         direkt als normale Eingaenge in Modus (1).
 
 Wichtig zum Loopback: Es wird ALLES erfasst, was an den gewaehlten
 Ausgang geht (also auch Windows-Systemklaenge, Benachrichtigungen usw.),
 nicht nur Spotify allein.
 
-Installation:
-    pip install sounddevice mido python-rtmidi librosa numpy soundfile soundcard
+MIDI-Ausgang: Unter Windows braucht es einen vorhandenen Port (z. B.
+loopMIDI). macOS/Linux koennen zusaetzlich einen eigenen virtuellen Port
+erzeugen (CoreMIDI/ALSA) -- der erscheint dann in DAW & Co. als Eingang.
 
-('soundcard' wird nur fuer den Loopback-Modus gebraucht.)
+Installation:
+    pip install -r requirements.txt
+
+('soundcard' wird nur unter Windows fuer den Loopback-Modus gebraucht.)
 
 Beenden mit Strg+C.
 """
@@ -76,6 +88,11 @@ ANALYSIS_SR           = 22050   # Analyse-Abtastrate (Fenster wird ggf. herunter
 ONSET_HOP             = 256     # Hop der Onset-Huellkurve (kleiner = feineres Tempo-Raster)
 CHROMA_HOP            = 512     # Hop des Chromagramms (chroma_cqt-Standard)
 PPQN                  = 24      # MIDI-Clock: 24 Pulse pro Viertelnote
+
+VIRTUAL_MIDI          = "__virtual__"       # Sentinel statt Portname: eigenen
+                                            #   virtuellen Port erzeugen (nur
+                                            #   macOS/Linux, s. open_midi_output)
+VIRTUAL_MIDI_NAME     = "Audio2Midi Clock"  # Name des erzeugten Ports
 
 INPUT_SR              = 22050   # Wunschrate fuer den Eingangs-Modus (sounddevice)
 LOOPBACK_SR           = 48000   # Aufnahmerate fuer Loopback (Windows-Mixer ist meist 48 kHz)
@@ -1774,6 +1791,20 @@ def clock_worker(shared, midi_out, stop_event):
 # Quellen-Auswahl
 # ===========================================================================
 def choose_capture_mode():
+    if sys.platform != 'win32':
+        # Loopback (Ausgabe mithoeren) gibt es nur unter Windows (WASAPI).
+        # Auf den anderen Plattformen laeuft das Mithoeren ueber Geraete,
+        # die als normale Eingaenge erscheinen -- darum hier keine Auswahl.
+        if sys.platform == 'darwin':
+            print("\nHinweis: Zum Mithoeren der Wiedergabe (z. B. Spotify) unter")
+            print("macOS ein virtuelles Ausgabegeraet wie BlackHole installieren")
+            print("(https://existential.audio/blackhole/) -- es erscheint dann")
+            print("unten als normaler Audio-Eingang.")
+        else:
+            print("\nHinweis: Zum Mithoeren der Wiedergabe die PipeWire/Pulse-")
+            print("'Monitor'-Quelle waehlen -- sie erscheint unten als normaler")
+            print("Audio-Eingang.")
+        return "1"
     print("\nAufnahmequelle waehlen:")
     print("  [1] Audio-Eingang / Mikrofon")
     print("  [2] Ausgabe mithoeren (Loopback) -- z. B. Spotify ueber Kopfhoerer")
@@ -1928,23 +1959,51 @@ def choose_loopback_speaker():
 def choose_midi_output():
     print("\nVerfuegbare MIDI-Ausgaenge:")
     names = mido.get_output_names()
-    if not names:
+    # CoreMIDI (macOS) und ALSA (Linux) koennen eigene virtuelle Ports
+    # erzeugen -- so braucht es kein IAC-/loopMIDI-Gegenstueck. Die
+    # Windows-MultiMedia-API kann das nicht, dort bleibt alles wie gehabt.
+    allow_virtual = sys.platform != 'win32'
+    if not names and not allow_virtual:
         print("  Kein MIDI-Ausgang gefunden (wird uebersprungen).")
         return None
-        
+
     for n, name in enumerate(names):
         print(f"  [{n}] {name}")
+    if allow_virtual:
+        print(f"  [v] Virtuellen MIDI-Port '{VIRTUAL_MIDI_NAME}' erzeugen")
     print("  [x] Ueberspringen (kein MIDI)")
-    
+
+    choices = "Nummer, 'v' oder 'x'" if allow_virtual else "Nummer oder 'x'"
     while True:
         try:
-            raw = input("MIDI-Ausgang waehlen (Nummer oder 'x'): ").strip().lower()
+            raw = input(f"MIDI-Ausgang waehlen ({choices}): ").strip().lower()
             if raw == 'x':
                 return None
+            if allow_virtual and raw == 'v':
+                return VIRTUAL_MIDI
             sel = int(raw)
             return names[sel]
         except (ValueError, IndexError):
             print("Ungueltige Eingabe, bitte erneut.")
+
+
+def open_midi_output(midi_name):
+    """MIDI-Ausgang oeffnen. VIRTUAL_MIDI erzeugt einen eigenen virtuellen
+    Port (macOS/Linux), sonst wird der vorhandene Port geoeffnet."""
+    if not midi_name:
+        return None
+    if midi_name == VIRTUAL_MIDI:
+        return mido.open_output(VIRTUAL_MIDI_NAME, virtual=True)
+    return mido.open_output(midi_name)
+
+
+def midi_output_desc(midi_name):
+    """Anzeigename eines MIDI-Ausgangs (loest das VIRTUAL_MIDI-Sentinel auf)."""
+    if not midi_name:
+        return "Kein MIDI"
+    if midi_name == VIRTUAL_MIDI:
+        return f"virtueller Port '{VIRTUAL_MIDI_NAME}'"
+    return midi_name
 
 
 def pick_input_samplerate(device_index):
@@ -2185,6 +2244,73 @@ def stop_monitor(thread, mon_stop):
 
 
 # ===========================================================================
+# Tastenabfrage waehrend des Laufs (plattformuebergreifend)
+# ===========================================================================
+class KeyPoller:
+    """Nicht blockierende Einzeltasten-Abfrage fuer die Hotkeys im Lauf.
+
+    Windows: msvcrt, exakt wie bisher (kein Terminal-Umbau noetig).
+    macOS/Linux: stdin wird waehrend der Statusschleife in den cbreak-Modus
+    geschaltet (Taste sofort lesbar, ohne Enter und ohne Echo). Fuer die
+    interaktiven input()-Dialoge stellt pause() den Normalmodus wieder her,
+    resume() schaltet danach zurueck. Strg+C bleibt in beiden Modi wirksam
+    (cbreak laesst ISIG an)."""
+
+    def __init__(self):
+        self._posix = False
+        self._saved = None          # gesicherte Terminal-Attribute (POSIX)
+        if msvcrt is None:
+            try:
+                import termios, tty, select  # noqa: F401 -- nur Verfuegbarkeit pruefen
+                self._posix = sys.stdin.isatty()
+            except Exception:
+                self._posix = False
+
+    @property
+    def available(self):
+        return msvcrt is not None or self._posix
+
+    def resume(self):
+        """cbreak-Modus aktivieren (POSIX; unter Windows ein No-Op)."""
+        if self._posix and self._saved is None:
+            import termios, tty
+            try:
+                fd = sys.stdin.fileno()
+                self._saved = termios.tcgetattr(fd)
+                tty.setcbreak(fd)
+            except Exception:
+                self._saved = None
+                self._posix = False
+
+    def pause(self):
+        """Terminal fuer input()-Dialoge zuruecksetzen (POSIX; sonst No-Op)."""
+        if self._posix and self._saved is not None:
+            import termios
+            try:
+                termios.tcsetattr(sys.stdin.fileno(),
+                                  termios.TCSADRAIN, self._saved)
+            except Exception:
+                pass
+            self._saved = None
+
+    def poll(self):
+        """Gedrueckte Taste (kleingeschrieben) oder None; blockiert nie."""
+        if msvcrt is not None:
+            if msvcrt.kbhit():
+                return msvcrt.getwch().lower()
+            return None
+        if self._posix and self._saved is not None:
+            import select
+            try:
+                if select.select([sys.stdin], [], [], 0)[0]:
+                    ch = sys.stdin.read(1)
+                    return ch.lower() if ch else None
+            except Exception:
+                pass
+        return None
+
+
+# ===========================================================================
 # Hauptprogramm
 # ===========================================================================
 def main():
@@ -2214,7 +2340,10 @@ def main():
     monitor_index = choose_monitor_output(monitor_exclude)
 
     shared.capture_sr = capture_sr
-    midi_out = mido.open_output(midi_name) if midi_name else None
+    try:
+        midi_out = open_midi_output(midi_name)
+    except Exception as e:
+        sys.exit(f"MIDI-Ausgang fehlgeschlagen: {e}")
 
     # librosa/numba einmalig "aufwaermen" (sonst dauert der erste echte Analyse-
     # Aufruf mehrere Sekunden, was Pegel/Analyse anfangs blockiert wirken laesst).
@@ -2250,13 +2379,15 @@ def main():
         analysis_thread.start()
         clock_thread.start()
 
+        keys = KeyPoller()
         hotkeys = ("[i] Eingang wechseln   [o] Mithör-Ausgang   "
                    "[s] Signal-Scan   [?] Hilfe   [q] Beenden"
-                   if msvcrt is not None else "(Beenden mit Strg+C)")
+                   if keys.available else "(Beenden mit Strg+C)")
         print(f"\nQuelle: {src_desc}")
-        print(f"MIDI-Ausgang: {midi_name if midi_name else 'Kein MIDI'}")
+        print(f"MIDI-Ausgang: {midi_output_desc(midi_name)}")
         print(f"Mithören: {monitor_desc}")
         print(f"Tasten: {hotkeys}\n")
+        keys.resume()
 
         while not stop_event.is_set():
             # ---------- Statuszeile ----------
@@ -2284,9 +2415,9 @@ def main():
                   f"Pegel: {db:5.0f}dB [{bar}] | {status:<14}",
                   end="", flush=True)
 
-            # ---------- Tastatur (nur Windows) ----------
-            if msvcrt is not None and msvcrt.kbhit():
-                ch = msvcrt.getwch().lower()
+            # ---------- Tastatur ----------
+            ch = keys.poll()
+            if ch is not None:
                 if ch == 'q':
                     break
 
@@ -2299,6 +2430,7 @@ def main():
                     print()
 
                 elif ch == 'i':
+                    keys.pause()    # input()-Dialoge brauchen den Normalmodus
                     print("\n--- Eingangsquelle wechseln ---")
                     try:
                         new = choose_capture_source()
@@ -2327,8 +2459,10 @@ def main():
                             stream = loopback_thread = None
                             cap_stop = threading.Event()
                         print(f"Neue Quelle: {src_desc}\n")
+                    keys.resume()
 
                 elif ch == 'o':
+                    keys.pause()    # input()-Dialog braucht den Normalmodus
                     print("\n--- Mithör-Ausgang wechseln ---")
                     exclude = source.name if mode == "2" else ""
                     new_idx = choose_monitor_output(exclude)
@@ -2343,6 +2477,7 @@ def main():
                         monitor_index = None
                         monitor_desc = "aus"
                     print(f"Mithören: {monitor_desc}\n")
+                    keys.resume()
 
             time.sleep(0.1)
 
@@ -2350,6 +2485,10 @@ def main():
         print("\n\nBeende ...")
     finally:
         stop_event.set()
+        try:
+            keys.pause()            # POSIX: Terminal-Modus wiederherstellen
+        except NameError:
+            pass                    # Abbruch noch vor der Statusschleife
         stop_capture(stream, loopback_thread, cap_stop)
         stop_monitor(monitor_thread, mon_stop)
         time.sleep(0.1)
