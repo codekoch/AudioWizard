@@ -305,6 +305,14 @@ BEAT_VALID_SEC        = 8.0     # so lange gilt ein Beat-Anker aus der Analyse
 BEAT_NUDGE_MAX        = 0.0015  # max. Phasenkorrektur der Clock pro Tick (Sek.)
 BEAT_NUDGE_GAIN       = 0.1     # Anteil des Phasenfehlers, der pro Tick
                                 #   korrigiert wird (sanfte Regelschleife)
+BEAT_ANCHOR_EMA       = 0.3     # Glaettung des Beat-Ankers ueber die Analysen:
+                                #   Anteil, mit dem eine neue Phasenmessung in
+                                #   den gefilterten Anker eingeht. Einzelne
+                                #   Messungen rauschen (~10-20 ms, Phasen-
+                                #   Histogramm); ohne Glaettung jagt die
+                                #   Nudge-Schleife der Clock jedem Messwert
+                                #   einzeln nach -> hoerbares Phasen-Zappeln.
+                                #   1.0 = aus (jede Messung gilt sofort).
 
 LOG_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)),
                         "audio2midi.log")
@@ -324,19 +332,38 @@ def log_message(text):
 
 
 def feed_analysis(audio_q, block):
-    """Block in die Analyse-Queue legen; bei Stau aeltesten Block verwerfen."""
+    """Block samt Capture-Zeitstempel in die Analyse-Queue legen; bei Stau
+    aeltesten Block verwerfen.
+
+    Der Zeitstempel (perf_counter beim Eintreffen) datiert das LETZTE Sample
+    des Blocks und dient dem Analyse-Worker als Wanduhr-Zeit des Pufferendes
+    (Beat-Anker). Wuerde der Worker stattdessen beim ABHOLEN stempeln, kaeme
+    -- je nachdem, wann er nach einer ~0,5-s-Analyse die Queue leert -- bis
+    zu eine Chunk-Laenge (~85 ms) Jitter in den Anker, dem die beat-synchrone
+    Clock dann hoerbar hinterherregeln muesste."""
     try:
         if audio_q.qsize() >= ANALYSIS_QUEUE_MAX:
             try:
                 audio_q.get_nowait()
             except queue.Empty:
                 pass
-        audio_q.put_nowait(block)
+        audio_q.put_nowait((block, time.perf_counter()))
     except Exception:
         pass
 SILENCE_DB            = -50.0   # Pegel darunter gilt als Stille
 SILENCE_RESET_SEC     = 2.0     # so lange Stille (Pause/Songwechsel) -> Analyse zuruecksetzen
 CLOCK_SLEW_BPM_PER_S  = 4.0     # max. Tempoaenderung der Clock pro Sekunde
+CLOCK_DEADBAND_FRAC   = 0.002   # Totband der Clock: weicht das Zieltempo um
+                                #   weniger als so viel (relativ, 0,2 %) vom
+                                #   Clock-Tempo ab, bleibt die Clock konstant.
+                                #   Der BPM-Median wackelt von Analyse zu
+                                #   Analyse um ~+-0,1 BPM (Mess-Quantisierung)
+                                #   -- ohne Totband faehrt die Clock jedes
+                                #   Wackeln per Slew nach, ein konstantes
+                                #   Stueck bekommt so nie ein konstantes
+                                #   Tempo. Der stehenbleibende Restfehler
+                                #   (max. 0,2 %) ist unhoerbar; im Beat-Sync-
+                                #   Modus raeumt ihn die Nudge-Schleife ab.
 CLOCK_JUMP_FRAC       = 0.20    # weicht das Zieltempo um mehr als 20 % von der
                                 #   Clock ab, sofort springen statt slewen --
                                 #   das Slewen wuerde sonst ~15+ s dauern, in
@@ -1139,6 +1166,8 @@ def analysis_worker(shared, audio_q, stop_event):
     buf = np.zeros(0, dtype=np.float32)
     res_tail = np.zeros(0, dtype=np.float32)  # Roh-Kontext fuers Resampling
     buf_end_wall = 0.0          # Wanduhr-Zeit des Pufferendes (Beat-Anker)
+    b_anchor_f = 0.0            # geglaetteter Beat-Anker (BEAT_ANCHOR_EMA)
+    b_anchor_t = 0.0            # wann er zuletzt aktualisiert wurde
     last_run = 0.0
     # Tonart-Integration, zweistufig: schnelle EMA (reagiert in ~KEY_EMA_SEC)
     # plus Gesamtmittel seit Songbeginn (wird mit der Laufzeit immer stabiler).
@@ -1166,8 +1195,10 @@ def analysis_worker(shared, audio_q, stop_event):
         neue Schaetzung vorliegt)."""
         nonlocal buf, res_tail, ema_pcp, ema_bass, cum_pcp, cum_bass
         nonlocal cum_n, key_disp, key_pend, key_pend_n, chord_disp
+        nonlocal b_anchor_t
         buf = np.zeros(0, dtype=np.float32)
         res_tail = np.zeros(0, dtype=np.float32)
+        b_anchor_t = 0.0        # Anker-Glaettung neu beginnen (neues Stueck)
         ema_pcp = ema_bass = None
         cum_pcp = np.zeros(12)
         cum_bass = np.zeros(12)
@@ -1194,14 +1225,16 @@ def analysis_worker(shared, audio_q, stop_event):
                 shared.chord = "—"
 
     while not stop_event.is_set():
+        t_block = 0.0           # Capture-Zeit des juengsten Blocks
         try:
-            block = audio_q.get(timeout=0.1)
+            block, t_block = audio_q.get(timeout=0.1)
             blocks = [block]
             # Alle weiteren wartenden Bloecke mitnehmen, damit die Analyse nicht
             # hinterherhinkt, falls ein Durchlauf laenger gedauert hat.
             try:
                 while True:
-                    blocks.append(audio_q.get_nowait())
+                    block, t_block = audio_q.get_nowait()
+                    blocks.append(block)
             except queue.Empty:
                 pass
         except queue.Empty:
@@ -1279,7 +1312,12 @@ def analysis_worker(shared, audio_q, stop_event):
         buf = np.concatenate([buf, new])
         if len(buf) > win:
             buf = buf[-win:]
-        buf_end_wall = time.perf_counter()
+        # Pufferende mit der CAPTURE-Zeit des juengsten Blocks datieren,
+        # nicht mit "jetzt": der Worker leert die Queue oft erst nach einer
+        # ~0,5-s-Analyse stapelweise -- "jetzt" laege dann mal Millisekunden,
+        # mal eine Chunk-Laenge hinter der Aufnahme, und genau dieser Jitter
+        # ginge 1:1 in den Beat-Anker der Clock.
+        buf_end_wall = t_block
         now = time.perf_counter()
 
         # ---- Schneller Akkord-Pfad (Option CHORD_FAST) ----
@@ -1429,7 +1467,19 @@ def analysis_worker(shared, audio_q, stop_event):
         if want_beat and target > 0:
             offs = _beat_phase_from_onset_env(perc_env, env_fr, target)
             if offs is not None:
-                beat_update = (buf_end_wall - offs, 60.0 / target)
+                anchor = buf_end_wall - offs
+                period = 60.0 / target
+                # Anker glaetten: den bisherigen Anker aufs Beat-Raster der
+                # neuen Messung projizieren (round = naechstgelegener Beat)
+                # und nur um BEAT_ANCHOR_EMA des Phasenfehlers nachziehen.
+                # Die Nudge-Schleife der Clock folgt dann dem gefilterten
+                # Raster statt dem Messrauschen jeder Einzelanalyse.
+                if b_anchor_t > 0 and (now - b_anchor_t) < BEAT_VALID_SEC:
+                    pred = b_anchor_f + period * round(
+                        (anchor - b_anchor_f) / period)
+                    anchor = pred + BEAT_ANCHOR_EMA * (anchor - pred)
+                b_anchor_f, b_anchor_t = anchor, now
+                beat_update = (anchor, period)
 
         with shared.lock:
             if target > 0:
@@ -1536,14 +1586,17 @@ def analysis_worker_safe(shared, audio_q, stop_event):
 # Praezises Warten + MIDI-Clock
 # ===========================================================================
 def precise_sleep_until(target_perf, stop_event):
+    """Bis target_perf warten: grob per time.sleep mit Sicherheitsmarge
+    (der Scheduler weckt auch bei 1-ms-Timeraufloesung gern ~1 ms zu spaet),
+    die letzten ~2 ms Spin auf perf_counter fuer tickgenaues Senden."""
     while True:
         if stop_event.is_set():
             return
         remaining = target_perf - time.perf_counter()
         if remaining <= 0:
             return
-        if remaining > 0.0015:
-            time.sleep(remaining - 0.001)
+        if remaining > 0.002:
+            time.sleep(remaining - 0.0015)
 
 
 def clock_worker(shared, midi_out, stop_event):
@@ -1552,11 +1605,54 @@ def clock_worker(shared, midi_out, stop_event):
     Bei Stille/Reset stoppt sie (MIDI 'stop') und startet beim naechsten
     Stueck neu ('start') -- im Beat-Sync-Modus exakt auf dem naechsten
     erkannten Beat."""
+    winmm = None
+    if sys.platform == 'win32':
+        # Tick-Timing braucht beides: 1-ms-Timeraufloesung (sonst schlaeft
+        # time.sleep in ~15-ms-Schritten; die GUI setzt timeBeginPeriod --
+        # anders als das CLI -- sonst nirgends) und hohe Thread-Prioritaet,
+        # damit Analyse-Rechnerei und GUI-Rendering die Ticks nicht
+        # verdraengen. timeBeginPeriod ist refcounted, der doppelte Aufruf
+        # im CLI-Main schadet nicht.
+        try:
+            import ctypes
+            try:
+                winmm = ctypes.windll.winmm
+                winmm.timeBeginPeriod(1)
+            except Exception:
+                winmm = None
+            try:
+                # Windows 11 IGNORIERT timeBeginPeriod fuer Prozesse ohne
+                # Vordergrund-Fenster (Timer-Throttling) -- Ticks kaemen
+                # dann in ~15-ms-Schritten, sobald ein anderes Fenster den
+                # Fokus hat. Das Throttling hier explizit abschalten:
+                # PROCESS_POWER_THROTTLING_IGNORE_TIMER_RESOLUTION (0x4)
+                # im ControlMask, StateMask 0 = Aufloesung immer ehren.
+                class _PowerThrottling(ctypes.Structure):
+                    _fields_ = [("Version", ctypes.c_ulong),
+                                ("ControlMask", ctypes.c_ulong),
+                                ("StateMask", ctypes.c_ulong)]
+                st = _PowerThrottling(1, 0x4, 0)
+                ctypes.windll.kernel32.SetProcessInformation(
+                    ctypes.windll.kernel32.GetCurrentProcess(),
+                    4,          # ProcessPowerThrottling
+                    ctypes.byref(st), ctypes.sizeof(st))
+            except Exception:
+                pass
+            try:
+                ctypes.windll.kernel32.SetThreadPriority(
+                    ctypes.windll.kernel32.GetCurrentThread(),
+                    15)         # THREAD_PRIORITY_TIME_CRITICAL
+            except Exception:
+                pass
+        except Exception:
+            pass
+
     clock_msg = mido.Message('clock')
     running = False
     cur_bpm = INITIAL_BPM
     next_tick = time.perf_counter()
     last_loop = next_tick
+    t_sent = 0.0                # wann der letzte Tick tatsaechlich rausging
     tick_in_beat = 0            # 0..PPQN-1; Tick 0 soll auf dem Beat liegen
 
     while not stop_event.is_set():
@@ -1606,6 +1702,7 @@ def clock_worker(shared, midi_out, stop_event):
                     midi_out.send(clock_msg)
             except Exception:
                 break
+            t_sent = time.perf_counter()
             tick_in_beat = 1
             continue
 
@@ -1615,12 +1712,14 @@ def clock_worker(shared, midi_out, stop_event):
 
         max_step = CLOCK_SLEW_BPM_PER_S * dt
         diff = target - cur_bpm
+        dead = cur_bpm * CLOCK_DEADBAND_FRAC
         if abs(diff) > cur_bpm * CLOCK_JUMP_FRAC:
             cur_bpm = target            # grosser Sprung: sofort uebernehmen
-        elif abs(diff) <= max_step:
-            cur_bpm = target
-        else:
-            cur_bpm += math.copysign(max_step, diff)
+        elif abs(diff) > dead:
+            # Nur bis an den Rand des Totbands heranfahren (Hysterese):
+            # das +-0,1-BPM-Wackeln des Medians erreicht die Clock so gar
+            # nicht, echte Tempoaenderungen folgen weiter per Slew.
+            cur_bpm += math.copysign(min(max_step, abs(diff) - dead), diff)
         cur_bpm = max(20.0, min(400.0, cur_bpm))
 
         interval = 60.0 / (cur_bpm * PPQN)
@@ -1640,7 +1739,15 @@ def clock_worker(shared, midi_out, stop_event):
             next_tick -= nudge
 
         if now - next_tick > 0.05:
+            # Langer Aussetzer: neu aufsetzen; den Phasenversatz holt im
+            # Beat-Sync-Modus die Nudge-Schleife wieder ein.
             next_tick = now + interval
+        elif next_tick < t_sent + 0.5 * interval:
+            # Kurzer Rueckstand (Scheduler/GIL): aufholen, aber hoechstens
+            # mit doppeltem Tempo. Ein Burst von Ticks im Null-Abstand
+            # laesst Empfaenger, die das Tempo aus den Tick-Abstaenden
+            # mitteln, kurz zappeln.
+            next_tick = t_sent + 0.5 * interval
 
         precise_sleep_until(next_tick, stop_event)
         try:
@@ -1648,6 +1755,7 @@ def clock_worker(shared, midi_out, stop_event):
                 midi_out.send(clock_msg)
         except Exception:
             break
+        t_sent = time.perf_counter()
         tick_in_beat = (tick_in_beat + 1) % PPQN
 
     try:
@@ -1655,6 +1763,11 @@ def clock_worker(shared, midi_out, stop_event):
             midi_out.send(mido.Message('stop'))
     except Exception:
         pass
+    if winmm is not None:
+        try:
+            winmm.timeEndPeriod(1)
+        except Exception:
+            pass
 
 
 # ===========================================================================
