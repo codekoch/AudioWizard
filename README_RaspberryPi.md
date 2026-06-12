@@ -7,12 +7,17 @@ beide Dateien müssen also im selben Ordner liegen.
 
 ## Hardware
 
-- Raspberry Pi 5 (empfohlen) oder Pi 4, **64-bit** Raspberry Pi OS (Desktop)
+- Raspberry Pi 5 (empfohlen) oder Pi 4, **64-bit** Raspberry Pi OS –
+  wahlweise mit Desktop (einfachster Weg) oder als Lite-Variante ohne
+  Desktop (siehe „Minimal-Installation“ unten)
 - 7"-Display (HDMI oder DSI), idealerweise mit Touch
 - USB-Audio-Interface für den Eingang (der Pi hat keinen Line-In)
 - USB-MIDI-Interface für die Clock (entfällt, wenn nur angezeigt werden soll)
 
-## Installation (auf dem Pi)
+## Installation (Raspberry Pi OS mit Desktop)
+
+Der einfachste Weg; wer einen dedizierten Bühnen-Pi möglichst schlank
+aufsetzen will, springt zur „Minimal-Installation“ weiter unten.
 
 ```bash
 sudo apt update
@@ -96,7 +101,7 @@ python bpm_key_display.py
   Sekunden BPM und Tonart dauerhaft korrekt stehen. Damit lässt sich
   jede Änderung an den Stellschrauben nachmessen.
 
-## Autostart (Kiosk-Betrieb)
+## Autostart (Desktop-Variante)
 
 Auf Raspberry Pi OS mit Desktop genügt eine Autostart-Datei:
 
@@ -117,6 +122,99 @@ X-GNOME-Autostart-enabled=true
 
 Optional in `raspi-config`: Auto-Login auf den Desktop aktivieren und den
 Bildschirmschoner/Blanking abschalten.
+
+## Minimal-Installation: Pi OS Lite ohne Desktop (Kiosk)
+
+Für einen dedizierten Bühnen-Pi reicht **Raspberry Pi OS Lite (64-bit)**:
+Statt des kompletten Desktops startet ein minimaler X-Server direkt in die
+Anzeige. Das spart rund zwei Drittel Platz auf der Karte, bootet schneller,
+und außer Kernel, X und Python läuft praktisch nichts. Sound- und
+MIDI-Treiber stecken bereits im Kernel (ALSA, `snd-usb-audio`) –
+USB-Audio- und USB-MIDI-Interfaces funktionieren ohne weiteres Zutun.
+
+```bash
+sudo apt update
+sudo apt install -y python3-venv python3-tk libportaudio2 libsndfile1 \
+                    xserver-xorg-core xinit xserver-xorg-input-libinput \
+                    matchbox-window-manager x11-xserver-utils \
+                    fonts-dejavu-core
+
+python3 -m venv ~/audio2midi-env
+source ~/audio2midi-env/bin/activate
+pip install --upgrade pip
+pip install -r requirements.txt
+```
+
+Hinweise:
+
+- `xserver-xorg-input-libinput` wird für den Touchscreen gebraucht;
+  `matchbox-window-manager` (winziger Fenstermanager, ~100 KB), damit das
+  Tk-Vollbild zuverlässig funktioniert – ganz ohne Fenstermanager
+  ignoriert X das Vollbild-Attribut.
+- Falls pip für `python-rtmidi` kein fertiges Wheel findet und kompilieren
+  will: vorher `sudo apt install -y build-essential libasound2-dev`,
+  hinterher mit `sudo apt autoremove build-essential libasound2-dev`
+  wieder entfernbar.
+- Ohne PipeWire/PulseAudio gibt es **keine „Monitor of …“-Quellen**
+  (Wiedergabe mithören) – nur echte Eingänge wie USB-Interface oder
+  Mikrofon. Für einen reinen Analyse-Pi mit Line-In ist das egal; wer die
+  Systemwiedergabe analysieren will, bleibt bei der Desktop-Variante.
+
+### Autostart (Lite-Variante)
+
+Konsolen-Autologin aktivieren:
+
+```bash
+sudo raspi-config   # System Options -> Boot / Auto Login -> Console Autologin
+```
+
+`~/.xinitrc` anlegen (Pfade ggf. anpassen):
+
+```bash
+#!/bin/sh
+xset s off -dpms            # Bildschirmschoner und Blanking aus
+matchbox-window-manager -use_cursor no &
+exec $HOME/audio2midi-env/bin/python \
+     $HOME/Audio2Midi/bpm_key_display.py --fullscreen
+```
+
+Und am Ende von `~/.bash_profile` (startet X nur auf der ersten Konsole,
+nicht in SSH-Sitzungen):
+
+```bash
+if [ -z "$DISPLAY" ] && [ "$(tty)" = "/dev/tty1" ]; then
+    exec startx
+fi
+```
+
+So verhält sich der Pi wie ein Gerät: einschalten, Anzeige kommt.
+`Esc` beendet die Anzeige – durch den Autologin startet sie sofort neu
+(gewollt im Kiosk-Betrieb). Zum Arbeiten am Gerät per SSH anmelden oder
+mit `Strg+Alt+F2` auf eine zweite Konsole wechseln.
+
+## Robust gegen hartes Ausschalten (Overlay-Dateisystem)
+
+Auf der Bühne wird der Pi meist einfach vom Strom getrennt – auf Dauer
+riskiert das ein korruptes Dateisystem auf der SD-Karte. Abhilfe schafft
+das Overlay-Dateisystem (funktioniert mit Desktop- und Lite-Variante):
+Root wird read-only eingehängt, alle Schreibzugriffe landen nur noch im
+RAM, und hartes Ausschalten ist jederzeit folgenlos.
+
+```bash
+sudo raspi-config   # Performance Options -> Overlay File System -> Enable
+```
+
+Wichtig:
+
+- **Vorher** einmal normal starten und im Auswahlbildschirm Audio-Eingang,
+  MIDI-Ausgang und Optionen festlegen, damit `display_config.json`
+  geschrieben ist – mit aktivem Overlay gehen Änderungen daran beim
+  Ausschalten verloren.
+- Logs (`audio2midi.log`, optional `akkorde.txt`) landen dann ebenfalls
+  nur noch flüchtig im RAM. Für die Fehlersuche das Overlay vorübergehend
+  deaktivieren.
+- Für Updates (git pull, pip install, Einstellungs-Änderungen) das Overlay
+  in `raspi-config` deaktivieren, neu starten, ändern, wieder aktivieren.
 
 ## Wenn der Pi 4 nicht hinterherkommt
 

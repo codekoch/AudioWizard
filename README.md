@@ -92,7 +92,9 @@ identisch. Drei Besonderheiten:
 
 ## Raspberry Pi (Kiosk-Betrieb)
 
-Installation, Autostart und Performance-Tipps für den Pi stehen in
+Installation (mit Desktop oder als Minimal-Variante auf Pi OS Lite),
+Kiosk-Autostart, Overlay-Dateisystem für den Bühnenbetrieb (robust gegen
+hartes Ausschalten) und Performance-Tipps stehen in
 [README_RaspberryPi.md](README_RaspberryPi.md).
 
 ## Wie es funktioniert
