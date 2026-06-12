@@ -164,8 +164,10 @@ for path, true_bpm, true_key in files:
                 ccomp += time.perf_counter() - c0
                 cn += 1
                 if fres is not None:
+                    alt = (fres[2], fres[3]) if fres[2] is not None else None
                     cand = tracker.update(fres[0], fres[1], key=key_disp,
-                                          dt=core.CHORD_FAST_INTERVAL)
+                                          dt=core.CHORD_FAST_INTERVAL,
+                                          alt=alt)
                     if cand != "—" and cand != chord_disp:
                         chord_disp = cand
                         n_changes += 1

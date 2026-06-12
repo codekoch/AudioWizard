@@ -195,7 +195,11 @@ CHORD_FAST            = False   # Schneller Akkord-Pfad (GUI-Option): eigene,
                                 #   grossen Analyse. Kostet zusaetzliche CPU;
                                 #   auf schwacher Hardware (Pi) aus lassen,
                                 #   dann laeuft der bisherige 1-s-Pfad.
-CHORD_FAST_INTERVAL   = 0.3     # Abstand der schnellen Akkord-Analysen (Sek.)
+CHORD_FAST_INTERVAL   = 0.2     # Abstand der schnellen Akkord-Analysen (Sek.)
+                                #   -- bei ~18 ms je Analyse (12-Bin-CQT)
+                                #   bleibt das unter 10 % eines Kerns; das
+                                #   Innovations-Gate braucht 2 Bestaetigungen,
+                                #   profitiert also direkt vom kurzen Takt
 CHORD_FAST_WIN        = 2.0     # so viele juengste Sekunden verarbeitet der
                                 #   schnelle Pfad (= das Akkordfenster; eine
                                 #   eigene Tail-Mittelung entfaellt). Kuerzer
@@ -211,6 +215,24 @@ CHORD_FAST_OCTAVES    = 5       # CQT-Umfang des schnellen Pfads, ab C2:
                                 #   die sehr langen Filter der C1-Oktave
                                 #   lohnen auf 2,5 s nicht; Bass-Profil aus
                                 #   den unteren 2 Oktaven derselben CQT
+CHORD_FAST_SAL_PEAKS  = True    # Salience-Peak-Filterung im schnellen Pfad.
+                                #   GEMESSEN: ohne sie klar schlechter (D-Moll
+                                #   -13 pp) -- sie uebernimmt hier die Drum-
+                                #   Unterdrueckung, denn der schnelle Pfad
+                                #   hat keine HPSS-Trennung.
+CHORD_FAST_BINS_OCT   = 12      # CQT-Aufloesung des schnellen Pfads. 12 statt
+                                #   36 Bins/Oktave: das Feinraster diente nur
+                                #   der Tuning-Robustheit, die Stimmung ist
+                                #   aber pro Song geschaetzt und eingefroren.
+                                #   Kuerzere Filter (C2: 0,26 statt 0,79 s!)
+                                #   = bessere Zeitaufloesung im Bass und
+                                #   ~3x weniger CQT-CPU (Unschaerfeprinzip:
+                                #   Frequenz- gegen Zeitaufloesung).
+                                #   GEMESSENER TRADEOFF: 12 Bins ~0,9 s
+                                #   Wechsel-Latenz bei 92 % Diatonik-Proxy
+                                #   (E-Dur-Testdatei); 36 Bins ~1,9 s bei
+                                #   95 % -- die langen Bassfilter
+                                #   verschmieren auch den Onset-Anker.
 CHORD_FAST_HALF_LIFE  = 1.0     # Recency-Gewichtung im schnellen Fenster:
                                 #   Frame-Gewicht halbiert sich je so viele
                                 #   Sekunden Alter -- ein neuer Akkord
@@ -220,6 +242,58 @@ CHORD_FAST_HALF_LIFE  = 1.0     # Recency-Gewichtung im schnellen Fenster:
                                 #   1-s-Pfad bei ~1,8 s Wechsel-Latenz
                                 #   (statt ~2-3 s); 0,7 s war minimal
                                 #   schneller, aber messbar flackriger.
+                                #   Greift nur als RUECKFALL, wenn kein
+                                #   Onset-Anker gefunden wird (s. u.).
+CHORD_ONSET_ANCHOR    = True    # Akkordfenster am letzten starken Onset
+                                #   verankern: Akkordwechsel liegen auf
+                                #   Anschlaegen -- ab dem Anker zaehlt nur
+                                #   noch, was DANACH klang (onset-synchrone
+                                #   Chroma-Mittelung, Bello & Pickens 2005).
+                                #   Onsets sind lokale Ereignisse, anders
+                                #   als die (verworfene) extrapolierte
+                                #   Beat-Phase jittert hier nichts.
+CHORD_ONSET_STD       = 1.5     # Onset-Schwelle: Spektralfluss-Frames ueber
+                                #   Mittel + so viele Standardabweichungen
+                                #   gelten als Anschlag
+CHORD_ONSET_MIN_TAIL  = 0.3     # Mindestmaterial NACH dem Anker (Sek.) --
+                                #   sonst gilt der vorherige Anker bzw. der
+                                #   Recency-Rueckfall (zu kurzes Segment
+                                #   liefert nur Rauschen)
+CHORD_ANCHOR_NOV      = 0.3     # Harmonie-Neuheit (1 - Pearson zwischen dem
+                                #   Profil vor und nach dem Onset), damit ein
+                                #   Onset das Fenster neu verankern darf
+                                #   (Harmonic-Change-Idee, Harte et al. 2006).
+                                #   Ohne diese Pruefung stutzt JEDER Drum-
+                                #   Schlag das Fenster auf den letzten Beat
+                                #   -> rauschige Profile, Flackern (gemessen).
+CHORD_ANCHOR_PRE      = 1.0     # so viel Kontext (Sek.) VOR dem Onset geht
+                                #   in den Neuheits-Vergleich -- ein kurzes
+                                #   Vorher-Fenster ist selbst zu verrauscht,
+                                #   um Harmoniewechsel von Beats zu trennen
+CHORD_ALT_MARGIN      = 0.40    # Mindestabstand des Kurzsegment-Vorschlags
+                                #   zum besten Akkord mit ANDEREM GRUNDTON,
+                                #   damit er als Wechsel-Verdacht zaehlt.
+                                #   Bewusst weder der Abstand zum Zweit-
+                                #   platzierten (bei Verwandten wie F vs.
+                                #   Fmaj7 prinzipiell winzig, sagt nichts
+                                #   ueber den Wechsel) noch zum aktuellen
+                                #   Akkord (nach einem Fehl-Kipp kaskadiert
+                                #   das; beides gemessen). Ein klarer neuer
+                                #   Akkord liegt ~0,5 ueber fremden Grund-
+                                #   toenen, Melodie-Phrasen deutlich tiefer.
+                                #   (Das Segment auch als HAUPT-Beobachtung
+                                #   zu nutzen wurde gemessen und verworfen:
+                                #   Post-Onset-Segmente sind melodie-
+                                #   dominiert und druecken die Qualitaet --
+                                #   als reiner Wechsel-DETEKTOR ist es
+                                #   dagegen unschaedlich.)
+CHORD_GATE_SELF_P     = 0.2     # Traegheit waehrend des Gate-Updates: schlaegt
+                                #   das Kurzsegment 2x in Folge denselben
+                                #   anderen Akkord vor, wird einmalig mit
+                                #   dieser (niedrigen) Selbstuebergangs-
+                                #   wahrscheinlichkeit aktualisiert -> der
+                                #   Tracker kippt sofort, statt ~0,7 s zu
+                                #   warten (Innovation-Gating)
 CHORD_LOG_PATH        = None    # Textdatei fuers Akkord-Protokoll (GUI-
                                 #   Option); None = kein Protokoll
 ANALYSIS_QUEUE_MAX    = 256     # max. gepufferte Bloecke fuer die Analyse --
@@ -346,6 +420,18 @@ class Shared:
                                   # der Worker leert Puffer und Historie
                                   # und beginnt von vorn; die Clock stoppt
                                   # bis zur naechsten echten Schaetzung
+        self.fast_buf = None      # Kopie der juengsten Audio-Sekunden
+                                  # (ANALYSIS_SR) fuer den schnellen
+                                  # Akkord-Thread; legt der Analyse-Worker ab
+        self.tuning = 0.0         # eingefrorene Stimmung des Stuecks
+                                  # (TuningEstimator), fuer den Akkord-Thread
+        self.chord_epoch = 0      # zaehlt Analyse-Resets: der schnelle
+                                  # Akkord-Thread verwirft seinen Zustand,
+                                  # sobald sich der Wert aendert
+        self.chord_logged = False # seit letzter Trennmarke Akkorde im
+                                  # Protokoll? (je nach Modus schreibt der
+                                  # Worker ODER der Akkord-Thread Akkorde;
+                                  # die Trennmarken schreibt der Worker)
         self.beat_sync = False    # Clock auf den Beat einrasten (GUI-Option)
         self.beat_anchor = 0.0    # perf_counter-Zeit eines erkannten Beats
         self.beat_period = 0.0    # Beat-Abstand in Sekunden
@@ -637,7 +723,13 @@ def chroma_pcp(y, sr, y_harm=None, tail_sec=0.0, tuning=0.0):
 
 def chroma_pcp_fast(y, sr, tuning=0.0):
     """Leichtgewichtiges Chroma NUR fuer den schnellen Akkord-Pfad:
-    (pcp, bass) ueber das ganze -- kurze -- Fenster, oder None.
+    (pcp, bass, alt_pcp, alt_bass) oder None.
+
+    pcp/bass: stabile Hauptbeobachtung (Recency-gewichtetes Fenster bzw.
+    onset-verankertes Segment, wenn es lang genug ist). alt_pcp/alt_bass:
+    Profil des onset-verankerten KURZsegments als Wechsel-Verdacht fuer
+    das Innovations-Gate des ChordTracker -- None, wenn kein harmonisch
+    neuer Onset gefunden wurde.
 
     Gegenueber chroma_pcp eingespart: die HPSS-Trennung (die Salience-
     Peak-Filterung daempft breitbandige Drums bereits), groeberer Hop
@@ -648,26 +740,74 @@ def chroma_pcp_fast(y, sr, tuning=0.0):
     try:
         if y is None or not np.any(y):
             return None
+        bpo = CHORD_FAST_BINS_OCT
         fmin = librosa.note_to_hz('C2')
-        n_bins = CHORD_FAST_OCTAVES * 36
+        n_bins = CHORD_FAST_OCTAVES * bpo
+        # tuner.value ist in Bruchteilen eines 36er-Bins (Schaetzung mit
+        # bins_per_octave=36) -> auf das Raster des schnellen Pfads umrechnen.
         C = np.abs(librosa.cqt(y, sr=sr, fmin=fmin, n_bins=n_bins,
-                               bins_per_octave=36, tuning=tuning,
+                               bins_per_octave=bpo,
+                               tuning=tuning * bpo / 36.0,
                                hop_length=CHORD_FAST_HOP))
+        # Spektralfluss aus der ohnehin berechneten CQT (faellt fast
+        # gratis ab) -- Grundlage fuer den Onset-Anker weiter unten.
+        flux = None
+        if CHORD_ONSET_ANCHOR and C.shape[1] >= 8:
+            flux = np.maximum(0.0, np.diff(C, axis=1)).sum(axis=0)
         freqs = librosa.cqt_frequencies(n_bins=n_bins, fmin=fmin,
-                                        bins_per_octave=36)
+                                        bins_per_octave=bpo)
         C = librosa.salience(C, freqs=freqs, harmonics=SAL_HARMONICS,
-                             weights=SAL_WEIGHTS, fill_value=0.0)
+                             weights=SAL_WEIGHTS, fill_value=0.0,
+                             filter_peaks=CHORD_FAST_SAL_PEAKS)
         chroma = librosa.feature.chroma_cqt(
             C=C, sr=sr, fmin=fmin, n_octaves=CHORD_FAST_OCTAVES,
-            bins_per_octave=36, hop_length=CHORD_FAST_HOP)
+            bins_per_octave=bpo, hop_length=CHORD_FAST_HOP)
         bchroma = librosa.feature.chroma_cqt(
-            C=C[:2 * 36], sr=sr, fmin=fmin, n_octaves=2,
-            bins_per_octave=36, hop_length=CHORD_FAST_HOP)
+            C=C[:2 * bpo], sr=sr, fmin=fmin, n_octaves=2,
+            bins_per_octave=bpo, hop_length=CHORD_FAST_HOP)
         if CHROMA_LOG_COMP > 0:
             chroma = np.log1p(CHROMA_LOG_COMP * chroma)
             bchroma = np.log1p(CHROMA_LOG_COMP * bchroma)
-        if CHORD_FAST_HALF_LIFE > 0 and chroma.shape[1] > 1:
-            n = chroma.shape[1]
+        # Mittelung: bevorzugt ab dem letzten starken Onset (Akkordwechsel
+        # liegen auf Anschlaegen -- alles davor gehoert zum alten Akkord),
+        # sonst Recency-gewichtet ueber das ganze Fenster.
+        n = chroma.shape[1]
+        anchor = -1
+        if flux is not None and len(flux) >= 4:
+            thr = flux.mean() + CHORD_ONSET_STD * flux.std()
+            min_tail = max(2, int(round(
+                CHORD_ONSET_MIN_TAIL * sr / CHORD_FAST_HOP)))
+            pre_k = max(min_tail, int(round(
+                CHORD_ANCHOR_PRE * sr / CHORD_FAST_HOP)))
+            cand = np.flatnonzero(flux > thr) + 1   # Fluss i: Frame i -> i+1
+            cand = cand[(cand <= n - min_tail) & (cand >= min_tail)]
+            # Nur Onsets, an denen sich die HARMONIE aendert, duerfen
+            # verankern: Profil vor/nach dem Kandidaten vergleichen --
+            # reine Schlagzeug-Anschlaege veraendern das Chroma kaum.
+            # Vom juengsten Kandidaten rueckwaerts, der erste neue gewinnt.
+            for a in cand[::-1][:3]:
+                post = chroma[:, a:].mean(axis=1)
+                pre = chroma[:, max(0, a - pre_k):a].mean(axis=1)
+                pc = post - post.mean()
+                qc = pre - pre.mean()
+                den = float(np.linalg.norm(pc) * np.linalg.norm(qc))
+                if den <= 1e-12:
+                    continue
+                if 1.0 - float(pc @ qc) / den >= CHORD_ANCHOR_NOV:
+                    anchor = int(a)
+                    break
+        alt_pcp = alt_bass = None
+        if anchor > 0:
+            alt_pcp = chroma[:, anchor:].mean(axis=1)
+            alt_bass = bchroma[:, anchor:].mean(axis=1)
+            asum = alt_pcp.sum()
+            if asum > 0:
+                alt_pcp = alt_pcp / asum
+                absum = alt_bass.sum()
+                alt_bass = alt_bass / absum if absum > 0 else np.zeros(12)
+            else:
+                alt_pcp = alt_bass = None
+        if CHORD_FAST_HALF_LIFE > 0 and n > 1:
             age = (n - 1 - np.arange(n)) * (CHORD_FAST_HOP / sr)
             w = 0.5 ** (age / CHORD_FAST_HALF_LIFE)
             w /= w.sum()
@@ -680,7 +820,8 @@ def chroma_pcp_fast(y, sr, tuning=0.0):
         if s <= 0:
             return None
         bs = bass.sum()
-        return pcp / s, (bass / bs if bs > 0 else np.zeros(12))
+        return (pcp / s, (bass / bs if bs > 0 else np.zeros(12)),
+                alt_pcp, alt_bass)
     except Exception:
         return None
 
@@ -829,12 +970,14 @@ class ChordTracker:
     def __init__(self):
         self.belief = None
         self.chord = "—"
+        self.alt_pending = None   # Wechsel-Verdacht aus dem Kurzsegment
 
     def reset(self):
         self.belief = None
         self.chord = "—"
+        self.alt_pending = None
 
-    def update(self, pcp, bass=None, key=None, dt=None):
+    def update(self, pcp, bass=None, key=None, dt=None, alt=None):
         """Neues Chroma-Profil einarbeiten; liefert den aktuellen Akkord.
 
         dt = Abstand zur vorigen Beobachtung in Sekunden. CHORD_SELF_P und
@@ -844,7 +987,15 @@ class ChordTracker:
         dann gleich stark, egal ob der langsame 1-s-Pfad oder der schnelle
         0,3-s-Pfad fuettert. Ohne die Evidenz-Skalierung integriert der
         schnelle Pfad das ~3-fache Evidenzgewicht und flackert (gemessen:
-        Wechselrate etwa verdoppelt)."""
+        Wechselrate etwa verdoppelt).
+
+        alt = (pcp, bass) des onset-verankerten Kurzsegments (schneller
+        Pfad): schlaegt es zweimal in Folge denselben ANDEREN Akkord mit
+        klarem Vorsprung (CHORD_ALT_MARGIN) vor, folgt ein einmaliges
+        Gate-Update mit niedriger Traegheit (CHORD_GATE_SELF_P) und voller
+        Evidenz -- der Tracker kippt am Akkordwechsel sofort, waehrend die
+        normale Traegheit im Gleichlauf unangetastet bleibt (Innovation-
+        Gating, analog zur Innovationspruefung beim Kalman-Filter)."""
         scores = chord_scores(pcp, bass)
         if scores is None:
             return self.chord
@@ -870,6 +1021,46 @@ class ChordTracker:
             belief = belief / s if s > 0 else emis
         self.belief = belief
         self.chord = CHORD_NAMES[int(np.argmax(belief))]
+
+        # ---- Innovations-Gate (nur schneller Pfad, alt-Profil) ----
+        if alt is not None and alt[0] is not None:
+            ascores = chord_scores(alt[0], alt[1])
+        else:
+            ascores = None
+        if ascores is None:
+            self.alt_pending = None
+            return self.chord
+        if KEY_CHORD_PRIOR > 0 and key:
+            mask = _diatonic_mask(key)
+            if mask is not None:
+                ascores = ascores + KEY_CHORD_PRIOR * mask
+        best = int(np.argmax(ascores))
+        alt_best = CHORD_NAMES[best]
+        # Margin gegen den besten Akkord mit ANDEREM Grundton (Varianten
+        # desselben Grundtons wie F/Fmaj7/F7 zaehlen nicht als Rivalen).
+        nt = len(CHORD_TYPES)
+        root = best // nt
+        rival = np.delete(ascores, slice(root * nt, (root + 1) * nt))
+        fam_margin = float(ascores[best] - rival.max())
+        if alt_best == self.chord or fam_margin < CHORD_ALT_MARGIN:
+            self.alt_pending = None
+        elif alt_best != self.alt_pending:
+            self.alt_pending = alt_best        # erster Verdacht: merken
+        else:
+            # Verdacht bestaetigt -> Gate: einmaliges Update mit niedriger
+            # Traegheit und voller (nicht dt-skalierter) Evidenz.
+            emis = np.exp(CHORD_TEMP * (ascores - ascores.max()))
+            s = emis.sum()
+            if np.isfinite(s) and s > 0:
+                emis /= s
+                pred = CHORD_GATE_SELF_P * self.belief \
+                    + (1.0 - CHORD_GATE_SELF_P) / len(emis)
+                belief = pred * emis
+                s = belief.sum()
+                if s > 0:
+                    self.belief = belief / s
+                    self.chord = CHORD_NAMES[int(np.argmax(self.belief))]
+            self.alt_pending = None
         return self.chord
 
 
@@ -963,8 +1154,6 @@ def analysis_worker(shared, audio_q, stop_event):
     chord_disp = "—"            # aktuell erkannter Akkord
     chord_tracker = ChordTracker()  # HMM-Glaettung ueber die Analysen
     tuner = TuningEstimator()   # Stimmung des Stuecks (wird eingefroren)
-    last_fast = 0.0             # Zeitpunkt der letzten schnellen Akkord-Analyse
-    chord_logged = False        # seit letzter Trennmarke Akkorde geschrieben?
     silence_rms = 10.0 ** (SILENCE_DB / 20.0)
     silent_since = None
     err_shown = False           # Analyse-Fehler nur einmal melden
@@ -976,8 +1165,7 @@ def analysis_worker(shared, audio_q, stop_event):
         die Anzeige-Ergebnisse geloescht (haelt die Clock an, bis eine
         neue Schaetzung vorliegt)."""
         nonlocal buf, res_tail, ema_pcp, ema_bass, cum_pcp, cum_bass
-        nonlocal cum_n, key_disp, key_pend, key_pend_n
-        nonlocal chord_disp, chord_logged
+        nonlocal cum_n, key_disp, key_pend, key_pend_n, chord_disp
         buf = np.zeros(0, dtype=np.float32)
         res_tail = np.zeros(0, dtype=np.float32)
         ema_pcp = ema_bass = None
@@ -989,9 +1177,14 @@ def analysis_worker(shared, audio_q, stop_event):
         chord_disp = "—"
         chord_tracker.reset()
         tuner.reset()
-        if chord_logged:
+        with shared.lock:
+            logged = shared.chord_logged
+            shared.chord_logged = False
+            shared.chord_epoch += 1     # Akkord-Thread: Zustand verwerfen
+            shared.fast_buf = None
+            shared.tuning = 0.0
+        if logged:
             chord_log("--- " + mark + " ---")
-            chord_logged = False
         if clear_shared:
             with shared.lock:
                 shared.have_estimate = False
@@ -1090,27 +1283,15 @@ def analysis_worker(shared, audio_q, stop_event):
         now = time.perf_counter()
 
         # ---- Schneller Akkord-Pfad (Option CHORD_FAST) ----
-        # Eigene, leichte Analyse NUR fuer den Akkord, zwischen den grossen
-        # Analysen: HPSS + Chroma auf den juengsten CHORD_FAST_WIN Sekunden
-        # statt des ganzen 8-s-Fensters. Der grosse Pfad laesst dann sein
-        # Akkordfenster weg (tail=0, s. u.) -- der Tracker wird nur von
-        # hier gefuettert, mit dt-angepasster Traegheit.
-        if CHORD_ENABLED and CHORD_FAST and eff >= silence_rms \
-                and (now - last_fast) >= CHORD_FAST_INTERVAL \
-                and len(buf) >= int(CHORD_FAST_WIN * ANALYSIS_SR):
-            dt_fast = (now - last_fast) if last_fast > 0 else None
-            last_fast = now
-            fres = chroma_pcp_fast(buf[-int(CHORD_FAST_WIN * ANALYSIS_SR):],
-                                   ANALYSIS_SR, tuning=tuner.value)
-            if fres is not None:
-                cand_chord = chord_tracker.update(fres[0], fres[1],
-                                                  key=key_disp, dt=dt_fast)
-                if cand_chord != "—" and cand_chord != chord_disp:
-                    chord_disp = cand_chord
-                    chord_log(time.strftime("%H:%M:%S") + "  " + cand_chord)
-                    chord_logged = True
-                    with shared.lock:
-                        shared.chord = chord_disp
+        # Die eigentliche Akkord-Analyse laeuft in einem EIGENEN Thread
+        # (fast_chord_worker): die ~0,5 s Rechenzeit der grossen Analyse
+        # wuerde die kurzen Akkord-Schritte sonst blockieren und die
+        # Wechsel-Latenz um bis zu eine halbe Sekunde wuerfeln. Hier wird
+        # nur der juengste Audio-Schnitt fuer den Thread abgelegt.
+        if CHORD_ENABLED and CHORD_FAST and len(buf) > 0:
+            snap = buf[-int(CHORD_FAST_WIN * ANALYSIS_SR):].copy()
+            with shared.lock:
+                shared.fast_buf = snap
 
         if len(buf) < win * 0.5 or (now - last_run) < ANALYSIS_INTERVAL:
             continue
@@ -1211,7 +1392,8 @@ def analysis_worker(shared, audio_q, stop_event):
             if cand_chord != "—" and cand_chord != chord_disp:
                 chord_disp = cand_chord
                 chord_log(time.strftime("%H:%M:%S") + "  " + cand_chord)
-                chord_logged = True
+                with shared.lock:
+                    shared.chord_logged = True
 
         # Tempo: Median der letzten Schaetzungen -> robust gegen Ausreisser.
         if bpm > 0:
@@ -1257,17 +1439,88 @@ def analysis_worker(shared, audio_q, stop_event):
                 shared.raw_bpm = bpm
             shared.key = key
             shared.key_confident = confident
-            shared.chord = chord_disp if CHORD_ENABLED else "—"
+            shared.tuning = tuner.value
+            if not (CHORD_ENABLED and CHORD_FAST):
+                # im schnellen Modus gehoert shared.chord dem Akkord-Thread
+                shared.chord = chord_disp if CHORD_ENABLED else "—"
             if beat_update is not None:
                 shared.beat_anchor = beat_update[0]
                 shared.beat_period = beat_update[1]
                 shared.beat_valid_time = time.perf_counter()
 
 
+def fast_chord_worker(shared, stop_event):
+    """Eigener Thread fuer den schnellen Akkord-Pfad (Option CHORD_FAST).
+
+    Laeuft PARALLEL zur grossen Analyse: deren ~0,5 s Rechenzeit pro
+    Durchlauf wuerde die kurzen Akkord-Schritte sonst blockieren und die
+    Wechsel-Latenz um bis zu eine halbe Sekunde wuerfeln. numpy/librosa
+    geben waehrend der grossen Transformationen den GIL frei, der Thread
+    rechnet also tatsaechlich nebenher. Solange CHORD_FAST aus ist,
+    schlaeft er nur (kostet nichts -- Pi-tauglich).
+
+    Audio kommt als Kopie der juengsten Sekunden aus shared.fast_buf
+    (legt der Analyse-Worker ab), der Akkord geht nach shared.chord und
+    ins Protokoll. Meldet der Worker einen Analyse-Reset (chord_epoch),
+    verwirft der Thread seinen Zustand."""
+    tracker = ChordTracker()
+    chord_disp = "—"
+    epoch = None
+    last_obs = 0.0
+    silence_rms = 10.0 ** (SILENCE_DB / 20.0)
+    while not stop_event.is_set():
+        if not (CHORD_ENABLED and CHORD_FAST):
+            time.sleep(0.25)
+            continue
+        t0 = time.perf_counter()
+        with shared.lock:
+            buf = shared.fast_buf
+            ep = shared.chord_epoch
+            key = shared.key
+            tuning = shared.tuning
+            lvl = shared.level
+            lvt = shared.level_time
+            hold = shared.hold
+        if epoch != ep:
+            epoch = ep
+            tracker.reset()
+            chord_disp = "—"
+            last_obs = 0.0
+        # Pegel-Gate wie im Worker (abklingend, falls keine Updates kommen)
+        age = t0 - lvt
+        eff = lvl * (math.exp(-(age - 0.3) / 0.4) if age > 0.3 else 1.0)
+        if hold or buf is None or eff < silence_rms \
+                or len(buf) < int(CHORD_FAST_WIN * ANALYSIS_SR * 0.9):
+            time.sleep(CHORD_FAST_INTERVAL)
+            continue
+        try:
+            fres = chroma_pcp_fast(buf, ANALYSIS_SR, tuning=tuning)
+        except Exception:
+            fres = None
+        if fres is not None:
+            dt = (t0 - last_obs) if last_obs > 0 else None
+            last_obs = t0
+            alt = (fres[2], fres[3]) if fres[2] is not None else None
+            cand = tracker.update(fres[0], fres[1], key=key, dt=dt, alt=alt)
+            if cand != "—" and cand != chord_disp:
+                chord_disp = cand
+                chord_log(time.strftime("%H:%M:%S") + "  " + cand)
+                with shared.lock:
+                    shared.chord = chord_disp
+                    shared.chord_logged = True
+        d = t0 + CHORD_FAST_INTERVAL - time.perf_counter()
+        if d > 0:
+            time.sleep(d)
+
+
 def analysis_worker_safe(shared, audio_q, stop_event):
     """analysis_worker mit Absturzschutz: ein unerwarteter Fehler wird
     geloggt und der Worker neu gestartet, statt die Analyse dauerhaft zu
-    verlieren (die Anzeige wuerde sonst stumm einfrieren)."""
+    verlieren (die Anzeige wuerde sonst stumm einfrieren). Startet auch
+    den Thread des schnellen Akkord-Pfads (fast_chord_worker) -- der
+    haengt am selben stop_event und uebersteht Worker-Neustarts."""
+    threading.Thread(target=fast_chord_worker, args=(shared, stop_event),
+                     daemon=True).start()
     while not stop_event.is_set():
         try:
             analysis_worker(shared, audio_q, stop_event)
