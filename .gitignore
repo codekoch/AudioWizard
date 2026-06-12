@@ -4,3 +4,7 @@ __pycache__/
 display_config.json
 Backup/
 akkorde.txt
+# Test-Audio (Urheberrecht) -- lokal fuer eval_detection/eval_chords behalten
+*.mp3
+# Lokale Werkzeug-Einstellungen
+.claude/
