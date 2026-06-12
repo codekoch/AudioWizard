@@ -3,6 +3,7 @@
 ![Python](https://img.shields.io/badge/Python-3.9%2B-blue)
 ![Plattform](https://img.shields.io/badge/Plattform-Windows%20%C2%B7%20Raspberry%20Pi%20%C2%B7%20Linux-555)
 ![MIDI](https://img.shields.io/badge/MIDI-Clock%2C%2024%20PPQN-1D9E75)
+![Lizenz](https://img.shields.io/badge/Lizenz-GPL--3.0-orange)
 
 **Hört Musik mit und zeigt live Tempo, Tonart und Akkorde an – und liefert
 dazu eine stabile MIDI-Clock, die Drumcomputer, Sequenzer, Arpeggiatoren und
@@ -105,6 +106,11 @@ die gemessen und verworfen wurden.
 numpy, librosa, soundfile, sounddevice, mido, python-rtmidi – und nur unter
 Windows zusätzlich soundcard für den Loopback (`requirements.txt`).
 
+## Lizenz
+
+[GPL-3.0](LICENSE) – frei nutzbar und veränderbar; Weitergaben (auch
+veränderte) müssen unter derselben Lizenz quelloffen bleiben.
+
 ---
 
-*Autoren: codekoch / claude*
+*Autoren: codekoch / claude · © 2026 codekoch*
