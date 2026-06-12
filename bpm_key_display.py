@@ -150,6 +150,7 @@ class DisplayApp:
                                               # zwei Sessions parallel starten
                                               # -> doppelte Clock/Aufnahme)
         self._last_height = 0
+        self._last_width = 0
         self._bpm_big = True                  # BPM-Label gerade gross/aktiv?
         self.hold = False                     # Analyse eingefroren?
         self._load_options()                  # Optionen + BPM-Bereich anwenden
@@ -163,6 +164,7 @@ class DisplayApp:
         self.f_h1    = tkfont.Font(family="Helvetica", size=-26)
         self.f_list  = tkfont.Font(family="Helvetica", size=-17)
         self.f_btn   = tkfont.Font(family="Helvetica", size=-16)
+        self.f_tiny  = tkfont.Font(family="Helvetica", size=-11)
 
         self._build_main_frame()
         self._build_setup_frame()
@@ -344,7 +346,6 @@ class DisplayApp:
                  bg=COL_BG, fg=COL_FG).pack(pady=(20, 12))
 
         body = tk.Frame(f, bg=COL_BG)
-        body.pack(fill="both", expand=True, padx=24)
         body.columnconfigure(0, weight=1)
         body.columnconfigure(1, weight=1)
         body.rowconfigure(1, weight=1)
@@ -356,7 +357,10 @@ class DisplayApp:
                  fg=COL_MUTED, anchor="w").grid(row=0, column=1,
                                                 sticky="w", padx=(16, 0),
                                                 pady=(0, 6))
-        kw = dict(font=self.f_list, bg=COL_SURFACE, fg=COL_FG,
+        # height=4: kleine MINDESThoehe -- die Listen wachsen per grid-weight
+        # mit dem Fenster, druecken aber an kleinen Fenstern nicht mehr die
+        # Optionen und Buttons aus dem Bild (Listbox-Standard waere 10 Zeilen).
+        kw = dict(font=self.f_list, bg=COL_SURFACE, fg=COL_FG, height=4,
                   selectbackground="#1D9E75", selectforeground="#04342C",
                   highlightthickness=0, bd=0, activestyle="none",
                   exportselection=False)
@@ -365,35 +369,23 @@ class DisplayApp:
         self.lb_midi = tk.Listbox(body, **kw)
         self.lb_midi.grid(row=1, column=1, sticky="nsew", padx=(16, 0))
 
-        opts = tk.Frame(f, bg=COL_BG)
-        opts.pack(fill="x", padx=24, pady=(12, 0))
+        # Optionen als Flow-Layout: _flow_options() bricht die Widgets je
+        # nach Fensterbreite in so viele Zeilen um wie noetig. Mit den
+        # frueheren zwei festen Zeilen liefen an schmalen Fenstern die
+        # hinteren Checkboxen rechts aus dem Bild.
+        cont = tk.Frame(f, bg=COL_BG)
+        self.opts_container = cont
+        self._opt_rows = []
+        self._flow_pending = False
         self.var_dec = tk.BooleanVar()
         self.var_beat = tk.BooleanVar()
+        self.var_chord = tk.BooleanVar()
+        self.var_chordlog = tk.BooleanVar()
+        self.var_chordfast = tk.BooleanVar()
         ck = dict(bg=COL_BG, fg=COL_FG, selectcolor=COL_SURFACE,
                   activebackground=COL_BG, activeforeground=COL_FG,
                   highlightthickness=0, font=self.f_small, cursor="hand2")
-        tk.Checkbutton(opts, text="BPM mit Nachkommastelle",
-                       variable=self.var_dec, **ck).pack(side="left")
-        tk.Checkbutton(opts, text="Beat-synchrone Clock (experimentell)",
-                       variable=self.var_beat, **ck).pack(side="left",
-                                                          padx=(16, 0))
-        opts2 = tk.Frame(f, bg=COL_BG)
-        opts2.pack(fill="x", padx=24, pady=(4, 0))
-        self.var_chord = tk.BooleanVar()
-        self.var_chordlog = tk.BooleanVar()
-        tk.Checkbutton(opts2, text="Akkorde anzeigen",
-                       variable=self.var_chord, **ck).pack(side="left")
-        tk.Checkbutton(opts2,
-                       text="Akkorde in Textdatei schreiben (akkorde.txt)",
-                       variable=self.var_chordlog, **ck).pack(side="left",
-                                                              padx=(16, 0))
-        self.var_chordfast = tk.BooleanVar()
-        tk.Checkbutton(opts2,
-                       text="Akkorde schneller berechnen (mehr CPU-Last)",
-                       variable=self.var_chordfast, **ck).pack(side="left",
-                                                               padx=(16, 0))
-        rng = tk.Frame(opts, bg=COL_BG)
-        rng.pack(side="right")
+        rng = tk.Frame(cont, bg=COL_BG)
         tk.Label(rng, text="BPM-Bereich", font=self.f_small, bg=COL_BG,
                  fg=COL_MUTED).pack(side="left", padx=(0, 6))
         ent = dict(font=self.f_small, bg=COL_SURFACE, fg=COL_FG, width=4,
@@ -404,16 +396,34 @@ class DisplayApp:
                  fg=COL_MUTED).pack(side="left", padx=4)
         self.ent_max = tk.Entry(rng, **ent)
         self.ent_max.pack(side="left", ipady=3)
+        self.opt_widgets = [
+            tk.Checkbutton(cont, text="BPM mit Nachkommastelle",
+                           variable=self.var_dec, **ck),
+            tk.Checkbutton(cont, text="Beat-synchrone Clock (experimentell)",
+                           variable=self.var_beat, **ck),
+            tk.Checkbutton(cont, text="Akkorde anzeigen",
+                           variable=self.var_chord, **ck),
+            tk.Checkbutton(cont,
+                           text="Akkorde in Textdatei schreiben (akkorde.txt)",
+                           variable=self.var_chordlog, **ck),
+            tk.Checkbutton(cont,
+                           text="Akkorde schneller berechnen (mehr CPU-Last)",
+                           variable=self.var_chordfast, **ck),
+            rng,
+        ]
+        self._flow_options()
 
         self.err_label = tk.Label(f, text="", font=self.f_small,
                                   bg=COL_BG, fg=COL_WARN)
-        self.err_label.pack(fill="x", padx=24, pady=(8, 0))
 
         bottom = tk.Frame(f, bg=COL_BG)
-        bottom.pack(fill="x", padx=24, pady=(6, 16))
-        tk.Label(bottom, text="F11: Vollbild   Esc: Beenden",
+        left = tk.Frame(bottom, bg=COL_BG)
+        left.pack(side="left")
+        tk.Label(left, text="F11: Vollbild   Esc: Beenden",
                  font=self.f_small, bg=COL_BG,
-                 fg=COL_MUTED).pack(side="left")
+                 fg=COL_MUTED).pack(anchor="w")
+        tk.Label(left, text="codekoch / claude", font=self.f_tiny,
+                 bg=COL_BG, fg="#55544E").pack(anchor="w", pady=(2, 0))
         tk.Button(bottom, text="Start", command=self.on_setup_start,
                   font=self.f_btn, bg="#1D9E75", fg="#04342C",
                   activebackground=COL_OK, activeforeground="#04342C",
@@ -424,6 +434,49 @@ class DisplayApp:
                   activebackground=COL_SURF_HI, activeforeground=COL_FG,
                   bd=0, padx=16, pady=8, highlightthickness=0,
                   cursor="hand2").pack(side="right", padx=(0, 10))
+
+        # Pack-Reihenfolge = Prioritaet bei knappem Platz: Bedienleiste,
+        # Fehlerzeile und Optionen werden zuerst (von unten) gesetzt, die
+        # Geraetelisten bekommen den Rest und schrumpfen als erstes --
+        # so bleiben Buttons und Checkboxen auch an kleinen Fenstern sichtbar.
+        bottom.pack(side="bottom", fill="x", padx=24, pady=(6, 16))
+        self.err_label.pack(side="bottom", fill="x", padx=24, pady=(8, 0))
+        cont.pack(side="bottom", fill="x", padx=24, pady=(12, 0))
+        body.pack(fill="both", expand=True, padx=24)
+
+    def _flow_options(self, width=None):
+        """Options-Widgets zeilenweise anordnen (Flow-Layout): in jede Zeile
+        kommen so viele, wie die Fensterbreite hergibt, der Rest bricht um.
+        Wird bei jeder Groessenaenderung neu berechnet (_on_resize)."""
+        if width is None:
+            width = self.root.winfo_width()
+        if width <= 1:
+            width = 800                 # vor dem ersten Mapping: Startgroesse
+        avail = max(200, width - 48)    # Aussenabstand des Containers (2x24)
+        for wdg in self.opt_widgets:
+            wdg.pack_forget()
+        for row in self._opt_rows:
+            row.destroy()
+        self._opt_rows = []
+        row, x = None, 0
+        for wdg in self.opt_widgets:
+            need = wdg.winfo_reqwidth()
+            if row is None or (x > 0 and x + 16 + need > avail):
+                row = tk.Frame(self.opts_container, bg=COL_BG)
+                row.pack(fill="x", pady=(0, 2))
+                # Die Widgets sind Geschwister der Zeilen-Frames (pack mit
+                # in_=...) -- die spaeter erzeugte Zeile laege sonst in der
+                # Stapelreihenfolge UEBER ihnen und wuerde sie verdecken.
+                row.lower()
+                self._opt_rows.append(row)
+                x = 0
+            pad = 0 if x == 0 else 16
+            wdg.pack(in_=row, side="left", padx=(pad, 0))
+            x += pad + need
+
+    def _reflow(self):
+        self._flow_pending = False
+        self._flow_options()
 
     def _populate_setup(self):
         cfg = load_config()
@@ -823,15 +876,25 @@ class DisplayApp:
     def _on_resize(self, event):
         if event.widget is not self.root:
             return
-        h = event.height
-        if abs(h - self._last_height) < 8:
-            return
-        self._last_height = h
-        self.f_bpm.configure(size=-max(60, int(h * 0.28)))
-        self.f_key.configure(size=-max(28, int(h * 0.11)))
-        self.f_key_par.configure(size=-max(15, int(h * 0.045)))
-        self.f_cap.configure(size=-max(12, int(h * 0.028)))
-        self.f_small.configure(size=-max(12, int(h * 0.024)))
+        h, w = event.height, event.width
+        changed = False
+        if abs(h - self._last_height) >= 8:
+            self._last_height = h
+            changed = True
+            self.f_bpm.configure(size=-max(60, int(h * 0.28)))
+            self.f_key.configure(size=-max(28, int(h * 0.11)))
+            self.f_key_par.configure(size=-max(15, int(h * 0.045)))
+            self.f_cap.configure(size=-max(12, int(h * 0.028)))
+            self.f_small.configure(size=-max(12, int(h * 0.024)))
+            self.f_tiny.configure(size=-max(9, int(h * 0.016)))
+        if abs(w - self._last_width) >= 8:
+            self._last_width = w
+            changed = True
+        if changed and not self._flow_pending:
+            # Optionen-Umbruch erst neu rechnen, wenn Tk die neuen
+            # Widget-Breiten (auch nach Schriftaenderung) verrechnet hat.
+            self._flow_pending = True
+            self.root.after_idle(self._reflow)
 
 
 def main():
