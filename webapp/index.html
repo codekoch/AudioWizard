@@ -1,15 +1,107 @@
 <!DOCTYPE html>
 <html lang="de">
 <head>
-  <meta charset="UTF-8">
-  <meta name="viewport" content="width=device-width, initial-scale=1">
-  <title>Audio2Midi -- BPM & MIDI-Clock (WebApp)</title>
-  <link rel="stylesheet" href="style.css">
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Audio2Midi -- BPM, MIDI-Clock & Tonart (Webversion)</title>
+<!--
+  Audio2Midi Webversion: BPM-Erkennung mit stabiler MIDI-Clock und optionaler
+  Tonart-Anzeige -- eine eigenstaendige HTML-Datei. Laeuft direkt im Browser
+  (Doppelklick / Strg+O) oder ueber GitHub Pages; kein Server noetig.
+
+  Umsetzung:
+    * ScriptProcessorNode statt AudioWorklet. Der Worklet laedt ein Modul,
+      was der Browser unter file:// (Origin "null") blockiert. Der
+      ScriptProcessor laedt nichts nach und laeuft daher auch lokal. Er ist
+      aelter/deprecated, fuer diese leichte Analyse aber voellig ausreichend.
+    * MIDI-Clock-Timer im Hauptthread (kein Blob-Worker -- der waere unter
+      file:// ebenfalls gesperrt).
+    * Tonart-Chroma ueber eine separate groessere FFT (saubere Halbton-
+      Aufloesung im Bass/Mittenbereich).
+
+  Voraussetzungen: Chrome/Edge/Opera (Web MIDI). Beim Start fragt der Browser
+  nach Mikrofon-Zugriff. Fuer die MIDI-Ausgabe an Software auf demselben
+  Rechner einen virtuellen MIDI-Port einrichten (Windows: loopMIDI, macOS:
+  IAC-Treiber).
+
+  Autoren: codekoch / claude
+-->
+<style>
+:root {
+  --bg: #131210; --surface: #1f1d1a; --surface-hi: #2a2723;
+  --fg: #f2efe9; --muted: #8a857c; --accent: #1d9e75; --warn: #f0a53e;
+  --bar-bg: #2a2723;
+}
+* { box-sizing: border-box; }
+body {
+  margin: 0; min-height: 100vh; background: var(--bg); color: var(--fg);
+  font-family: "Segoe UI", Helvetica, Arial, sans-serif;
+  display: flex; flex-direction: column;
+}
+header {
+  padding: 14px 24px; border-bottom: 1px solid var(--surface);
+  display: flex; align-items: baseline; gap: 12px;
+}
+header h1 { font-size: 18px; font-weight: 600; margin: 0; }
+header .sub { color: var(--muted); font-size: 13px; }
+.controls {
+  display: flex; flex-wrap: wrap; gap: 16px 20px; align-items: flex-end;
+  padding: 16px 24px; border-bottom: 1px solid var(--surface);
+}
+.field { display: flex; flex-direction: column; gap: 4px; }
+.field label { font-size: 12px; color: var(--muted); text-transform: uppercase; letter-spacing: .04em; }
+.field .row { display: flex; align-items: center; gap: 8px; }
+button.ghost {
+  background: var(--surface); color: var(--fg); border: 1px solid var(--surface-hi);
+  border-radius: 6px; padding: 8px 12px; font-size: 13px; cursor: pointer; white-space: nowrap;
+}
+button.ghost:hover { background: var(--surface-hi); }
+button.ghost:disabled { opacity: .5; cursor: default; }
+button.ghost.on { border-color: var(--accent); color: var(--accent); }
+select, input[type="number"] {
+  background: var(--surface); color: var(--fg); border: 1px solid var(--surface-hi);
+  border-radius: 6px; padding: 8px 10px; font-size: 14px;
+}
+select { min-width: 200px; }
+input[type="number"] { width: 72px; }
+.range { display: flex; align-items: center; gap: 6px; }
+button#startBtn {
+  margin-left: auto; background: var(--accent); color: #04342c; border: 0;
+  border-radius: 8px; padding: 12px 28px; font-size: 16px; font-weight: 700; cursor: pointer;
+}
+button#startBtn.stop { background: var(--warn); color: #412402; }
+button#startBtn:disabled { opacity: .4; cursor: default; }
+main {
+  flex: 1; display: flex; flex-direction: column; align-items: center;
+  justify-content: center; gap: 4px; padding: 24px;
+}
+.bpm {
+  font-size: clamp(96px, 28vw, 280px); font-weight: 700; line-height: 1;
+  color: var(--accent); font-variant-numeric: tabular-nums;
+}
+.bpm.idle { color: var(--muted); opacity: .5; }
+.keyblock { margin-top: 26px; text-align: center; }
+.key { font-size: clamp(40px, 9vw, 88px); font-weight: 700; line-height: 1; }
+#keyName { color: var(--accent); }
+#keyName.idle { color: var(--muted); opacity: .6; }
+.par { font-size: .42em; font-weight: 600; color: var(--muted); margin-left: .2em; }
+.cap { font-size: 14px; color: var(--muted); letter-spacing: .2em; }
+.raw { font-size: 15px; color: var(--muted); margin-top: 12px; }
+.status { font-size: 15px; color: var(--muted); margin-top: 2px; min-height: 1.2em; }
+.level { width: min(680px, 90%); margin: 22px auto 0; display: flex; align-items: center; gap: 12px; }
+.level .lbl { font-size: 12px; color: var(--muted); }
+.track { flex: 1; height: 12px; background: var(--bar-bg); border-radius: 6px; overflow: hidden; }
+.track > div { height: 100%; width: 0; background: var(--accent); transition: width .08s linear; }
+.level .db { font-size: 12px; color: var(--muted); width: 56px; text-align: right; }
+.hint { padding: 10px 24px; font-size: 13px; color: var(--muted); border-top: 1px solid var(--surface); min-height: 1.2em; }
+.hint.error { color: var(--warn); }
+.credit { padding: 4px 24px 10px; font-size: 11px; color: #55544e; text-align: right; }
+</style>
 </head>
 <body>
   <header>
     <h1>Audio2Midi</h1>
-    <span class="sub">BPM-Erkennung mit stabiler MIDI-Clock &middot; WebApp</span>
+    <span class="sub">BPM-Erkennung mit stabiler MIDI-Clock und Tonarterkennung &middot; Webversion</span>
   </header>
 
   <section class="controls">
@@ -35,15 +127,23 @@
         <input type="number" id="maxBpm" value="140" min="30" max="300" step="1">
       </div>
     </div>
+    <div class="field">
+      <label>Tonart</label>
+      <button id="keyToggle" class="ghost"
+              title="Grundtonart (mit Paralleltonart) anzeigen">anzeigen</button>
+    </div>
     <button id="startBtn">Start</button>
   </section>
 
   <main>
-    <div class="bpm" id="bpm">—</div>
+    <div class="bpm idle" id="bpm">—</div>
     <div class="cap">BPM</div>
     <div class="raw" id="raw">roh: —</div>
     <div class="status" id="status">bereit</div>
-
+    <div class="keyblock" id="keyBlock" style="display:none">
+      <div class="key"><span id="keyName" class="idle">—</span><span class="par" id="keyPar"></span></div>
+      <div class="cap">TONART</div>
+    </div>
     <div class="level">
       <span class="lbl">PEGEL</span>
       <div class="track"><div id="levelBar"></div></div>
@@ -52,9 +152,711 @@
   </main>
 
   <div class="hint" id="hint"></div>
+  <div class="credit">codekoch / claude</div>
 
-  <script src="tempo.js"></script>
-  <script src="midiclock.js"></script>
-  <script src="app.js"></script>
+<script>
+"use strict";
+
+// ===========================================================================
+// Stellschrauben (mirror der Python-Konstanten)
+// ===========================================================================
+const WINDOW_SECONDS   = 8.0;
+const FFT_SIZE         = 2048;
+const HOP_SIZE         = 512;
+const TEMPO_PRIOR_OCT  = 0.9;
+const CONF_RATIO       = 1.45;
+const MIN_ONSET_SUM    = 1e-3;
+
+const ANALYSIS_INTERVAL = 1.0;
+const BPM_MEDIAN_LEN    = 16;
+const SILENCE_DB        = -55.0;
+const DEFAULT_MIN_BPM   = 70;
+const DEFAULT_MAX_BPM   = 140;
+
+// Tonart (Sha'ath-Profile, Konstanten wie im Python-Kern)
+const NOTE_NAMES = ['C','C#','D','D#','E','F','F#','G','G#','A','A#','B'];
+const KS_MAJOR = [6.6,2.0,3.5,2.3,4.6,4.0,2.5,5.2,2.4,3.7,2.3,3.4];
+const KS_MINOR = [6.5,2.7,3.5,5.4,2.6,3.5,2.5,5.2,4.0,2.7,4.3,3.2];
+const BASS_TONIC_WEIGHT    = 0.30;
+const CHROMA_LOG_COMP      = 10.0;
+const KEY_EMA_SEC          = 15.0;
+const KEY_SWITCH_CONFIRM   = 2;
+const KEY_CONFIDENT_MARGIN = 0.12;
+const KEY_CONFIDENT_MIN_N  = 16;
+
+const PPQN          = 24;
+const LOOKAHEAD_MS  = 120;
+const TICK_MS       = 25;
+const SLEW_BPM_PER_S = 8.0;
+const DEADBAND_BPM  = 0.15;
+const MSG_CLOCK = 0xF8, MSG_START = 0xFA, MSG_STOP = 0xFC;
+
+// ===========================================================================
+// Radix-2-FFT (in-place)
+// ===========================================================================
+class FFT {
+  constructor(n) {
+    this.n = n;
+    this.cos = new Float32Array(n / 2);
+    this.sin = new Float32Array(n / 2);
+    for (let i = 0; i < n / 2; i++) {
+      this.cos[i] = Math.cos(-2 * Math.PI * i / n);
+      this.sin[i] = Math.sin(-2 * Math.PI * i / n);
+    }
+    const bits = Math.round(Math.log2(n));
+    this.rev = new Uint32Array(n);
+    for (let i = 0; i < n; i++) {
+      let x = i, r = 0;
+      for (let j = 0; j < bits; j++) { r = (r << 1) | (x & 1); x >>= 1; }
+      this.rev[i] = r >>> 0;
+    }
+  }
+  transform(re, im) {
+    const n = this.n, rev = this.rev;
+    for (let i = 0; i < n; i++) {
+      const j = rev[i];
+      if (j > i) { let t = re[i]; re[i] = re[j]; re[j] = t; t = im[i]; im[i] = im[j]; im[j] = t; }
+    }
+    for (let size = 2; size <= n; size <<= 1) {
+      const half = size >> 1, step = (n / size) | 0;
+      for (let i = 0; i < n; i += size) {
+        for (let k = 0; k < half; k++) {
+          const ci = k * step, c = this.cos[ci], s = this.sin[ci];
+          const a = i + k, b = a + half;
+          const tre = re[b] * c - im[b] * s, tim = re[b] * s + im[b] * c;
+          re[b] = re[a] - tre; im[b] = im[a] - tim;
+          re[a] += tre;        im[a] += tim;
+        }
+      }
+    }
+  }
+}
+
+// ===========================================================================
+// TempoAnalyzer: rollende Onset-Huellkurve -> Autokorrelation -> BPM
+// ===========================================================================
+class TempoAnalyzer {
+  constructor(sampleRate, minBpm, maxBpm) {
+    this.sr = sampleRate;
+    this.minBpm = minBpm;
+    this.maxBpm = maxBpm;
+    this.envRate = sampleRate / HOP_SIZE;
+    this.envLen = Math.round(WINDOW_SECONDS * this.envRate);
+    this.centerBpm = Math.sqrt(minBpm * maxBpm);
+    this.fft = new FFT(FFT_SIZE);
+    this.win = new Float32Array(FFT_SIZE);
+    for (let i = 0; i < FFT_SIZE; i++) {
+      this.win[i] = 0.5 - 0.5 * Math.cos(2 * Math.PI * i / (FFT_SIZE - 1));
+    }
+    this.frame = new Float32Array(FFT_SIZE);
+    this.re = new Float32Array(FFT_SIZE);
+    this.im = new Float32Array(FFT_SIZE);
+    this.prevMag = new Float32Array(FFT_SIZE / 2);
+    this.onset = [];
+    this._havePrev = false;
+    // --- Tonart-Chroma ueber eine SEPARATE, groessere FFT ---
+    // Bei FFT_SIZE 2048 sind die Bins (~23 Hz) im Bass/Mittenbereich groeber
+    // als ein Halbton -> einzelne Tonklassen blieben leer ("Loecher"). Eine
+    // groessere FFT (16384 ~ 0,34 s -> ~3-Hz-Bins) gibt eine saubere Ton-
+    // klassen-Zuordnung. Wird nur ~1x/s ausgewertet (computeChroma).
+    this.NC = 16384;
+    this.fftC = new FFT(this.NC);
+    this.winC = new Float32Array(this.NC);
+    for (let i = 0; i < this.NC; i++) {
+      this.winC[i] = 0.5 - 0.5 * Math.cos(2 * Math.PI * i / (this.NC - 1));
+    }
+    this.cbuf = new Float32Array(this.NC);   // rollender Sample-Puffer
+    this.cbufFilled = 0;
+    this.reC = new Float32Array(this.NC);
+    this.imC = new Float32Array(this.NC);
+    const halfC = this.NC / 2;
+    this.binPc = new Int8Array(halfC);       // Bin -> Tonklasse (0=C), -1=ignorieren
+    this.binBass = new Uint8Array(halfC);    // Bin im Bassbereich? (Grundton-Evidenz)
+    for (let k = 1; k < halfC; k++) {
+      const f = k * sampleRate / this.NC;
+      if (f < 55 || f > 5000) { this.binPc[k] = -1; continue; }
+      const midi = Math.round(69 + 12 * Math.log2(f / 440));
+      this.binPc[k] = ((midi % 12) + 12) % 12;
+      this.binBass[k] = (f >= 55 && f <= 260) ? 1 : 0;   // ~A1..C4
+    }
+    this.binPc[0] = -1;
+  }
+  pushChunk(chunk) {
+    // Samples zusaetzlich in den groesseren Chroma-Puffer schieben.
+    this.cbuf.copyWithin(0, HOP_SIZE);
+    this.cbuf.set(chunk, this.NC - HOP_SIZE);
+    if (this.cbufFilled < this.NC) this.cbufFilled += HOP_SIZE;
+
+    this.frame.copyWithin(0, HOP_SIZE);
+    this.frame.set(chunk, FFT_SIZE - HOP_SIZE);
+    const re = this.re, im = this.im, win = this.win;
+    for (let i = 0; i < FFT_SIZE; i++) { re[i] = this.frame[i] * win[i]; im[i] = 0; }
+    this.fft.transform(re, im);
+    const half = FFT_SIZE / 2;
+    let flux = 0;
+    const prev = this.prevMag;
+    for (let k = 0; k < half; k++) {
+      const mag = Math.hypot(re[k], im[k]);
+      const d = mag - prev[k];
+      if (d > 0) flux += d;
+      prev[k] = mag;
+    }
+    if (this._havePrev) {
+      this.onset.push(flux);
+      if (this.onset.length > this.envLen) {
+        this.onset.splice(0, this.onset.length - this.envLen);
+      }
+    }
+    this._havePrev = true;
+  }
+  // Chroma (pcp + bass, je auf Summe 1, log-komprimiert) aus dem aktuellen
+  // Sample-Puffer ueber die grosse FFT berechnen. null, solange der Puffer
+  // noch nicht voll ist (~0,34 s nach Start).
+  computeChroma() {
+    if (this.cbufFilled < this.NC) return null;
+    const re = this.reC, im = this.imC, win = this.winC;
+    for (let i = 0; i < this.NC; i++) { re[i] = this.cbuf[i] * win[i]; im[i] = 0; }
+    this.fftC.transform(re, im);
+    const halfC = this.NC / 2;
+    const c = new Float32Array(12), bas = new Float32Array(12);
+    const bpc = this.binPc, bbs = this.binBass;
+    for (let k = 1; k < halfC; k++) {
+      const pc = bpc[k];
+      if (pc < 0) continue;
+      const mag = Math.hypot(re[k], im[k]);
+      c[pc] += mag;
+      if (bbs[k]) bas[pc] += mag;
+    }
+    const pcp = chromaNorm(c);
+    const bass = chromaNorm(bas);
+    return pcp ? { pcp, bass: bass || new Float32Array(12) } : null;
+  }
+  estimate() {
+    const e = this.onset, L = e.length;
+    if (L < this.envRate * 3) return null;
+    let mean = 0;
+    for (let i = 0; i < L; i++) mean += e[i];
+    mean /= L;
+    if (mean < MIN_ONSET_SUM) return null;
+    const x = new Float32Array(L);
+    let energy = 0;
+    for (let i = 0; i < L; i++) { x[i] = e[i] - mean; energy += x[i] * x[i]; }
+    if (energy <= 0) return null;
+    const lagMin = Math.max(2, Math.floor(60 * this.envRate / this.maxBpm));
+    const lagMax = Math.min(L - 2, Math.ceil(60 * this.envRate / this.minBpm));
+    if (lagMax <= lagMin) return null;
+    const acfMax = Math.min(L - 2, lagMax * 4);
+    const acf = new Float32Array(acfMax + 1);
+    for (let lag = lagMin; lag <= acfMax; lag++) {
+      let s = 0;
+      for (let i = 0; i + lag < L; i++) s += x[i] * x[i + lag];
+      acf[lag] = s / energy;
+    }
+    const harmW = [1.0, 0.6, 0.4, 0.25];
+    let best = -Infinity, bestLag = -1, scoreSum = 0, scoreCnt = 0;
+    const priorW = TEMPO_PRIOR_OCT;
+    for (let lag = lagMin; lag <= lagMax; lag++) {
+      let comb = 0;
+      for (let h = 1; h <= 4; h++) { const hl = lag * h; if (hl <= acfMax) comb += harmW[h - 1] * acf[hl]; }
+      const bpm = 60 * this.envRate / lag;
+      const lo = Math.log2(bpm / this.centerBpm) / priorW;
+      const prior = Math.exp(-0.5 * lo * lo);
+      const score = comb * prior;
+      scoreSum += score; scoreCnt++;
+      if (score > best) { best = score; bestLag = lag; }
+    }
+    if (bestLag < 0) return null;
+    const meanScore = scoreSum / Math.max(1, scoreCnt);
+    const ratio = meanScore > 0 ? best / meanScore : 0;
+    if (best <= 0 || ratio < CONF_RATIO) return null;
+    let lag = bestLag;
+    const y0 = acf[bestLag - 1], y1 = acf[bestLag], y2 = acf[bestLag + 1];
+    const denom = (y0 - 2 * y1 + y2);
+    if (denom !== 0) { const delta = 0.5 * (y0 - y2) / denom; if (delta > -1 && delta < 1) lag = bestLag + delta; }
+    return { bpm: 60 * this.envRate / lag, conf: ratio };
+  }
+}
+
+// ===========================================================================
+// Tonart-Bestimmung (Sha'ath-Profile, Bass-Evidenz) -- portiert aus
+// classify_key() im Python-Kern.
+// ===========================================================================
+function chromaNorm(v) {
+  let s = 0; for (let i = 0; i < 12; i++) s += v[i];
+  if (s <= 0) return null;
+  const out = new Float32Array(12);
+  let s2 = 0;
+  for (let i = 0; i < 12; i++) { out[i] = Math.log1p(CHROMA_LOG_COMP * (v[i] / s)); s2 += out[i]; }
+  if (s2 > 0) for (let i = 0; i < 12; i++) out[i] /= s2;
+  return out;
+}
+// Pearson-Korrelation von pcp mit dem um i rotierten Profil (Grundton -> i):
+// rotiertes Profil r[j] = prof[(j - i) mod 12].
+function profCorr(pcp, prof, i) {
+  let ma = 0, mb = 0;
+  for (let j = 0; j < 12; j++) { ma += pcp[j]; mb += prof[j]; }
+  ma /= 12; mb /= 12;
+  let num = 0, da = 0, db = 0;
+  for (let j = 0; j < 12; j++) {
+    const pj = prof[((j - i) % 12 + 12) % 12];
+    const xa = pcp[j] - ma, xb = pj - mb;
+    num += xa * xb; da += xa * xa; db += xb * xb;
+  }
+  const den = Math.sqrt(da * db);
+  return den > 0 ? num / den : 0;
+}
+function classifyKey(pcp, bass) {
+  const useBass = bass && bass.some(v => v > 0);
+  const scores = [];
+  for (let i = 0; i < 12; i++) {
+    let bonus = 0;
+    if (useBass) bonus = BASS_TONIC_WEIGHT * (bass[i] + 0.5 * bass[(i + 7) % 12]);
+    scores.push([profCorr(pcp, KS_MAJOR, i) + bonus, NOTE_NAMES[i] + ' Dur']);
+    scores.push([profCorr(pcp, KS_MINOR, i) + bonus, NOTE_NAMES[i] + ' Moll']);
+  }
+  scores.sort((a, b) => b[0] - a[0]);
+  return { name: scores[0][1], margin: scores[0][0] - scores[1][0], second: scores[1][1] };
+}
+// Paralleltonart (relative Tonart): C-Dur <-> a-Moll usw.
+function parallelKey(key) {
+  const p = key.split(' ');
+  if (p.length !== 2) return '';
+  const i = NOTE_NAMES.indexOf(p[0]);
+  if (i < 0) return '';
+  if (p[1] === 'Dur')  return NOTE_NAMES[(i + 9) % 12] + ' Moll';
+  if (p[1] === 'Moll') return NOTE_NAMES[(i + 3) % 12] + ' Dur';
+  return '';
+}
+
+// ===========================================================================
+// MidiClock -- 24 PPQN, Ticks per send(timestamp) im Voraus geplant.
+// Scheduler-Timer hier im Hauptthread (kein Blob-Worker -> file://-tauglich).
+// ===========================================================================
+class MidiClock {
+  constructor() {
+    this.output = null;
+    this.enabled = false;
+    this.targetBpm = null;
+    this.curBpm = 120;
+    this.running = false;
+    this.nextTick = 0;
+    this._lastSched = 0;
+    this._timer = setInterval(() => this._schedule(), TICK_MS);
+  }
+  setOutput(output) {
+    if (this.output === output) return;
+    if (this.running) this._send(MSG_STOP);
+    this.running = false;
+    this.output = output;
+  }
+  enable() {
+    if (this.enabled) return;
+    this.enabled = true;
+    this._lastSched = performance.now();
+  }
+  disable() {
+    this.enabled = false;
+    if (this.running) this._send(MSG_STOP);
+    this.running = false;
+  }
+  setTargetBpm(bpm) { this.targetBpm = bpm; }
+  _send(status, timestamp) {
+    if (!this.output) return;
+    try {
+      if (timestamp === undefined) this.output.send([status]);
+      else this.output.send([status], timestamp);
+    } catch (e) { /* Port verschwunden o.ae. */ }
+  }
+  _schedule() {
+    if (!this.enabled) return;
+    const now = performance.now();
+    const dt = Math.max(0, (now - this._lastSched) / 1000);
+    this._lastSched = now;
+    if (this.targetBpm == null) {
+      if (this.running) { this._send(MSG_STOP); this.running = false; }
+      return;
+    }
+    if (!this.running) {
+      this.running = true;
+      this.curBpm = this.targetBpm;
+      this.nextTick = now + 20;
+      this._send(MSG_START);
+    } else {
+      const diff = this.targetBpm - this.curBpm;
+      if (Math.abs(diff) > DEADBAND_BPM) {
+        const maxStep = SLEW_BPM_PER_S * dt;
+        this.curBpm += Math.max(-maxStep, Math.min(maxStep, diff));
+      }
+    }
+    if (this.nextTick < now - LOOKAHEAD_MS) this.nextTick = now;
+    const horizon = now + LOOKAHEAD_MS;
+    while (this.nextTick < horizon) {
+      this._send(MSG_CLOCK, this.nextTick);
+      this.nextTick += 60000 / (this.curBpm * PPQN);
+    }
+  }
+}
+
+// ===========================================================================
+// App-Glue
+// ===========================================================================
+const clock = new MidiClock();
+let midiAccess = null;
+let audioCtx = null;
+let procNode = null;           // ScriptProcessorNode
+let sinkNode = null;           // stumm geschalteter Gain-Knoten zum Ausgang
+let mediaStream = null;
+let analyzer = null;
+
+let estimates = [];
+let lastRaw = 0;
+let levelEma = 0;
+let haveEstimate = false;
+let running = false;
+let analyzeTimer = null;
+let lastChunkTime = 0;
+let inputsUnlocked = false;
+let unlocking = false;
+let grantedDeviceId = '';
+let grantedLabel = '';
+let midiRequested = false;
+
+// Tonart-Zustand (zweistufige Mittelung + Hysterese wie im Python-Kern)
+let keyEnabled = false;
+let keyDisp = '—', keyPend = null, keyPendN = 0, keyConfident = false;
+let emaPcp = null, emaBass = null, cumPcp = null, cumBass = null, cumN = 0;
+const KEY_EMA_A = ANALYSIS_INTERVAL / KEY_EMA_SEC;
+
+const $ = (id) => document.getElementById(id);
+const elMidi = $('midiOut'), elInput = $('audioIn'), elLoad = $('loadInputs');
+const elMin = $('minBpm'), elMax = $('maxBpm'), elStart = $('startBtn');
+const elBpm = $('bpm'), elRaw = $('raw'), elStatus = $('status');
+const elBar = $('levelBar'), elDb = $('db'), elHint = $('hint');
+const elKeyToggle = $('keyToggle'), elKeyBlock = $('keyBlock');
+const elKeyName = $('keyName'), elKeyPar = $('keyPar');
+
+// --- Web MIDI (erst bei Bedarf anfragen) ---
+async function initMidi() {
+  if (midiRequested) return;
+  midiRequested = true;
+  if (!navigator.requestMIDIAccess) {
+    setHint('Web MIDI wird von diesem Browser nicht unterstuetzt. Empfohlen: Chrome, Edge oder Opera.', true);
+    return;
+  }
+  try {
+    midiAccess = await navigator.requestMIDIAccess({ sysex: false });
+  } catch (e) {
+    midiRequested = false;
+    setHint('MIDI-Zugriff verweigert: ' + e.message, true);
+    return;
+  }
+  refreshMidiOutputs();
+  midiAccess.onstatechange = refreshMidiOutputs;
+}
+function refreshMidiOutputs() {
+  const prev = elMidi.value;
+  elMidi.innerHTML = '';
+  elMidi.add(new Option('Kein MIDI (nur Anzeige)', ''));
+  for (const out of midiAccess.outputs.values()) elMidi.add(new Option(out.name, out.id));
+  elMidi.value = [...elMidi.options].some(o => o.value === prev) ? prev : '';
+  applyMidiOutput();
+}
+function applyMidiOutput() {
+  const id = elMidi.value;
+  clock.setOutput(id ? midiAccess.outputs.get(id) : null);
+}
+
+// --- Audio-Eingaenge ---
+function captureGranted(stream) {
+  try {
+    const t = stream.getAudioTracks()[0];
+    if (!t) return;
+    const s = t.getSettings ? t.getSettings() : {};
+    if (s.deviceId) grantedDeviceId = s.deviceId;
+    if (t.label) grantedLabel = t.label;
+  } catch (e) {}
+}
+async function refreshAudioInputs() {
+  if (!navigator.mediaDevices || !navigator.mediaDevices.enumerateDevices) return 0;
+  const devices = await navigator.mediaDevices.enumerateDevices();
+  const prev = elInput.value;
+  elInput.innerHTML = '';
+  elInput.add(new Option('Standard-Eingang', ''));
+  const seen = new Set(['']);
+  let count = 0, i = 1;
+  if (grantedDeviceId && !seen.has(grantedDeviceId)) {
+    elInput.add(new Option(grantedLabel || 'Freigegebener Eingang', grantedDeviceId));
+    seen.add(grantedDeviceId); count++;
+  }
+  for (const d of devices) {
+    if (d.kind !== 'audioinput') continue;
+    if (!d.deviceId) continue;
+    if (d.deviceId === 'communications') continue;
+    if (seen.has(d.deviceId)) continue;
+    const label = d.label || ('Eingang ' + (i++) + ' (Name nach Freigabe)');
+    elInput.add(new Option(label, d.deviceId));
+    seen.add(d.deviceId); count++;
+  }
+  elInput.value = [...elInput.options].some(o => o.value === prev) ? prev : '';
+  return count;
+}
+async function unlockInputs() {
+  if (inputsUnlocked || unlocking) return;
+  if (!navigator.mediaDevices || !navigator.mediaDevices.getUserMedia) return;
+  unlocking = true;
+  elLoad.disabled = true;
+  setHint('Eingaenge werden geladen … bitte den Mikrofon-Zugriff erlauben.');
+  let tmp = null;
+  try {
+    tmp = await navigator.mediaDevices.getUserMedia({ audio: true });
+    captureGranted(tmp);
+    inputsUnlocked = true;
+    const n = await refreshAudioInputs();
+    elLoad.textContent = 'Aktualisieren';
+    setHint(n + ' Eingang/Eingaenge geladen. Gewuenschten Eingang waehlen und Start druecken.');
+  } catch (e) {
+    setHint('Mikrofon-Zugriff abgelehnt — ohne Freigabe zeigt der Browser nur den Standard-Eingang. (' + e.message + ')', true);
+  } finally {
+    if (tmp) tmp.getTracks().forEach(t => t.stop());
+    unlocking = false;
+    if (!running) elLoad.disabled = false;
+  }
+}
+
+// --- Sitzung starten / stoppen ---
+async function start() {
+  const minBpm = clampBpm(parseFloat(elMin.value), DEFAULT_MIN_BPM);
+  const maxBpm = clampBpm(parseFloat(elMax.value), DEFAULT_MAX_BPM);
+  if (!(minBpm < maxBpm)) { setHint('BPM-Bereich ungueltig: von < bis (z. B. 70 bis 140).', true); return; }
+
+  try {
+    const constraints = { audio: { echoCancellation: false, noiseSuppression: false, autoGainControl: false } };
+    if (elInput.value) constraints.audio.deviceId = { exact: elInput.value };
+    mediaStream = await navigator.mediaDevices.getUserMedia(constraints);
+  } catch (e) {
+    setHint('Mikrofon-/Eingangszugriff fehlgeschlagen: ' + e.message + '  — anderen Eingang waehlen oder Zugriff erlauben.', true);
+    setStatus('FEHLER');
+    return;
+  }
+
+  captureGranted(mediaStream);
+  inputsUnlocked = true;
+  refreshAudioInputs();
+
+  try {
+    audioCtx = new AudioContext();
+    await audioCtx.resume();
+    analyzer = new TempoAnalyzer(audioCtx.sampleRate, minBpm, maxBpm);
+
+    const src = audioCtx.createMediaStreamSource(mediaStream);
+    // ScriptProcessorNode statt AudioWorklet: laedt kein Modul -> auch unter
+    // file:// nutzbar. Mono-Downmix, in HOP_SIZE-grosse Bloecke schneiden.
+    procNode = audioCtx.createScriptProcessor(2048, 1, 1);
+    procNode.onaudioprocess = (ev) => {
+      const buf = ev.inputBuffer;
+      const chs = buf.numberOfChannels, n = buf.length;
+      const mono = new Float32Array(n);
+      for (let c = 0; c < chs; c++) {
+        const d = buf.getChannelData(c);
+        for (let i = 0; i < n; i++) mono[i] += d[i];
+      }
+      if (chs > 1) for (let i = 0; i < n; i++) mono[i] /= chs;
+      for (let off = 0; off + HOP_SIZE <= n; off += HOP_SIZE) {
+        onChunk(mono.subarray(off, off + HOP_SIZE));
+      }
+    };
+    src.connect(procNode);
+    // ScriptProcessor feuert nur, wenn er zum Ausgang verbunden ist.
+    // Stumm geschalteter Gain -> kein Ton, keine Rueckkopplung.
+    sinkNode = audioCtx.createGain();
+    sinkNode.gain.value = 0;
+    procNode.connect(sinkNode);
+    sinkNode.connect(audioCtx.destination);
+  } catch (e) {
+    setHint('Audio konnte nicht gestartet werden: ' + e.message, true);
+    setStatus('FEHLER');
+    if (audioCtx) { try { await audioCtx.close(); } catch (_) {} audioCtx = null; }
+    if (mediaStream) { mediaStream.getTracks().forEach(t => t.stop()); mediaStream = null; }
+    procNode = null; sinkNode = null; analyzer = null;
+    return;
+  }
+
+  estimates = []; lastRaw = 0; levelEma = 0; haveEstimate = false;
+  resetKey();
+  clock.enable();
+  analyzeTimer = setInterval(analyze, ANALYSIS_INTERVAL * 1000);
+  lastChunkTime = performance.now();
+  running = true;
+  elStart.textContent = 'Stopp';
+  elStart.classList.add('stop');
+  setControlsDisabled(true);
+  setHint('Laeuft. Tab im Vordergrund lassen, damit die Clock stabil bleibt.');
+}
+
+function stop() {
+  running = false;
+  if (analyzeTimer) { clearInterval(analyzeTimer); analyzeTimer = null; }
+  clock.disable();
+  if (procNode) { procNode.disconnect(); procNode.onaudioprocess = null; procNode = null; }
+  if (sinkNode) { sinkNode.disconnect(); sinkNode = null; }
+  if (mediaStream) { mediaStream.getTracks().forEach(t => t.stop()); mediaStream = null; }
+  if (audioCtx) { audioCtx.close(); audioCtx = null; }
+  analyzer = null; haveEstimate = false; estimates = [];
+  resetKey();
+  if (keyEnabled) updateKeyDisplay();
+  elStart.textContent = 'Start';
+  elStart.classList.remove('stop');
+  setControlsDisabled(false);
+  setBpmText('—');
+  elRaw.textContent = 'roh: —';
+  setStatus('bereit');
+  updateLevel(-60);
+}
+
+// --- Audio-Bloecke + Analyse ---
+function onChunk(chunk) {
+  if (!analyzer) return;
+  lastChunkTime = performance.now();
+  analyzer.pushChunk(chunk);
+  let sum = 0;
+  for (let i = 0; i < chunk.length; i++) sum += chunk[i] * chunk[i];
+  const rms = Math.sqrt(sum / chunk.length);
+  levelEma = 0.85 * levelEma + 0.15 * rms;
+}
+function analyze() {
+  if (!analyzer) return;
+  const db = levelEma > 0 ? 20 * Math.log10(levelEma) : -120;
+  if (db < SILENCE_DB) {
+    estimates = []; haveEstimate = false; clock.setTargetBpm(null);
+    resetKey();
+    return;
+  }
+  const est = analyzer.estimate();
+  if (est) {
+    lastRaw = est.bpm;
+    estimates.push(est.bpm);
+    if (estimates.length > BPM_MEDIAN_LEN) estimates.splice(0, estimates.length - BPM_MEDIAN_LEN);
+    haveEstimate = true;
+    clock.setTargetBpm(median(estimates));
+  }
+  updateKey();
+}
+
+// --- Tonart: Chroma -> 50% schnelle EMA + 50% Gesamtmittel -> Klassifikation
+//     mit Hysterese (wie im Python-Kern). Laeuft immer mit (guenstig); die
+//     Anzeige erscheint nur, wenn der Tonart-Button aktiv ist.
+function resetKey() {
+  keyDisp = '—'; keyPend = null; keyPendN = 0; keyConfident = false;
+  emaPcp = emaBass = cumPcp = cumBass = null; cumN = 0;
+  if (analyzer) { analyzer.cbuf.fill(0); analyzer.cbufFilled = 0; }
+}
+function updateKey() {
+  const ch = analyzer.computeChroma();
+  if (!ch) return;
+  const p = ch.pcp, b = ch.bass;
+  if (emaPcp === null) {
+    emaPcp = p.slice(); emaBass = b.slice();
+    cumPcp = p.slice(); cumBass = b.slice(); cumN = 1;
+  } else {
+    for (let i = 0; i < 12; i++) {
+      emaPcp[i]  = (1 - KEY_EMA_A) * emaPcp[i]  + KEY_EMA_A * p[i];
+      emaBass[i] = (1 - KEY_EMA_A) * emaBass[i] + KEY_EMA_A * b[i];
+      cumPcp[i] += p[i]; cumBass[i] += b[i];
+    }
+    cumN++;
+  }
+  const prof = new Float32Array(12), bprof = new Float32Array(12);
+  for (let i = 0; i < 12; i++) {
+    prof[i]  = 0.5 * emaPcp[i]  + 0.5 * (cumPcp[i]  / cumN);
+    bprof[i] = 0.5 * emaBass[i] + 0.5 * (cumBass[i] / cumN);
+  }
+  const r = classifyKey(prof, bprof);
+  const cand = r.name;
+  // Hysterese: Wechsel erst nach KEY_SWITCH_CONFIRM gleichen Folgeschaetzungen.
+  if (cand !== keyDisp) {
+    if (keyDisp === '—' || cand === '—') { keyDisp = cand; keyPend = null; keyPendN = 0; }
+    else if (cand === keyPend) {
+      keyPendN++;
+      if (keyPendN >= KEY_SWITCH_CONFIRM) { keyDisp = cand; keyPend = null; keyPendN = 0; }
+    } else { keyPend = cand; keyPendN = 1; }
+  } else { keyPend = null; keyPendN = 0; }
+  keyConfident = (cand === keyDisp && cand !== '—'
+                  && r.margin >= KEY_CONFIDENT_MARGIN && cumN >= KEY_CONFIDENT_MIN_N);
+}
+function updateKeyDisplay() {
+  const show = running && keyDisp !== '—';
+  elKeyName.textContent = show ? keyDisp : '—';
+  const par = show ? parallelKey(keyDisp) : '';
+  elKeyPar.textContent = par ? '(' + par + ')' : '';
+  // Gedimmt, solange die Erkennung noch unsicher ist (wie im Python-Kern).
+  elKeyName.classList.toggle('idle', !(show && keyConfident));
+}
+
+// --- Anzeige ---
+function render() {
+  if (running) {
+    const db = levelEma > 0 ? 20 * Math.log10(levelEma) : -120;
+    updateLevel(db);
+    if (performance.now() - lastChunkTime > 1500) {
+      setStatus('KEIN AUDIO – Eingang prüfen'); setBpmText('—');
+    } else if (db < SILENCE_DB) {
+      setStatus('KEIN SIGNAL'); setBpmText('—');
+    } else if (!haveEstimate) {
+      setStatus('analysiere …'); setBpmText('—');
+    } else {
+      setStatus('laeuft'); setBpmText(String(Math.round(median(estimates))));
+    }
+    elRaw.textContent = 'roh: ' + (lastRaw ? lastRaw.toFixed(1) : '—');
+  }
+  if (keyEnabled) updateKeyDisplay();
+  requestAnimationFrame(render);
+}
+
+// --- Hilfen ---
+function median(arr) {
+  if (!arr.length) return 0;
+  const s = [...arr].sort((a, b) => a - b);
+  const m = s.length >> 1;
+  return s.length % 2 ? s[m] : 0.5 * (s[m - 1] + s[m]);
+}
+function clampBpm(v, fallback) { return isFinite(v) ? Math.min(300, Math.max(30, v)) : fallback; }
+function setStatus(txt) { elStatus.textContent = txt; }
+function setBpmText(txt) { elBpm.textContent = txt; elBpm.classList.toggle('idle', txt === '—'); }
+function setHint(txt, isError) { elHint.textContent = txt; elHint.classList.toggle('error', !!isError); }
+function updateLevel(db) {
+  const pct = Math.max(0, Math.min(100, (db + 60) / 60 * 100));
+  elBar.style.width = pct + '%';
+  elDb.textContent = (db <= -60 ? '-60' : db.toFixed(0)) + ' dB';
+}
+function setControlsDisabled(on) { elInput.disabled = on; elLoad.disabled = on; elMin.disabled = on; elMax.disabled = on; }
+
+// --- Verdrahtung ---
+elStart.addEventListener('click', () => running ? stop() : start());
+elMidi.addEventListener('change', applyMidiOutput);
+elLoad.addEventListener('click', () => { inputsUnlocked = false; unlockInputs(); });
+elInput.addEventListener('focus', () => { if (!inputsUnlocked) unlockInputs(); });
+elMidi.addEventListener('focus', initMidi);
+elKeyToggle.addEventListener('click', () => {
+  keyEnabled = !keyEnabled;
+  elKeyBlock.style.display = keyEnabled ? '' : 'none';
+  elKeyToggle.textContent = keyEnabled ? 'ausblenden' : 'anzeigen';
+  elKeyToggle.classList.toggle('on', keyEnabled);
+  if (keyEnabled) updateKeyDisplay();
+});
+
+window.addEventListener('DOMContentLoaded', () => {
+  elMidi.add(new Option('Kein MIDI (Liste öffnen zum Verbinden)', ''));
+  refreshAudioInputs();
+  setBpmText('—');
+  updateLevel(-60);
+  setStatus('bereit');
+  if (!window.isSecureContext) {
+    setHint('Hinweis: Ohne sicheren Kontext (lokale Datei, http://localhost oder HTTPS) können Mikrofon/MIDI gesperrt sein.', true);
+  } else {
+    setHint('„Eingänge laden“ klicken, um alle Audio-Eingänge mit Namen zu sehen. MIDI-Liste öffnen, um den MIDI-Ausgang zu wählen.');
+  }
+  requestAnimationFrame(render);
+});
+</script>
 </body>
 </html>

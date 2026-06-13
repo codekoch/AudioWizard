@@ -1,104 +1,43 @@
-# Audio2Midi -- WebApp (BPM + MIDI-Clock)
+# Audio2Midi -- Webversion (BPM, MIDI-Clock & Tonart)
 
 Eine schlanke Browser-Variante des Projekts: Tempo-Erkennung (BPM) mit
-**stabiler MIDI-Clock-Ausgabe** (24 PPQN), optional auch die Grundtonart.
-Keine Installation, kein Python -- läuft direkt im Browser über die
-**Web Audio API** (Eingang) und die **Web MIDI API** (Clock-Ausgabe).
+**stabiler MIDI-Clock-Ausgabe** (24 PPQN), optional auch die **Grundtonart**
+(mit Paralleltonart). Keine Installation, kein Python, kein Server -- die
+ganze App steckt in einer einzigen Datei: **`index.html`**.
 
-Tonart, Akkorde, Loopback und die Kiosk-Oberfläche bleiben den
-Python-Versionen vorbehalten; diese WebApp ist bewusst auf den Kern
-reduziert.
+> **Online ausprobieren:** _GitHub-Pages-Link folgt hier._
 
-Es gibt zwei Varianten:
+## Starten
 
-1. **Einzeldatei `audio2midi-standalone.html`** – einfach im Browser öffnen
-   (Doppelklick), **kein Server nötig**. Empfohlen für den schnellen Einsatz.
-2. **Server-Variante (`index.html` + `*.js`)** – nutzt einen modernen
-   `AudioWorklet` (Analyse im eigenen Thread), braucht aber einen lokalen
-   Server (s. unten).
+- **Lokal:** `index.html` einfach im Browser öffnen (Doppelklick im
+  Datei-Explorer oder im Browser `Strg`+`O`). Kein Server nötig.
+- **Online:** über den GitHub-Pages-Link oben (siehe unten „Veröffentlichung").
+
+Dann:
+
+1. **„Eingänge laden"** klicken und den Mikrofon-Zugriff erlauben – erst
+   danach zeigt der Browser alle Audio-Eingänge **mit Namen** (Datenschutz).
+   Den gewünschten **Audio-Eingang** wählen.
+2. **MIDI-Ausgang**: die Liste öffnen (fragt den MIDI-Zugriff an) und einen
+   Port wählen, z. B. „loopMIDI Port". „Kein MIDI" zeigt nur an.
+3. Optional **BPM-Bereich** anpassen (Standard 70–140) und über den Button
+   **„Tonart"** die Tonart-Anzeige einblenden.
+4. **Start** drücken.
+
+Die große Zahl zeigt das erkannte Tempo; die MIDI-Clock startet automatisch
+mit der ersten stabilen Schätzung (MIDI `start`) und hält bei Stille an
+(`stop`).
 
 ## Voraussetzungen
 
 - **Browser mit Web MIDI:** Chrome, Edge oder Opera (Chromium).
   Firefox unterstützt Web MIDI nur mit Erweiterung; **Safari unterstützt es
-  nicht** – dort gibt es keine MIDI-Ausgabe.
+  nicht** – dort gibt es keine MIDI-Ausgabe (Anzeige funktioniert trotzdem).
 - **Virtueller MIDI-Port**, um eine DAW/Hardware auf demselben Rechner zu
   erreichen: Windows
   [loopMIDI](https://www.tobias-erichsen.de/software/loopmidi.html),
   macOS der IAC-Treiber (Audio-MIDI-Setup), Linux ALSA/`snd-virmidi`.
   Ein USB-MIDI-Interface geht direkt.
-
-## Variante 1: Einzeldatei (ohne Server)
-
-**`audio2midi-standalone.html` im Browser öffnen** – Doppelklick im
-Datei-Explorer oder im Browser per `Strg`+`O`. Fertig, kein Server.
-
-Diese Datei verwendet einen `ScriptProcessorNode` statt des `AudioWorklet`:
-etwas älter, lädt aber kein Modul nach und läuft daher auch direkt von
-`file://` (wo der Browser Worklets sperrt). Für diese leichte Analyse ist das
-völlig ausreichend; die MIDI-Clock ist davon ohnehin unabhängig.
-
-Beim Start fragt der Browser nach Mikrofon-Zugriff. Bedienung wie unten
-(„Eingänge laden" → Eingang wählen, MIDI-Liste öffnen → Port wählen, Start).
-
-**Zusätzlich: Tonart-Anzeige.** Über den Button **„Tonart"** lässt sich
-optional die erkannte Grundtonart mit Paralleltonart einblenden (z. B.
-„C Dur (A Moll)"). Die Erkennung ist aus dem Python-Kern portiert
-(Sha'ath-Profile, Bass-Evidenz zur Unterscheidung von Dur und Mollparallele,
-zweistufige Mittelung mit Hysterese; unsichere Erkennung wird gedimmt). Das
-Chroma stammt hier aus einer STFT (statt der CQT des Python-Projekts), ist
-also etwas einfacher – für die Grundtonart aber gut brauchbar. Nur in der
-Einzeldatei-Variante vorhanden.
-
-## Variante 2: Server (AudioWorklet)
-
-Im Ordner `webapp/` den mitgelieferten kleinen Server starten:
-
-```bash
-cd webapp
-python serve.py
-```
-
-Dann im Browser **http://localhost:8000** öffnen.
-
-> ⚠️ **Nicht die `index.html` direkt doppelklicken!** Wird die Seite als
-> `file://…/index.html` geöffnet, behandelt der Browser sie als Origin
-> „null" und **blockiert AudioWorklets** (`blob:null` → „Unable to load a
-> worklet's module"). Die Adressleiste muss `http://localhost:8000` zeigen,
-> nicht `file://`. Web Audio braucht zwingend einen `http`-/`https`-Origin.
-
-`serve.py` liefert `.js` zuverlässig mit JavaScript-MIME-Typ aus (manche
-Systeme mappen `.js` sonst auf `text/plain`, was das Laden von AudioWorklets
-verhindert) und schaltet Caching ab, damit Änderungen sofort ankommen.
-`python -m http.server` funktioniert grundsätzlich auch, kann aber je nach
-System genau an diesen beiden Punkten scheitern.
-
-1. **„Eingänge laden"** klicken und den Mikrofon-Zugriff erlauben – erst
-   danach zeigt der Browser alle Audio-Eingänge **mit Namen** (siehe Kasten
-   unten). Dann den gewünschten **Audio-Eingang** wählen.
-2. **MIDI-Ausgang**: die Liste öffnen (fragt den MIDI-Zugriff an) und einen
-   Port wählen, z. B. „loopMIDI Port". „Kein MIDI" zeigt nur an.
-3. Optional den **BPM-Bereich** anpassen (Standard 70–140, genau eine
-   Oktave – macht die Tempo-Zuordnung eindeutig).
-4. **Start** drücken.
-
-> **Warum erst „Eingänge laden"?** Aus Datenschutzgründen gibt der Browser
-> die vollständige, benannte Eingangsliste erst nach erteilter
-> Mikrofon-Freigabe heraus; vorher erscheint nur ein anonymer
-> „Standard-Eingang". Berechtigungen werden bewusst erst bei Bedarf
-> angefragt (Mikrofon beim Laden der Eingänge, MIDI beim Öffnen der
-> MIDI-Liste), nicht schon beim Seitenaufruf.
->
-> **Firefox** zeigt die Geräteauswahl in seinem *eigenen* Berechtigungs­dialog
-> und gibt bei „Dieses Mal erlauben" oft nur das gewählte Gerät an die Liste
-> weiter – das gewünschte Mikrofon also direkt im Browser-Dialog auswählen
-> (oder „Beim Besuch dieser Website merken" wählen, dann erscheint die volle
-> Liste). Für die eigentliche MIDI-Ausgabe ohnehin **Chrome/Edge** verwenden;
-> dort funktioniert auch die In-App-Auswahl vollständig.
-
-Die große Zahl zeigt das erkannte Tempo; die MIDI-Clock startet automatisch
-mit der ersten stabilen Schätzung (MIDI `start`) und hält bei Stille an
-(`stop`).
 
 ## Warum die Clock stabil ist
 
@@ -107,49 +46,57 @@ geplant** – der Zeitstempel liegt in der `performance.now()`-Domäne, und das
 MIDI-Subsystem des Browsers/Betriebssystems gibt den Tick dann zeitgenau aus.
 Die Tick-Stabilität hängt damit nicht am (ungenauen) JavaScript-Timer,
 sondern an der OS-MIDI-Schicht – derselbe Gedanke wie bei CoreMIDI auf dem
-Mac. Ein Lookahead-Scheduler (Timer in einem Web Worker, damit er im
-Hintergrund seltener gedrosselt wird) füllt die Tick-Warteschlange laufend
-ein Stück in die Zukunft. Tempoänderungen werden mit Totband (gegen
-Mess-Zittern) und begrenzter Slew-Rate sanft nachgeführt – kein Tick-Burst.
+Mac. Ein Lookahead-Scheduler füllt die Tick-Warteschlange laufend ein Stück
+in die Zukunft. Tempoänderungen werden mit Totband (gegen Mess-Zittern) und
+begrenzter Slew-Rate sanft nachgeführt – kein Tick-Burst.
 
 **Tipp:** Den Tab im Vordergrund lassen. Hintergrund-Tabs werden vom Browser
 gedrosselt; durch den Lookahead bleibt die Clock zwar eine Weile stabil,
 für den Live-Betrieb sollte der Tab aber sichtbar bleiben.
 
+## Tonart-Anzeige (optional)
+
+Über den Button **„Tonart"** lässt sich die erkannte Grundtonart mit
+Paralleltonart einblenden (z. B. „C Dur (A Moll)"). Die Erkennung ist aus dem
+Python-Kern portiert: Sha'ath-Profile, Bass-Evidenz zur Unterscheidung von Dur
+und Mollparallele, zweistufige Mittelung mit Hysterese; unsichere Erkennung
+wird gedimmt angezeigt. Das Chroma stammt aus einer (für den Bass extra
+hochaufgelösten) STFT statt der CQT des Python-Projekts.
+
+## Technische Hinweise
+
+- **`ScriptProcessorNode` statt `AudioWorklet`:** Der Worklet lädt ein Modul
+  nach, was der Browser unter `file://` (Origin „null") blockiert. Der
+  ScriptProcessor lädt nichts nach und läuft daher auch beim direkten Öffnen
+  der Datei. Etwas älter/deprecated, für diese leichte Analyse aber völlig
+  ausreichend; die MIDI-Clock ist davon ohnehin unabhängig.
+- **MIDI-Clock-Timer im Hauptthread** (kein Blob-Worker – der wäre unter
+  `file://` ebenfalls gesperrt). Tab sichtbar lassen.
+
 ## Grenzen gegenüber den Python-Versionen
 
-- **Kürzere Geräteliste als die Python-Version:** Der Browser zeigt eine
-  *logische* Eingangsliste – einen Eintrag pro echtem Gerät. Die Python-App
-  (PortAudio) listet dasselbe Interface mehrfach, einmal pro Host-API
-  (MME, DirectSound, WASAPI, WDM-KS) und Abtastrate; das macht der Browser
-  bewusst nicht. Namen erscheinen zudem erst nach der Mikrofon-Freigabe
-  („Eingänge laden").
-- **Kein Mithören der Wiedergabe** (Spotify o. ä.): Browser dürfen die
-  Ausgabe anderer Apps nicht systemweit mitschneiden, und die
-  WASAPI-„Loopback"-Einträge der Windows-Version gibt es im Browser nicht.
-  Quelle ist immer Mikrofon oder ein Audio-Interface (Class-Compliant,
-  ohne Treiber). Ein in Windows aktiviertes „Stereomix" erscheint allerdings
-  als normaler Eingang und lässt sich wählen.
-- **Vereinfachte Analyse:** Statt der HPSS-Trennung dient eine
-  Spektralfluss-Onset-Hüllkurve als Grundlage der Autokorrelation. Für
-  rhythmisches Material ist das robust; bei sehr flächigem/perkussionsarmem
-  Material ist die Python-Version etwas treffsicherer.
-- **Tonart** (optional, nur Einzeldatei): Grundtonart + Paralleltonart aus
-  STFT-Chroma statt CQT – etwas weniger treffsicher als die Python-Version,
-  vor allem bei der Dur/Moll-Unterscheidung. Keine Akkorde, kein Beat-Sync.
+- **Kürzere Geräteliste:** Der Browser zeigt eine *logische* Eingangsliste –
+  einen Eintrag pro echtem Gerät. Die Python-App (PortAudio) listet dasselbe
+  Interface mehrfach (MME, DirectSound, WASAPI, WDM-KS). Namen erscheinen erst
+  nach der Mikrofon-Freigabe („Eingänge laden").
+- **Kein Mithören der Wiedergabe** (Spotify o. ä.): Browser dürfen die Ausgabe
+  anderer Apps nicht systemweit mitschneiden; die WASAPI-„Loopback"-Einträge
+  der Windows-Version gibt es nicht. Quelle ist immer Mikrofon oder ein
+  Audio-Interface. Ein in Windows aktiviertes „Stereomix" erscheint allerdings
+  als normaler Eingang.
+- **Vereinfachte Analyse:** Spektralfluss-Onset-Hüllkurve statt HPSS; Tonart
+  aus STFT-Chroma statt CQT (etwas weniger treffsicher, vor allem bei der
+  Dur/Moll-Unterscheidung). Keine Akkorde, kein Beat-Sync.
 
-## Dateien
+## Veröffentlichung über GitHub Pages
 
-| Datei | Zweck |
-|-------|-------|
-| `audio2midi-standalone.html` | **Einzeldatei** (Variante 1): alles inline, `ScriptProcessorNode`, ohne Server lauffähig |
-| `index.html` | Oberfläche der Server-Variante (Variante 2) |
-| `style.css` | dunkles Thema (an die Kiosk-Anzeige angelehnt) |
-| `tempo.js` | FFT, Onset-Hüllkurve, Autokorrelation, BPM-Schätzung |
-| `midiclock.js` | Lookahead-Scheduler + zeitgestempelte MIDI-Clock |
-| `app.js` | Glue: Audio/MIDI einrichten, Analyse takten, Anzeige; enthält den AudioWorklet (Mono-Downmix, 512-Sample-Blöcke) als eingebetteten Blob |
-| `serve.py` | kleiner Server für Variante 2 (korrekter JS-MIME, no-cache) |
+Da alles in `index.html` steckt, genügt statisches Hosting:
 
-Die Stellschrauben (Fensterlänge, Prior, Slew-Rate, Totband …) stehen als
-Konstanten am Kopf von `tempo.js`, `midiclock.js` und `app.js` und sind
-bewusst nach denselben Werten wie im Python-Kern benannt.
+1. Im GitHub-Repo unter **Settings → Pages** die Quelle auf „Deploy from a
+   branch", Branch `master`, Ordner `/ (root)` setzen.
+2. Nach dem Build ist die App erreichbar unter
+   `https://<benutzer>.github.io/<repo>/webapp/`.
+3. Diesen Link oben in dieser README (und in der Haupt-README) eintragen.
+
+> Web MIDI und Mikrofon brauchen einen sicheren Kontext – über `https://…`
+> (GitHub Pages liefert HTTPS) ist das erfüllt.
