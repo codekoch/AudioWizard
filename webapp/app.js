@@ -171,6 +171,29 @@ async function unlockInputs() {
   }
 }
 
+// AudioWorklet-Modul laden -- robust gegen falsch konfigurierten MIME-Typ.
+// addModule() verlangt einen JavaScript-MIME-Typ; manche lokalen Server
+// (z. B. python http.server unter Windows, je nach Registry) liefern .js
+// aber als text/plain o. ae. aus und addModule lehnt dann ab. Als Ausweg die
+// Datei selbst holen und als Blob mit korrektem MIME-Typ nachladen.
+async function addWorkletModule(ctx) {
+  try {
+    await ctx.audioWorklet.addModule('capture-worklet.js');
+    return;
+  } catch (e) {
+    const resp = await fetch('capture-worklet.js');
+    if (!resp.ok) throw e;
+    const code = await resp.text();
+    const url = URL.createObjectURL(
+      new Blob([code], { type: 'application/javascript' }));
+    try {
+      await ctx.audioWorklet.addModule(url);
+    } finally {
+      URL.revokeObjectURL(url);
+    }
+  }
+}
+
 // ---------------------------------------------------------------------------
 // Sitzung starten / stoppen
 // ---------------------------------------------------------------------------
@@ -206,7 +229,7 @@ async function start() {
 
   try {
     audioCtx = new AudioContext();
-    await audioCtx.audioWorklet.addModule('capture-worklet.js');
+    await addWorkletModule(audioCtx);
     await audioCtx.resume();
 
     analyzer = new TempoAnalyzer(audioCtx.sampleRate, minBpm, maxBpm);
