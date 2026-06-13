@@ -25,15 +25,20 @@ reduziert.
 
 ## Starten
 
-Im Ordner `webapp/` einen lokalen Webserver starten -- z. B. mit dem schon
-vorhandenen Python:
+Im Ordner `webapp/` den mitgelieferten kleinen Server starten:
 
 ```bash
 cd webapp
-python -m http.server 8000
+python serve.py
 ```
 
 Dann im Browser **http://localhost:8000** öffnen.
+
+`serve.py` liefert `.js` zuverlässig mit JavaScript-MIME-Typ aus (manche
+Systeme mappen `.js` sonst auf `text/plain`, was das Laden von AudioWorklets
+verhindert) und schaltet Caching ab, damit Änderungen sofort ankommen.
+`python -m http.server` funktioniert grundsätzlich auch, kann aber je nach
+System genau an diesen beiden Punkten scheitern.
 
 1. **„Eingänge laden"** klicken und den Mikrofon-Zugriff erlauben – erst
    danach zeigt der Browser alle Audio-Eingänge **mit Namen** (siehe Kasten
