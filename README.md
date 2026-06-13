@@ -104,7 +104,7 @@ in [webapp/index.html](webapp/index.html): BPM-Erkennung mit stabiler
 MIDI-Clock und optionaler Tonart-Anzeige über die Web Audio und Web MIDI API
 (Chrome/Edge). Einfach im Browser öffnen – kein Server nötig.
 
-👉 **Online ausprobieren:** _GitHub-Pages-Link folgt._
+👉 **Online ausprobieren:** <a href="https://codekoch.github.io/Audio2Midi/webapp/">https://codekoch.github.io/Audio2Midi/webapp/</a>
 
 Details in [webapp/README.md](webapp/README.md).
 
