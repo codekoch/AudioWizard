@@ -97,6 +97,13 @@ Kiosk-Autostart, Overlay-Dateisystem für den Bühnenbetrieb (robust gegen
 hartes Ausschalten) und Performance-Tipps stehen in
 [README_RaspberryPi.md](README_RaspberryPi.md).
 
+## WebApp (Browser, nur BPM + MIDI-Clock)
+
+Eine schlanke Browser-Variante ohne Installation liegt in
+[webapp/](webapp/): nur Tempo-Erkennung mit stabiler MIDI-Clock über die
+Web Audio und Web MIDI API (Chrome/Edge, lokal über `localhost` ausführen).
+Details in [webapp/README.md](webapp/README.md).
+
 ## Wie es funktioniert
 
 Die Analyse läuft auf einem rollenden 8-Sekunden-Fenster, das jede Sekunde

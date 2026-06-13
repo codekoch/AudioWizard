@@ -1,0 +1,54 @@
+<!DOCTYPE html>
+<html lang="de">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Audio2Midi -- BPM & MIDI-Clock (WebApp)</title>
+  <link rel="stylesheet" href="style.css">
+</head>
+<body>
+  <header>
+    <h1>Audio2Midi</h1>
+    <span class="sub">BPM-Erkennung mit stabiler MIDI-Clock &middot; WebApp</span>
+  </header>
+
+  <section class="controls">
+    <div class="field">
+      <label for="audioIn">Audio-Eingang</label>
+      <select id="audioIn"></select>
+    </div>
+    <div class="field">
+      <label for="midiOut">MIDI-Ausgang</label>
+      <select id="midiOut"></select>
+    </div>
+    <div class="field">
+      <label>BPM-Bereich</label>
+      <div class="range">
+        <input type="number" id="minBpm" value="70" min="30" max="300" step="1">
+        <span>–</span>
+        <input type="number" id="maxBpm" value="140" min="30" max="300" step="1">
+      </div>
+    </div>
+    <button id="startBtn">Start</button>
+  </section>
+
+  <main>
+    <div class="bpm" id="bpm">—</div>
+    <div class="cap">BPM</div>
+    <div class="raw" id="raw">roh: —</div>
+    <div class="status" id="status">bereit</div>
+
+    <div class="level">
+      <span class="lbl">PEGEL</span>
+      <div class="track"><div id="levelBar"></div></div>
+      <span class="db" id="db">-60 dB</span>
+    </div>
+  </main>
+
+  <div class="hint" id="hint"></div>
+
+  <script src="tempo.js"></script>
+  <script src="midiclock.js"></script>
+  <script src="app.js"></script>
+</body>
+</html>
