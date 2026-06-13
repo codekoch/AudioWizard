@@ -16,6 +16,7 @@ const clock = new MidiClock();
 let midiAccess = null;
 let audioCtx = null;
 let workletNode = null;
+let sinkNode = null;           // stumm geschalteter Gain-Knoten zum Ausgang
 let mediaStream = null;
 let analyzer = null;
 
@@ -25,6 +26,7 @@ let levelEma = 0;              // geglaetteter Pegel (RMS)
 let haveEstimate = false;
 let running = false;
 let analyzeTimer = null;
+let lastChunkTime = 0;         // wann zuletzt Audio vom Eingang kam (Wächter)
 let inputsUnlocked = false;    // volle, benannte Geraeteliste verfuegbar?
 let unlocking = false;
 let grantedDeviceId = '';      // zuletzt tatsaechlich freigegebenes Geraet
@@ -191,7 +193,9 @@ async function start() {
     if (elInput.value) constraints.audio.deviceId = { exact: elInput.value };
     mediaStream = await navigator.mediaDevices.getUserMedia(constraints);
   } catch (e) {
-    setHint('Mikrofon-/Eingangszugriff fehlgeschlagen: ' + e.message, true);
+    setHint('Mikrofon-/Eingangszugriff fehlgeschlagen: ' + e.message
+          + '  — anderen Eingang waehlen oder Zugriff erlauben.', true);
+    setStatus('FEHLER');
     return;
   }
 
@@ -200,18 +204,34 @@ async function start() {
   inputsUnlocked = true;
   refreshAudioInputs();
 
-  audioCtx = new AudioContext();
-  await audioCtx.audioWorklet.addModule('capture-worklet.js');
-  await audioCtx.resume();
+  try {
+    audioCtx = new AudioContext();
+    await audioCtx.audioWorklet.addModule('capture-worklet.js');
+    await audioCtx.resume();
 
-  analyzer = new TempoAnalyzer(audioCtx.sampleRate, minBpm, maxBpm);
+    analyzer = new TempoAnalyzer(audioCtx.sampleRate, minBpm, maxBpm);
 
-  const src = audioCtx.createMediaStreamSource(mediaStream);
-  workletNode = new AudioWorkletNode(audioCtx, 'capture-processor');
-  workletNode.port.onmessage = (ev) => onChunk(ev.data);
-  src.connect(workletNode);
-  // Worklet muss nicht zu den Lautsprechern -- kein connect zum Ausgang
-  // (verhindert Rueckkopplung/Echo).
+    const src = audioCtx.createMediaStreamSource(mediaStream);
+    workletNode = new AudioWorkletNode(audioCtx, 'capture-processor');
+    workletNode.port.onmessage = (ev) => onChunk(ev.data);
+    src.connect(workletNode);
+    // Den Worklet-Knoten in einen Pfad zum Ausgang haengen, damit der Graph
+    // zuverlaessig (browserunabhaengig) gerendert wird -- manche Chrome-
+    // Versionen verarbeiten einen nicht angeschlossenen Zweig nicht. Der
+    // Knoten gibt selbst nur Stille aus, der Gain ist auf 0: kein Ton, keine
+    // Rueckkopplung.
+    sinkNode = audioCtx.createGain();
+    sinkNode.gain.value = 0;
+    workletNode.connect(sinkNode);
+    sinkNode.connect(audioCtx.destination);
+  } catch (e) {
+    setHint('Audio konnte nicht gestartet werden: ' + e.message, true);
+    setStatus('FEHLER');
+    if (audioCtx) { try { await audioCtx.close(); } catch (_) {} audioCtx = null; }
+    if (mediaStream) { mediaStream.getTracks().forEach(t => t.stop()); mediaStream = null; }
+    workletNode = null; sinkNode = null; analyzer = null;
+    return;
+  }
 
   estimates = [];
   lastRaw = 0;
@@ -221,6 +241,7 @@ async function start() {
   clock.enable();
   analyzeTimer = setInterval(analyze, ANALYSIS_INTERVAL * 1000);
 
+  lastChunkTime = performance.now();
   running = true;
   elStart.textContent = 'Stopp';
   elStart.classList.add('stop');
@@ -233,6 +254,7 @@ function stop() {
   if (analyzeTimer) { clearInterval(analyzeTimer); analyzeTimer = null; }
   clock.disable();
   if (workletNode) { workletNode.disconnect(); workletNode = null; }
+  if (sinkNode) { sinkNode.disconnect(); sinkNode = null; }
   if (mediaStream) { mediaStream.getTracks().forEach(t => t.stop()); mediaStream = null; }
   if (audioCtx) { audioCtx.close(); audioCtx = null; }
   analyzer = null;
@@ -253,6 +275,7 @@ function stop() {
 // ---------------------------------------------------------------------------
 function onChunk(chunk) {
   if (!analyzer) return;
+  lastChunkTime = performance.now();
   analyzer.pushChunk(chunk);
   // Pegel (RMS) fuer Anzeige und Stille-Erkennung mitfuehren.
   let sum = 0;
@@ -295,7 +318,12 @@ function render() {
   if (running) {
     const db = levelEma > 0 ? 20 * Math.log10(levelEma) : -120;
     updateLevel(db);
-    if (db < SILENCE_DB) {
+    // Wächter: kommen ueberhaupt Audio-Bloecke? Tote Quelle (Geraet liefert
+    // nichts) von echter Stille (Quelle da, aber leise) unterscheiden.
+    if (performance.now() - lastChunkTime > 1500) {
+      setStatus('KEIN AUDIO – Eingang prüfen');
+      setBpmText('—');
+    } else if (db < SILENCE_DB) {
       setStatus('KEIN SIGNAL');
       setBpmText('—');
     } else if (!haveEstimate) {
