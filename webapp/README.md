@@ -63,6 +63,10 @@ Browsers (Screen-Capture API, `getDisplayMedia`):
   und **„Tab-Audio teilen"** ankreuzen (z. B. den Spotify-Web-Player).
 - **macOS:** System-Audio ist hier nicht erfassbar – nur **Tab-Audio**
   (Spotify/YouTube als Browser-Tab). Safari unterstützt es nicht.
+- **Android/Mobil:** **nicht möglich** – mobile Browser stellen
+  `getDisplayMedia` nicht bereit. Die Option wird dort automatisch
+  deaktiviert; als Quelle bleibt nur das Mikrofon. (Der Noten-Modus
+  monophon funktioniert auf Android mit dem Mikrofon.)
 
 Wichtig: Das Audio-Häkchen muss aktiv sein, sonst kommt kein Ton an (die App
 weist dann darauf hin). Beendet man die Freigabe über die Browser-Leiste,

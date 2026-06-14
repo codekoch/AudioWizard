@@ -100,6 +100,31 @@ main {
 .hint { padding: 10px 24px; font-size: 13px; color: var(--muted); border-top: 1px solid var(--surface); min-height: 1.2em; }
 .hint.error { color: var(--warn); }
 .credit { padding: 4px 24px 10px; font-size: 11px; color: #55544e; text-align: right; }
+
+/* Kompaktere Darstellung auf schmalen Bildschirmen (Handy) */
+@media (max-width: 600px) {
+  header { flex-direction: column; align-items: flex-start; gap: 1px; padding: 8px 14px; }
+  header h1 { font-size: 16px; }
+  header .sub { font-size: 11px; line-height: 1.25; }
+  .controls { padding: 8px 14px; gap: 7px 12px; }
+  .field { gap: 2px; }
+  .field label { font-size: 10px; }
+  select, input[type="number"] { padding: 5px 8px; font-size: 13px; }
+  select { min-width: 0; }
+  .field .row { gap: 6px; }
+  button.ghost { padding: 5px 9px; font-size: 12px; }
+  button#startBtn { padding: 7px 18px; font-size: 14px; border-radius: 6px; }
+  main { padding: 10px; }
+  .bpm { font-size: clamp(56px, 22vw, 150px); }
+  .bpm.notes { font-size: clamp(30px, 8vw, 72px); }
+  .key { font-size: clamp(32px, 8vw, 64px); }
+  .keyblock { margin-top: 14px; }
+  .raw, .status { font-size: 13px; }
+  .raw { margin-top: 6px; }
+  .level { margin-top: 12px; }
+  .hint { padding: 7px 14px; font-size: 12px; }
+  .credit { padding: 2px 14px 7px; }
+}
 </style>
 </head>
 <body>
@@ -1138,6 +1163,14 @@ elKeyToggle.addEventListener('click', () => {
 
 window.addEventListener('DOMContentLoaded', () => {
   elMidi.add(new Option('Kein MIDI (Liste öffnen zum Verbinden)', ''));
+  // "Wiedergabe mithören" braucht getDisplayMedia -- auf Android/Mobil-Chrome
+  // nicht vorhanden. Dann die Option sichtbar deaktivieren statt erst beim
+  // Start zu scheitern.
+  if (!navigator.mediaDevices || !navigator.mediaDevices.getDisplayMedia) {
+    const opt = [...elSource.options].find(o => o.value === 'display');
+    if (opt) { opt.disabled = true; opt.textContent += ' – hier nicht verfügbar'; }
+    if (elSource.value === 'display') { elSource.value = 'input'; applySource(); }
+  }
   refreshAudioInputs();
   setBpmText('—');
   updateLevel(-60);
