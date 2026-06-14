@@ -184,6 +184,11 @@ main {
         <input type="checkbox" id="startStop"> senden
       </label>
     </div>
+    <div class="field">
+      <label for="octave">Oktave ±</label>
+      <input type="number" id="octave" value="0" min="-4" max="4" step="1"
+             title="Erkannte Noten für die MIDI-Ausgabe um N Oktaven verschieben">
+    </div>
     <button id="startBtn">Start</button>
   </section>
 
@@ -253,7 +258,9 @@ const BEAT_VALID_MS     = 4000;   // so lange gilt ein Beat-Anker als aktuell
 const NOTE_CH          = 0;       // MIDI-Kanal 1
 const NOTE_MIN_MIDI    = 36;      // C2
 const NOTE_MAX_MIDI    = 96;      // C7
-const NOTE_SILENCE_RMS = 0.004;   // ~ -48 dBFS: darunter keine Note
+const NOTE_SILENCE_RMS = 0.004;   // ~ -48 dBFS: darunter startet keine neue Note
+const NOTE_SUSTAIN_RMS = 0.0015;  // gehaltene Note bleibt an, solange Pegel darueber (Ausklingen)
+const NOTE_OFF_FRAMES  = 3;       // so viele wirklich leise Frames vor Note Off (entprellt)
 const YIN_THRESHOLD    = 0.15;    // YIN-Schwelle (kleiner = strenger)
 const POLY_HARMONICS   = 8;       // so viele Obertoene gehen in die Salienz ein
 const POLY_REL_THRESH  = 0.34;    // weitere Note nur, wenn Salienz >= Anteil der staerksten
@@ -741,7 +748,8 @@ class NoteEngine {
     this.buf = new Float32Array(this.win);
     this.filled = 0;
     this.display = '—';
-    this.curNote = -1; this.candNote = -1; this.candN = 0;   // mono
+    this.transpose = 0;               // Oktav-Transponierung der Ausgabe (Halbtoene)
+    this.curNote = -1; this.candNote = -1; this.candN = 0; this.offCount = 0;   // mono
     this.active = new Map();          // poly: midi -> Anzahl Frames ohne Beleg
     if (poly) {
       this.fft = new FFT(this.win);
@@ -761,28 +769,53 @@ class NoteEngine {
     if (this.filled < this.win) return;
     if (this.poly) this._poly(level); else this._mono(level);
   }
+  // Note-On/Off mit Oktav-Transponierung (auf MIDI-Bereich begrenzt). Da die
+  // Transponierung beim Senden angewandt wird, passen On und Off zusammen.
+  _out(note) { return Math.max(0, Math.min(127, note + this.transpose)); }
+  _noteOn(note, vel) { this.send([0x90 | NOTE_CH, this._out(note), vel]); }
+  _noteOff(note) { this.send([0x80 | NOTE_CH, this._out(note), 0]); }
+  setTranspose(semi) {
+    if (semi === this.transpose) return;
+    this.allOff();                 // offene Noten mit der ALTEN Transponierung beenden
+    this.transpose = semi;
+  }
   _mono(level) {
     let note = -1;
-    if (level > NOTE_SILENCE_RMS) {
+    // Zum HALTEN einer Note genuegt ein niedrigerer Pegel (Hysterese) -- ein
+    // ausklingender Ton reisst so nicht ab und wird nicht neu getriggert.
+    const gate = this.curNote !== -1 ? NOTE_SUSTAIN_RMS : NOTE_SILENCE_RMS;
+    if (level > gate) {
       const f = yinPitch(this.buf, this.sr, YIN_THRESHOLD);
       if (f > 0) {
         const m = Math.round(69 + 12 * Math.log2(f / 440));
         if (m >= NOTE_MIN_MIDI && m <= NOTE_MAX_MIDI) note = m;
       }
     }
-    if (note === -1) {                                  // Stille / kein Ton
-      if (this.curNote !== -1) { this.send([0x80 | NOTE_CH, this.curNote, 0]); this.curNote = -1; }
-      this.candNote = -1; this.candN = 0; this.display = '—';
+    if (note === this.curNote && this.curNote !== -1) {   // klar gehalten
+      this.offCount = 0; this.candNote = -1; this.candN = 0; return;
+    }
+    if (note === -1) {
+      // Keine klare Tonhoehe. Klingt noch genug Pegel? -> Note halten
+      // (YIN findet beim Ausklingen oft kurz nichts). Sonst nach Entprellung aus.
+      if (this.curNote !== -1 && level > NOTE_SUSTAIN_RMS) {
+        this.offCount = 0;
+      } else if (this.curNote !== -1) {
+        if (++this.offCount >= NOTE_OFF_FRAMES) {
+          this._noteOff(this.curNote); this.curNote = -1; this.offCount = 0; this.display = '—';
+        }
+      }
+      this.candNote = -1; this.candN = 0;
       return;
     }
-    if (note === this.curNote) { this.candNote = -1; this.candN = 0; return; }   // gehalten
+    // neuer Ton (anders als der gehaltene) -> Wechsel kurz entprellen
+    this.offCount = 0;
     if (note === this.candNote) this.candN++; else { this.candNote = note; this.candN = 1; }
-    const need = (this.curNote === -1) ? 1 : 2;         // aus Stille sofort, Wechsel kurz entprellen
+    const need = (this.curNote === -1) ? 1 : 2;
     if (this.candN >= need) {
-      if (this.curNote !== -1) this.send([0x80 | NOTE_CH, this.curNote, 0]);
-      this.send([0x90 | NOTE_CH, note, velFromLevel(level)]);
+      if (this.curNote !== -1) this._noteOff(this.curNote);
+      this._noteOn(note, velFromLevel(level));
       this.curNote = note; this.candNote = -1; this.candN = 0;
-      this.display = midiName(note);
+      this.display = midiName(this._out(note));
     }
   }
   _poly(level) {
@@ -836,24 +869,25 @@ class NoteEngine {
     }
     const vel = velFromLevel(level);
     for (const m of detected) {
-      if (!this.active.has(m)) this.send([0x90 | NOTE_CH, m, vel]);
+      if (!this.active.has(m)) this._noteOn(m, vel);
       this.active.set(m, 0);
     }
     for (const [m, miss] of [...this.active]) {          // Note-Off mit 1 Frame Nachsicht
       if (detected.has(m)) continue;
-      if (miss >= 1) { this.send([0x80 | NOTE_CH, m, 0]); this.active.delete(m); }
+      if (miss >= 1) { this._noteOff(m); this.active.delete(m); }
       else this.active.set(m, miss + 1);
     }
     const on = [...this.active.keys()].filter(m => this.active.get(m) === 0).sort((a, b) => a - b);
     const ch = chordName(on.map(m => ((m % 12) + 12) % 12));
     this.display = on.length
-      ? on.map(midiName).join(' ') + (ch ? '  (' + ch + ')' : '')
+      ? on.map(m => midiName(this._out(m))).join(' ') + (ch ? '  (' + ch + ')' : '')
       : '—';
   }
   allOff() {
-    if (this.curNote !== -1) { this.send([0x80 | NOTE_CH, this.curNote, 0]); this.curNote = -1; }
-    for (const m of this.active.keys()) this.send([0x80 | NOTE_CH, m, 0]);
+    if (this.curNote !== -1) { this._noteOff(this.curNote); this.curNote = -1; }
+    for (const m of this.active.keys()) this._noteOff(m);
     this.active.clear();
+    this.offCount = 0; this.candNote = -1; this.candN = 0;
     this.display = '—';
   }
 }
@@ -903,6 +937,8 @@ const elBar = $('levelBar'), elDb = $('db'), elHint = $('hint');
 const elKeyToggle = $('keyToggle'), elKeyBlock = $('keyBlock');
 const elKeyName = $('keyName'), elKeyPar = $('keyPar');
 const elStartStop = $('startStop');
+const elOctave = $('octave');
+let noteTranspose = 0;            // Oktav-Transponierung (Halbtoene) fuer die Noten-Ausgabe
 
 // --- Web MIDI (erst bei Bedarf anfragen) ---
 async function initMidi() {
@@ -1013,6 +1049,7 @@ function applyModeControls() {
   const note = opMode !== 'clock';
   elMin.disabled = note; elMax.disabled = note; elKeyToggle.disabled = note;
   elStartStop.disabled = note;        // Start/Stop nur im Clock-Modus relevant
+  elOctave.disabled = !note;          // Oktav-Transponierung nur im Noten-Modus
 }
 function applyMode() {
   opMode = elMode.value;
@@ -1097,6 +1134,8 @@ async function start() {
     if (noteMode) {
       noteEngine = new NoteEngine(sr, opMode === 'poly',
         (bytes) => { if (midiOut) { try { midiOut.send(bytes); } catch (e) {} } });
+      noteTranspose = (parseInt(elOctave.value, 10) || 0) * 12;
+      noteEngine.transpose = noteTranspose;
     } else {
       analyzer = new TempoAnalyzer(sr, minBpm, maxBpm);
     }
@@ -1327,6 +1366,12 @@ elMidi.addEventListener('focus', initMidi);
 elSource.addEventListener('change', applySource);
 elMode.addEventListener('change', applyMode);
 elStartStop.addEventListener('change', () => { clock.sendStartStop = elStartStop.checked; });
+elOctave.addEventListener('change', () => {
+  const oct = Math.max(-4, Math.min(4, parseInt(elOctave.value, 10) || 0));
+  elOctave.value = oct;
+  noteTranspose = oct * 12;
+  if (noteEngine) noteEngine.setTranspose(noteTranspose);   // offene Noten sauber umsetzen
+});
 elKeyToggle.addEventListener('click', () => {
   keyEnabled = !keyEnabled;
   elKeyBlock.style.display = keyEnabled ? '' : 'none';

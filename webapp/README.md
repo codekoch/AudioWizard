@@ -54,6 +54,12 @@ Schritte bewusst **nicht** mit – für möglichst geringe Latenz.
 Velocity wird aus dem Pegel abgeleitet, gesendet wird auf MIDI-Kanal 1.
 Beim Stoppen/Umschalten werden alle offenen Noten beendet (Note Off).
 
+Eine gehaltene Note bleibt über das Ausklingen **stehen** (Pegel-Hysterese +
+entprelltes Note-Off), statt bei jedem kurzen Erkennungsaussetzer neu
+getriggert zu werden. Mit **„Oktave ±"** lassen sich die erkannten Töne für
+die MIDI-Ausgabe um ganze Oktaven nach oben/unten verschieben (z. B. eine
+tief gespielte Bassline eine Oktave höher an einen Synth schicken).
+
 ## Wiedergabe mithören (Loopback)
 
 Statt eines Mikrofons lässt sich auch die laufende **Wiedergabe** analysieren
