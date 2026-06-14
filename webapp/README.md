@@ -98,11 +98,14 @@ Mac. Ein Lookahead-Scheduler füllt die Tick-Warteschlange laufend ein Stück
 in die Zukunft. Tempoänderungen werden mit Totband (gegen Mess-Zittern) und
 begrenzter Slew-Rate sanft nachgeführt – kein Tick-Burst.
 
-**Phasenkopplung gegen Drift:** Zusätzlich zur reinen Tempofolge rastet die
-Clock per PLL sanft auf das **Beat-Raster des Songs** ein – die Beat-Phase
-wird aus der Onset-Hüllkurve geschätzt, und der Beat-Tick (Tick 1 von 24)
-wird mit max. wenigen Millisekunden pro Beat darauf nachgezogen. So bleibt
-ein synchronisiertes Gerät dauerhaft im Timing, statt langsam wegzudriften.
+**Phasenkopplung gegen Drift:** Die Clock läuft nicht einfach im geschätzten
+Tempo (das minimal daneben liegen und so langsam wegdriften kann), sondern im
+**aus den Beats gemessenen Song-Tempo**: Aus dem Abstand aufeinanderfolgender
+erkannter Beats wird die echte Beat-Periode bestimmt und als Clock-Rate
+verwendet. Zusätzlich wird der Beat-Tick (Tick 1 von 24) mit max. wenigen
+Millisekunden pro Beat sanft auf das Beat-Raster nachgezogen. So bleibt ein
+synchronisiertes Gerät dauerhaft im Timing. Das genaue Einrasten dauert nach
+dem Start einige Sekunden.
 
 **MIDI Start/Stop (Option):** Standardmäßig sendet die App **kein** Start/Stop,
 sondern nur durchgehende Clock-Pulse – du startest dein Gerät selbst (auf den

@@ -242,10 +242,11 @@ const TICK_MS       = 25;
 const SLEW_BPM_PER_S = 8.0;
 const DEADBAND_BPM  = 0.15;
 const MSG_CLOCK = 0xF8, MSG_START = 0xFA, MSG_STOP = 0xFC;
-// Beat-Phasenkopplung (PLL): die Clock rastet sanft auf das Beat-Raster des
-// Songs ein, damit ein synchronisiertes Geraet nicht wegdriftet.
-const BEAT_PLL_GAIN     = 0.2;    // Anteil des Phasenfehlers, der pro Beat korrigiert wird
-const BEAT_MAX_NUDGE_MS = 4.0;    // max. Phasenkorrektur pro Beat (kein hoerbarer Sprung)
+// Beat-Phasenkopplung: die Clock laeuft im aus den Beats GEMESSENEN Song-Tempo
+// (kein Drift durch Tempo-Schaetzfehler) und zieht die Beat-Phase zusaetzlich
+// sanft aufs Song-Raster (Proportional-Nachregelung).
+const BEAT_PLL_GAIN     = 0.10;   // Phasen-Anteil pro Beat
+const BEAT_MAX_NUDGE_MS = 6.0;    // max. Phasenkorrektur pro Beat (kein hoerbarer Sprung)
 const BEAT_VALID_MS     = 4000;   // so lange gilt ein Beat-Anker als aktuell
 
 // Noten-Modus (Pitch -> MIDI)
@@ -255,8 +256,9 @@ const NOTE_MAX_MIDI    = 96;      // C7
 const NOTE_SILENCE_RMS = 0.004;   // ~ -48 dBFS: darunter keine Note
 const YIN_THRESHOLD    = 0.15;    // YIN-Schwelle (kleiner = strenger)
 const POLY_HARMONICS   = 8;       // so viele Obertoene gehen in die Salienz ein
-const POLY_REL_THRESH  = 0.22;    // weitere Note nur, wenn Salienz >= Anteil der staerksten
-const NOTE_MAX_POLY    = 6;       // max. gleichzeitige Noten
+const POLY_REL_THRESH  = 0.34;    // weitere Note nur, wenn Salienz >= Anteil der staerksten
+const POLY_CANCEL_BINS = 3;       // +/- Bins, die je Oberton geloescht werden
+const NOTE_MAX_POLY    = 5;       // max. gleichzeitige Noten
 
 // ===========================================================================
 // Radix-2-FFT (in-place)
@@ -400,7 +402,7 @@ class TempoAnalyzer {
   }
   estimate() {
     const e = this.onset, L = e.length;
-    if (L < this.envRate * 3) return null;
+    if (L < this.envRate * 2) return null;       // ~2 s -> erste BPM erscheint frueher
     let mean = 0;
     for (let i = 0; i < L; i++) mean += e[i];
     mean /= L;
@@ -535,11 +537,13 @@ class MidiClock {
     this.tickInBeat = 0;          // 0..23; Tick 0 ist ein Beat
     this._lastSched = 0;
     this.sendStartStop = false;   // MIDI Start/Stop senden? (Standard: nein)
-    // Beat-Anker (Phasenkopplung)
-    this.anchor = 0;              // performance.now-Zeit eines Song-Beats (ms)
-    this.period = 0;              // Beat-Abstand (ms)
+    // Beat-Phasenkopplung
+    this.anchor = 0;              // geglaettete performance.now-Zeit eines Song-Beats (ms)
+    this.period = 0;              // Beat-Abstand fuers Grid = verfeinerte Periode (ms)
     this.anchorTime = 0;          // wann der Anker zuletzt aktualisiert wurde
     this.anchorValid = false;
+    this.refPeriod = 0;           // aus aufeinanderfolgenden Beats gemessene Periode
+    this.refAnchor = 0;           // letzter gemeldeter echter Beat (fuer die Messung)
     this._timer = setInterval(() => this._schedule(), TICK_MS);
   }
   setOutput(output) {
@@ -565,14 +569,32 @@ class MidiClock {
   setBeat(anchorMs, periodMs) {
     if (!(periodMs > 0)) return;
     const now = performance.now();
-    if (this.anchorValid && (now - this.anchorTime) < BEAT_VALID_MS && this.period > 0) {
-      const m = Math.round((anchorMs - this.anchor) / periodMs);
-      const proj = this.anchor + m * periodMs;
+    const fresh = this.anchorValid && (now - this.anchorTime) < BEAT_VALID_MS;
+    // Echte Beat-Periode aus dem Abstand zweier gemessener Beats verfeinern --
+    // genauer als die Tempo-Schaetzung, daher laeuft die Clock im Song-Tempo
+    // und driftet nicht weg.
+    if (fresh && this.refPeriod > 0) {
+      const dt = anchorMs - this.refAnchor;
+      const beats = Math.round(dt / this.refPeriod);
+      if (beats >= 1 && beats <= 8) {
+        const measured = dt / beats;
+        if (measured > periodMs * 0.6 && measured < periodMs * 1.6) {
+          this.refPeriod += 0.35 * (measured - this.refPeriod);
+        }
+      }
+    } else {
+      this.refPeriod = periodMs;
+    }
+    this.refAnchor = anchorMs;
+    // Anker fuers Grid auf die verfeinerte Periode projizieren + glaetten.
+    if (fresh && this.period > 0) {
+      const m = Math.round((anchorMs - this.anchor) / this.refPeriod);
+      const proj = this.anchor + m * this.refPeriod;
       this.anchor = proj + 0.4 * (anchorMs - proj);
     } else {
       this.anchor = anchorMs;
     }
-    this.period = periodMs;
+    this.period = this.refPeriod;
     this.anchorTime = now;
     this.anchorValid = true;
   }
@@ -618,20 +640,24 @@ class MidiClock {
     // ohne Start/Stop bei Stille: einfach mit letztem Tempo weiterticken.
 
     if (this.nextTick < now - LOOKAHEAD_MS) this.nextTick = now;
-    const interval = 60000 / (this.curBpm * PPQN);
     const horizon = now + LOOKAHEAD_MS;
     while (this.nextTick < horizon) {
-      // Phasenkopplung: den Beat-Tick (Tick 0) sanft aufs Song-Raster ziehen.
+      // Phase: Beat-Tick (Tick 0) sanft aufs Song-Raster ziehen.
       if (this.tickInBeat === 0 && this._beatActive(now)) {
         const m = Math.round((this.nextTick - this.anchor) / this.period);
-        const err = (this.anchor + m * this.period) - this.nextTick;
+        const err = (this.anchor + m * this.period) - this.nextTick;   // ms; >0 = Song-Beat spaeter
         if (Math.abs(err) < this.period * 0.45) {     // Halbbeat-Slips ignorieren
           this.nextTick += Math.max(-BEAT_MAX_NUDGE_MS,
                                     Math.min(BEAT_MAX_NUDGE_MS, err * BEAT_PLL_GAIN));
         }
       }
+      // Tempo: bei aktivem Beat die GEMESSENE Song-Periode (kein Drift),
+      // sonst das geschaetzte/geslewte Tempo.
+      const eff = (this._beatActive(now) && this.refPeriod > 0)
+        ? Math.max(20, 60000 / this.refPeriod)
+        : Math.max(20, this.curBpm);
       this._send(MSG_CLOCK, this.nextTick);
-      this.nextTick += interval;
+      this.nextTick += 60000 / (eff * PPQN);
       this.tickInBeat = (this.tickInBeat + 1) % PPQN;
     }
   }
@@ -802,8 +828,8 @@ class NoteEngine {
           const f0 = 440 * Math.pow(2, (bestM - 69) / 12);   // Obertonreihe loeschen
           for (let h = 1; h <= POLY_HARMONICS; h++) {
             const f = f0 * h; if (f >= nyq) break;
-            const b = Math.round(f * scale);
-            for (let k = Math.max(0, b - 2); k <= Math.min(half - 1, b + 2); k++) spec[k] = 0;
+            const b = Math.round(f * scale), w = POLY_CANCEL_BINS;
+            for (let k = Math.max(0, b - w); k <= Math.min(half - 1, b + w); k++) spec[k] = 0;
           }
         }
       }
@@ -1188,7 +1214,9 @@ function analyze() {
       clock.setBeat(lastChunkTime - offSec * 1000, 60000 / med);
     }
   }
-  updateKey();
+  // Tonart-Chroma (grosse FFT) nur rechnen, wenn die Anzeige aktiv ist -- spart
+  // spuerbar Rechenzeit (v. a. auf dem Handy), wenn die Tonart nicht gebraucht wird.
+  if (keyEnabled) updateKey();
 }
 
 // --- Tonart: Chroma -> 50% schnelle EMA + 50% Gesamtmittel -> Klassifikation
