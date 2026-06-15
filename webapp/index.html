@@ -221,6 +221,12 @@ main {
       <button id="keyToggle" class="ghost"
               title="Grundtonart (mit Paralleltonart) anzeigen">anzeigen</button>
     </div>
+    <div class="field" id="syncField">
+      <label for="beatSync">Beat-Sync</label>
+      <label class="chk" title="Clock regelmäßig auf den erkannten Beat nachführen (gegen Drift). Bei undeutlichem Beat läuft sie frei weiter.">
+        <input type="checkbox" id="beatSync" checked> auf Beat
+      </label>
+    </div>
     <div class="field">
       <label for="startStop">MIDI Start/Stop</label>
       <label class="chk" title="MIDI Start/Stop senden? Aus = nur durchgehende Clock; du startest dein Gerät selbst.">
@@ -348,6 +354,7 @@ const MSG_CLOCK = 0xF8, MSG_START = 0xFA, MSG_STOP = 0xFC;
 const BEAT_PLL_GAIN     = 0.10;   // Phasen-Anteil pro Beat
 const BEAT_MAX_NUDGE_MS = 6.0;    // max. Phasenkorrektur pro Beat (kein hoerbarer Sprung)
 const BEAT_VALID_MS     = 4000;   // so lange gilt ein Beat-Anker als aktuell
+const BEAT_MIN_COH      = 0.18;   // Mindest-Phasenkohaerenz der Onset-Faltung, sonst kein Sync (kein Reissen bei undeutlichem Beat)
 
 // Datei-Modus: Offline-Beat-Map -> driftfreie Clock gegen die Wiedergabe.
 const FILE_TIGHTNESS         = 100;    // DP-Beat-Tracker: Bindung der Beat-Abstaende ans (lokale) Tempo
@@ -594,6 +601,34 @@ class TempoAnalyzer {
     }
     return bestOff / this.envRate;              // Sekunden seit letztem Beat
   }
+  // Beat-Raster fuer die Phasenkopplung der Clock: faltet die rollende Onset-
+  // Huellkurve eng um das Tempo (Phasen-Kohaerenz, wie im Datei-Modus). Liefert
+  // verfeinerte Periode + Phase (Sekunden seit letztem Beat) + Guete (0..1).
+  // Robuster als die Einzelfenster-Kammsuche -- nur bei hoher Guete einrasten.
+  beatGrid(bpm) {
+    const e = this.onset, L = e.length;
+    if (!(bpm > 0) || L < this.envRate * 3) return null;     // >= ~3 s Historie
+    let mean = 0; for (let i = 0; i < L; i++) mean += e[i]; mean /= L;
+    let denom = 0; for (let i = 0; i < L; i++) { const w = e[i] - mean; if (w > 0) denom += w; }
+    if (denom <= 0) return null;
+    const P0 = 60 * this.envRate / bpm;                      // Periode in Frames
+    const coh = (P) => {
+      let sc = 0, ss = 0;
+      for (let i = 0; i < L; i++) { const w = e[i] - mean; if (w <= 0) continue; const a = 2 * Math.PI * i / P; sc += w * Math.cos(a); ss += w * Math.sin(a); }
+      return [Math.hypot(sc, ss) / denom, Math.atan2(ss, sc)];
+    };
+    let lo = P0 * 0.97, hi = P0 * 1.03, bestP = P0, bestR = -1, bestAng = 0;
+    for (let pass = 0; pass < 2; pass++) {                    // grob -> fein um das Maximum
+      const steps = 60;
+      for (let s = 0; s <= steps; s++) { const P = lo + (hi - lo) * s / steps; const r = coh(P); if (r[0] > bestR) { bestR = r[0]; bestP = P; bestAng = r[1]; } }
+      const span = (hi - lo) / steps * 3; lo = bestP - span; hi = bestP + span;
+    }
+    let phase0 = (bestAng / (2 * Math.PI)) * bestP; phase0 = ((phase0 % bestP) + bestP) % bestP;
+    const lastIdx = L - 1;
+    const k = Math.floor((lastIdx - phase0) / bestP);
+    const offFrames = lastIdx - (phase0 + k * bestP);        // Frames seit letztem Beat (0..bestP)
+    return { offSec: offFrames / this.envRate, periodSec: bestP / this.envRate, coherence: bestR };
+  }
 }
 
 // ===========================================================================
@@ -689,6 +724,8 @@ class MidiClock {
     this.anchorValid = false;
   }
   setTargetBpm(bpm) { this.targetBpm = bpm; }
+  // Beat-Kopplung sofort loesen (Beat-Sync aus): Clock laeuft frei im Tempo weiter.
+  clearBeat() { this.anchorValid = false; this.refPeriod = 0; }
   // Song-Beat-Raster melden: anchorMs = Zeit eines Beats, periodMs = Beat-Abstand.
   // Der Anker wird leicht geglaettet (auf das vorige Raster projiziert + EMA).
   setBeat(anchorMs, periodMs) {
@@ -1187,6 +1224,9 @@ let recBlob = null;            // fertige Aufnahme (Original, fuer WebM-Speicher
 let recSegments = [];          // erkannte Stuecke fuer das Speichern-Panel
 let recMonitoring = false;     // Live-Analyse (Pegel/BPM/Tonart) waehrend Bereitstellen+Aufnahme
 
+// Beat-Sync (Clock-Phasenkopplung) -- optional, Standard an
+let beatSyncEnabled = true;
+
 // Tonart-Zustand (zweistufige Mittelung + Hysterese wie im Python-Kern)
 let keyEnabled = false;
 let keyDisp = '—', keyPend = null, keyPendN = 0, keyConfident = false;
@@ -1203,6 +1243,7 @@ const elBar = $('levelBar'), elDb = $('db'), elHint = $('hint');
 const elKeyToggle = $('keyToggle'), elKeyBlock = $('keyBlock');
 const elKeyName = $('keyName'), elKeyPar = $('keyPar');
 const elStartStop = $('startStop');
+const elSyncField = $('syncField'), elBeatSync = $('beatSync');
 const elOctave = $('octave');
 const elSrcField = $('srcField'), elInField = $('inField'), elKeyField = $('keyField'), elOctField = $('octField');
 const elFileField = $('fileField'), elFileBtn = $('fileBtn'), elFileNameLbl = $('fileNameLbl'), elAudioFile = $('audioFile');
@@ -1329,6 +1370,7 @@ function applyModeControls() {
   elMin.disabled = note;               // BPM-Bereich: Clock + Datei nutzen ihn, Noten nicht
   elMax.disabled = note;
   elKeyToggle.disabled = note || file; // Tonart nur im Clock-Modus
+  elBeatSync.disabled = note || file;  // Beat-Sync nur im Clock-Modus
   elStartStop.disabled = note;         // Start/Stop fuer Clock + Datei relevant
   elOctave.disabled = !note;           // Oktav-Transponierung nur im Noten-Modus
   elSource.disabled = false;           // Quelle: Clock/Noten = Live-Quelle, Datei = Aufnahme-Quelle
@@ -2538,12 +2580,17 @@ function analyze() {
     haveEstimate = true;
     const med = median(estimates);
     clock.setTargetBpm(med);
-    // Beat-Phasenkopplung (Einrasten aufs Song-Raster) DEAKTIVIERT: brachte
-    // keine zuverlaessige Drift-Reduktion und ist die Komplexitaet nicht wert.
-    // Die Clock laeuft jetzt einfach im geglaetteten Median-Tempo
-    // (siehe MidiClock._schedule; ohne Beat-Anker greift die PLL nicht mehr).
-    // Falls die Phasenkopplung spaeter doch gewuenscht ist, hier wieder
-    // analyzer.beatPhase(med) ermitteln und clock.setBeat(...) aufrufen.
+    // Beat-Phasenkopplung (optional, gegen Drift): die Clock laeuft im aus den
+    // Beats gemessenen Song-Tempo und wird auf das erkannte Beat-Raster nachge-
+    // zogen. Das Raster kommt aus einer Phasenfaltung der Onset-Huellkurve eng
+    // ums Tempo -- nur bei hoher Kohaerenz einrasten, sonst frei weiterlaufen
+    // (kein Reissen bei undeutlichem Beat).
+    if (beatSyncEnabled) {
+      const grid = analyzer.beatGrid(med);
+      if (grid && grid.coherence >= BEAT_MIN_COH) {
+        clock.setBeat(lastChunkTime - grid.offSec * 1000, grid.periodSec * 1000);
+      }
+    }
   }
   // Tonart-Chroma (grosse FFT) nur rechnen, wenn die Anzeige aktiv ist -- spart
   // spuerbar Rechenzeit (v. a. auf dem Handy), wenn die Tonart nicht gebraucht wird.
@@ -2673,6 +2720,10 @@ elMidi.addEventListener('focus', initMidi);
 elSource.addEventListener('change', applySource);
 elMode.addEventListener('change', applyMode);
 elStartStop.addEventListener('change', () => { clock.sendStartStop = elStartStop.checked; });
+elBeatSync.addEventListener('change', () => {
+  beatSyncEnabled = elBeatSync.checked;
+  if (!beatSyncEnabled) clock.clearBeat();   // sofort frei laufen lassen
+});
 elOctave.addEventListener('change', () => {
   const oct = Math.max(-4, Math.min(4, parseInt(elOctave.value, 10) || 0));
   elOctave.value = oct;

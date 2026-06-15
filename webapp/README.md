@@ -216,14 +216,24 @@ Mac. Ein Lookahead-Scheduler füllt die Tick-Warteschlange laufend ein Stück
 in die Zukunft. Tempoänderungen werden mit Totband (gegen Mess-Zittern) und
 begrenzter Slew-Rate sanft nachgeführt – kein Tick-Burst.
 
-**Phasenkopplung gegen Drift:** Die Clock läuft nicht einfach im geschätzten
-Tempo (das minimal daneben liegen und so langsam wegdriften kann), sondern im
-**aus den Beats gemessenen Song-Tempo**: Aus dem Abstand aufeinanderfolgender
-erkannter Beats wird die echte Beat-Periode bestimmt und als Clock-Rate
-verwendet. Zusätzlich wird der Beat-Tick (Tick 1 von 24) mit max. wenigen
-Millisekunden pro Beat sanft auf das Beat-Raster nachgezogen. So bleibt ein
-synchronisiertes Gerät dauerhaft im Timing. Das genaue Einrasten dauert nach
-dem Start einige Sekunden.
+**Beat-Sync gegen Drift (optional):** Ohne Sync läuft die Clock im geschätzten
+Tempo – das liegt aber oft minimal daneben (z. B. 120,1 statt 120 BPM), wodurch
+sie nach einigen Takten hörbar vom Song wegdriftet. Mit aktivem **„Beat-Sync"**
+(Standard an, in den Steuerelementen abschaltbar) wird die Clock laufend auf das
+erkannte Beat-Raster nachgeführt:
+
+- Aus einer **Phasenfaltung der Onset-Hüllkurve** eng ums geschätzte Tempo wird
+  – über das ganze Analysefenster – die **echte Beat-Periode und -Phase** sehr
+  genau bestimmt (gemessen <0,03 % Tempofehler bei klarem Beat); diese Periode
+  dient als Clock-Rate, sodass kaum noch Drift entsteht.
+- Zusätzlich wird der Beat-Tick (Tick 1 von 24) mit max. wenigen Millisekunden
+  pro Beat sanft auf das Raster nachgezogen (Phasenregelung), was Restdrift
+  laufend ausgleicht. Das Einrasten dauert nach dem Start ein paar Sekunden.
+
+Eingerastet wird **nur bei deutlichem, kohärentem Beat** – bei undeutlichem
+Rhythmus läuft die Clock einfach im zuletzt gemessenen Tempo frei weiter (kein
+Reißen). Wer das nicht will (oder ungewöhnliches Material hat), schaltet
+„Beat-Sync" ab; dann läuft die Clock wie zuvor im geglätteten Schätztempo.
 
 **MIDI Start/Stop (Option):** Standardmäßig sendet die App **kein** Start/Stop,
 sondern nur durchgehende Clock-Pulse – du startest dein Gerät selbst (auf den
