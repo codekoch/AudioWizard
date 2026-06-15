@@ -269,7 +269,9 @@ const FILE_TIGHTNESS         = 100;    // DP-Beat-Tracker: Bindung der Beat-Abst
 const FILE_LEAD_S            = 0.18;   // Vorlauf vor dem Wiedergabestart (Audio + Scheduler einschwingen)
 const FILE_SCHED_INTERVAL_MS = 25;     // Scheduler-Takt
 const FILE_SCHED_LOOKAHEAD_S = 0.12;   // so weit im Voraus werden Ticks terminiert
-const FILE_CONST_TOL         = 0.015;  // <=1,5% Tempo-Streuung -> "konstant" -> perfektes Raster
+const FILE_CONST_DRIFT       = 0.015;  // <=1,5% Tempo-Unterschied 1./2. Haelfte -> "konstant" -> perfektes Raster
+const FILE_FOLD_REL          = 0.006;  // Feinsuche der Periode: +-0,6% um den Median-Beat-Abstand
+const FILE_FOLD_MIN_R        = 0.45;   // ab dieser Phasenkohaerenz wird die verfeinerte Periode genutzt
 
 // Noten-Modus (Pitch -> MIDI)
 const NOTE_CH          = 0;       // MIDI-Kanal 1
@@ -1426,37 +1428,47 @@ async function computeBeatMap(buffer, minBpm, maxBpm, onProgress) {
   for (let i = 0; i < beatFrames.length; i++) beats[i] = beatFrames[i] * HOP_SIZE / sr;
   beats = sanitizeBeats(beats);
   if (beats.length < 2) return null;
-  // konstant vs. variabel: robuster Median der |Residuen| gegen den Geradenfit
-  // (einzelne fehlgeschnappte Beats kippen die Entscheidung nicht). Schwelle mit
-  // Frame-Quantisierung als Untergrenze (~11 ms Raster nicht ueberbewerten).
-  const fit = lineFit(beats);
-  const resAbs = [];
-  for (let i = 0; i < beats.length; i++) resAbs.push(Math.abs(beats[i] - (fit.a + fit.b * i)));
-  resAbs.sort((a, b) => a - b);
-  const madRes = resAbs[resAbs.length >> 1];
+  // Konstantes vs. variables Tempo. Ein zum Klick aufgenommener Song laeuft
+  // konstant -- auch wenn der Beat-Tracker einzelne Beats verschluckt oder
+  // doppelt setzt. Dabei wandert die Beat-PHASE ueber den Song, weshalb ein
+  // Geradenfit gegen den Beat-INDEX (t ~ a + b*k) hier untauglich ist: schon
+  // ein ausgelassener Beat verschiebt alle folgenden Indizes und treibt die
+  // Residuen auf >100 ms, obwohl das Tempo exakt konstant ist. Robust ist der
+  // Vergleich des Median-Beat-Abstands der ERSTEN gegen die ZWEITE Haelfte:
+  // echte Tempoaenderung verschiebt ihn, reines Erkennungs-Zittern nicht.
   const ibis = [];
-  let ibiMin = Infinity, ibiMax = 0;
-  for (let i = 1; i < beats.length; i++) { const d = beats[i] - beats[i - 1]; if (d > 0) { ibis.push(d); if (d < ibiMin) ibiMin = d; if (d > ibiMax) ibiMax = d; } }
-  if (!ibis.length || !isFinite(ibiMin) || ibiMax <= 0) return null;
-  const frameSec = HOP_SIZE / sr;
-  const tolSec = Math.max(FILE_CONST_TOL * fit.b, 1.0 * frameSec);
-  const constant = fit.b > 0 && (1.4826 * madRes) < tolSec;
+  for (let i = 1; i < beats.length; i++) { const d = beats[i] - beats[i - 1]; if (d > 0) ibis.push(d); }
+  if (ibis.length < 2) return null;
+  const sorted = ibis.slice().sort((a, b) => a - b);
+  const q = (p) => sorted[Math.min(sorted.length - 1, Math.max(0, Math.round(p * (sorted.length - 1))))];
+  const medIvl = q(0.5);                       // robuste Beat-Periode (gegen Aussetzer/Doppler)
+  const midBeat = beats.length >> 1;
+  const medHalf = (lo, hi) => { const w = []; for (let i = lo + 1; i < hi; i++) { const d = beats[i] - beats[i - 1]; if (d > 0) w.push(d); } if (!w.length) return 0; w.sort((a, b) => a - b); return w[w.length >> 1]; };
+  const mh1 = medHalf(0, midBeat), mh2 = medHalf(midBeat, beats.length);
+  const drift = (mh1 > 0 && mh2 > 0) ? Math.abs(mh2 - mh1) / (0.5 * (mh1 + mh2)) : 1;
   if (onProgress) onProgress(1.0);
-  if (constant) {
-    const b = fit.b, dur = buffer.duration;
-    const k0 = Math.ceil((0 - fit.a) / b - 1e-9);
+  if (medIvl > 0 && drift < FILE_CONST_DRIFT) {
+    // Periode praezise bestimmen: der Median-Beat-Abstand ist ein robuster, aber
+    // nur ~0,1%-genauer Startwert (genug fuer 10 ms, aber bei langen Files ein
+    // paar 100 ms Drift). Per Phasenfaltung eng um den Median wird er ueber die
+    // volle Songlaenge verfeinert -- aber nur, wenn die Beats global phasen-
+    // kohaerent sind (R >= FILE_FOLD_MIN_R); sonst koennte die Faltung auf eine
+    // leicht falsche Periode einrasten. Die enge Suche (+-FILE_FOLD_REL) haelt
+    // selbst eine verworfene Faltung dicht am robusten Median.
+    const fold = foldPeriod(beats, medIvl, FILE_FOLD_REL);
+    const P = (fold.R >= FILE_FOLD_MIN_R) ? fold.P : medIvl;
+    const ph = gridPhase(beats, P);            // bester globaler Anker (zirkulaeres Mittel)
+    const dur = buffer.duration;
     const arr = [];
-    for (let k = k0; ; k++) { const t = fit.a + b * k; if (t > dur) break; if (t >= 0) arr.push(t); }
+    let k = Math.ceil((0 - ph) / P - 1e-9);
+    for (; ; k++) { const t = ph + P * k; if (t > dur) break; if (t >= 0) arr.push(t); }
     if (arr.length >= 2) {
-      const bpm = 60 / b;
+      const bpm = 60 / P;
       return { beats: Float64Array.from(arr), constant: true, bpm: bpm, bpmMin: bpm, bpmMax: bpm };
     }
   }
-  // variabel: robuste Kennzahlen (Median + 10/90-Perzentile) -> einzelne Ausreisser-
-  // Beats verfaelschen die Anzeige nicht.
-  const sorted = ibis.slice().sort((a, b) => a - b);
-  const q = (p) => sorted[Math.min(sorted.length - 1, Math.max(0, Math.round(p * (sorted.length - 1))))];
-  const medIvl = q(0.5);
+  // variabel: robuste Kennzahlen (Median + 10/90-Perzentile) -> einzelne
+  // Ausreisser-Beats verfaelschen die Anzeige nicht.
   return { beats, constant: false, bpm: 60 / medIvl, bpmMin: 60 / q(0.9), bpmMax: 60 / q(0.1) };
 }
 
@@ -1614,15 +1626,34 @@ function sanitizeBeats(beats) {
   return Float64Array.from(out);
 }
 
-// Geradenfit t ~ a + b*k (k = Beat-Index) per kleinster Quadrate.
-function lineFit(beats) {
-  const n = beats.length;
-  let sx = 0, sy = 0, sxx = 0, sxy = 0;
-  for (let k = 0; k < n; k++) { const y = beats[k]; sx += k; sy += y; sxx += k * k; sxy += k * y; }
-  const den = n * sxx - sx * sx;
-  const b = den !== 0 ? (n * sxy - sx * sy) / den : 0;
-  const a = (sy - b * sx) / n;
-  return { a, b };
+// Phasenfaltung: feine Periodensuche eng um P0 (Sekunden). Faltet alle Beats
+// auf ihre Phase (Beat modulo P) und sucht die Periode mit der staerksten
+// Buendelung (Laenge der Resultierenden R, 0..1). Unempfindlich gegen
+// ausgelassene/doppelte Beats -- ein fehlender Beat liegt weiter bei Phase 0,
+// ein Doppler ist ein einzelner Ausreisser. Liefert Periode P und Kohaerenz R.
+function foldPeriod(beats, P0, rel) {
+  const coh = (P) => {
+    let sc = 0, ss = 0;
+    for (let i = 0; i < beats.length; i++) { const a = 2 * Math.PI * beats[i] / P; sc += Math.cos(a); ss += Math.sin(a); }
+    return Math.hypot(sc, ss) / beats.length;
+  };
+  let lo = P0 * (1 - rel), hi = P0 * (1 + rel), bestP = P0, bestR = -1;
+  for (let pass = 0; pass < 3; pass++) {          // grob -> fein um das Maximum
+    const steps = 400; let lp = bestP, lr = -1;
+    for (let s = 0; s <= steps; s++) { const P = lo + (hi - lo) * s / steps; const R = coh(P); if (R > lr) { lr = R; lp = P; } }
+    bestP = lp; bestR = lr; const span = (hi - lo) / steps * 4; lo = bestP - span; hi = bestP + span;
+  }
+  return { P: bestP, R: bestR };
+}
+
+// Zirkulaeres Mittel der Beat-Phasen modulo P -> bester globaler Anker (s) in
+// [0, P). Robust gegen Ausreisser, weil als Vektormittel gerechnet.
+function gridPhase(beats, P) {
+  let sc = 0, ss = 0;
+  for (let i = 0; i < beats.length; i++) { const a = 2 * Math.PI * beats[i] / P; sc += Math.cos(a); ss += Math.sin(a); }
+  let ph = (Math.atan2(ss, sc) / (2 * Math.PI)) * P;
+  ph %= P; if (ph < 0) ph += P;
+  return ph;
 }
 
 // 24 PPQN. Wichtig: 24 Ticks gelten PRO Viertel. Ist ein Beat-Abstand ~doppelt
