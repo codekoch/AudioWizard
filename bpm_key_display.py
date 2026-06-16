@@ -187,6 +187,14 @@ class DisplayApp:
         self._rec_segs = None                 # vom Segmentier-Thread gesetzt
         self._rec_name_vars = []
         self._rec_save_win = None
+        # ---- DJ-Modus (zwei Decks, Crossfade, Clock folgt) ----
+        self.dj_engine = None
+        self.dj_clock_stop = None
+        self.dj_clock_thread = None
+        self.dj_midi = None
+        self.dj_win = None
+        self.dj_w = [{}, {}]                  # Widget-Referenzen je Deck
+        self._dj_load_res = None              # (idx, audio, sr, info, key, name)
         self._load_options()                  # Optionen + BPM-Bereich anwenden
 
         # ---- Schriften (Groesse wird bei Resize angepasst) ----
@@ -380,6 +388,13 @@ class DisplayApp:
                                  pady=6, highlightthickness=0, takefocus=0,
                                  cursor="hand2")
         self.rec_btn.pack(side="left", padx=(8, 0))
+        self.dj_btn = tk.Button(btns, text="DJ", command=self.open_dj,
+                                font=self.f_small, bg=COL_SURFACE, fg=COL_FG,
+                                activebackground=COL_SURF_HI,
+                                activeforeground=COL_FG, bd=0, padx=16, pady=6,
+                                highlightthickness=0, takefocus=0,
+                                cursor="hand2")
+        self.dj_btn.pack(side="left", padx=(8, 0))
         self._small_button(btns, "Beenden", self.quit_app).pack(side="right")
         self._small_button(btns, "Einstellungen",
                            self.on_settings).pack(side="right", padx=(0, 8))
@@ -1053,6 +1068,293 @@ class DisplayApp:
         self._rec_info.config(
             text=f"{ok} von {len(self._rec_segs)} Stück(en) im Ordner gespeichert.")
 
+    # ------------------------------------------------------------------
+    # DJ-Modus: zwei Decks, Crossfade, Clock folgt dem Ziel-Deck
+    # ------------------------------------------------------------------
+    def open_dj(self):
+        """DJ-Fenster oeffnen: zwei Decks in einem gemischten Ausgabe-Stream,
+        Crossfade per Klick aufs Deck oder Fader; die MIDI-Clock folgt dem
+        dominierenden Deck. Beendet eine laufende Live-Sitzung."""
+        if self.dj_win is not None:
+            try:
+                self.dj_win.lift()
+            except Exception:
+                pass
+            return
+        self.stop_session()
+        try:
+            self.dj_engine = core.DJEngine(channels=2)
+            self.dj_engine.start_stream()
+        except Exception as e:
+            self.dj_engine = None
+            self.show_setup(error=f"DJ-Audioausgabe fehlgeschlagen: {e}")
+            return
+        # MIDI aus der Konfiguration
+        self.dj_midi = None
+        cfg = load_config()
+        midi_name = cfg.get("midi_output") or None
+        if midi_name and (midi_name == core.VIRTUAL_MIDI
+                          or midi_name in mido.get_output_names()):
+            try:
+                self.dj_midi = core.open_midi_output(midi_name)
+            except Exception:
+                self.dj_midi = None
+        self.dj_clock_stop = threading.Event()
+        self.dj_clock_thread = threading.Thread(
+            target=core.dj_clock_worker,
+            args=(self.dj_engine, self.dj_midi, self.dj_clock_stop), daemon=True)
+        self.dj_clock_thread.start()
+        self._build_dj_window()
+        self._dj_tick()
+
+    def _build_dj_window(self):
+        win = tk.Toplevel(self.root)
+        win.title("DJ-Modus")
+        win.configure(bg=COL_BG)
+        win.geometry("760x540")
+        win.transient(self.root)
+        win.protocol("WM_DELETE_WINDOW", self._dj_close)
+        self.dj_win = win
+        tk.Label(win, text="DJ-Modus", font=self.f_h1, bg=COL_BG,
+                 fg=COL_FG).pack(pady=(12, 2))
+        tk.Label(win, text="Datei je Deck laden · Klick aufs Deck (oder Fader) "
+                           "blendet über · die Clock folgt dem lauteren Deck",
+                 font=self.f_tiny, bg=COL_BG, fg=COL_MUTED).pack(pady=(0, 8))
+        decks = tk.Frame(win, bg=COL_BG)
+        decks.pack(fill="both", expand=True, padx=16)
+        decks.columnconfigure(0, weight=1, uniform="d")
+        decks.columnconfigure(1, weight=1, uniform="d")
+        for idx in (0, 1):
+            self._build_dj_deck(decks, idx)
+        # Crossfader
+        cf = tk.Frame(win, bg=COL_BG)
+        cf.pack(fill="x", padx=24, pady=(8, 4))
+        tk.Label(cf, text="A", font=self.f_small, bg=COL_BG,
+                 fg=COL_ACCENT).pack(side="left")
+        self.dj_cross = tk.Scale(cf, from_=0, to=100, orient="horizontal",
+                                 showvalue=False, command=self._dj_cross,
+                                 bg=COL_BG, fg=COL_FG, troughcolor=COL_SURFACE,
+                                 highlightthickness=0, bd=0, sliderrelief="flat",
+                                 activebackground=COL_OK)
+        self.dj_cross.pack(side="left", fill="x", expand=True, padx=10)
+        tk.Label(cf, text="B", font=self.f_small, bg=COL_BG,
+                 fg=COL_ACCENT).pack(side="left")
+        self.dj_clock_lbl = tk.Label(win, text="Clock: –", font=self.f_small,
+                                     bg=COL_BG, fg=COL_MUTED)
+        self.dj_clock_lbl.pack(pady=(2, 2))
+        bf = tk.Frame(win, bg=COL_BG)
+        bf.pack(fill="x", padx=16, pady=(4, 12))
+        self._small_button(bf, "Schließen", self._dj_close).pack(side="right")
+
+    def _build_dj_deck(self, parent, idx):
+        letter = "A" if idx == 0 else "B"
+        panel = tk.Frame(parent, bg=COL_SURFACE, bd=0, highlightthickness=2,
+                         highlightbackground=COL_BG)
+        panel.grid(row=0, column=idx, sticky="nsew", padx=8, pady=4)
+        w = self.dj_w[idx]
+        w["panel"] = panel
+        head = tk.Label(panel, text=f"DECK {letter}", font=self.f_small,
+                        bg=COL_SURFACE, fg=COL_MUTED)
+        head.pack(pady=(10, 0))
+        w["name"] = tk.Label(panel, text="keine Datei", font=self.f_small,
+                             bg=COL_SURFACE, fg=COL_FG, wraplength=300)
+        w["name"].pack(pady=(2, 6))
+        w["bpm"] = tk.Label(panel, text="—", font=self.f_key, bg=COL_SURFACE,
+                            fg=COL_MUTED)
+        w["bpm"].pack()
+        tk.Label(panel, text="BPM", font=self.f_tiny, bg=COL_SURFACE,
+                 fg=COL_MUTED).pack()
+        w["key"] = tk.Label(panel, text="", font=self.f_small, bg=COL_SURFACE,
+                            fg=COL_ACCENT)
+        w["key"].pack(pady=(4, 0))
+        w["pos"] = tk.Label(panel, text="–", font=self.f_small, bg=COL_SURFACE,
+                            fg=COL_MUTED)
+        w["pos"].pack(pady=(2, 6))
+        lvl = tk.Canvas(panel, height=8, bg=COL_BAR_BG, highlightthickness=0,
+                        bd=0)
+        lvl.pack(fill="x", padx=18, pady=(0, 8))
+        w["lvl"] = lvl
+        w["lvlrect"] = lvl.create_rectangle(0, 0, 0, 10, fill=COL_OK, width=0)
+        bar = tk.Frame(panel, bg=COL_SURFACE)
+        bar.pack(pady=(0, 12))
+        self._small_button(bar, "Laden …",
+                           lambda i=idx: self._dj_load(i)).pack(side="left", padx=4)
+        w["play"] = tk.Button(bar, text="▶", command=lambda i=idx: self._dj_play(i),
+                              font=self.f_small, bg=COL_BG, fg=COL_FG,
+                              activebackground=COL_SURF_HI, activeforeground=COL_FG,
+                              bd=0, padx=14, pady=4, highlightthickness=0,
+                              cursor="hand2", state="disabled")
+        w["play"].pack(side="left", padx=4)
+        # Klick aufs Deck (Anzeigebereich) blendet hierher
+        for el in (panel, head, w["name"], w["bpm"], w["key"], w["pos"]):
+            el.bind("<Button-1>", lambda e, i=idx: self._dj_fade(i))
+
+    def _dj_load(self, idx):
+        path = filedialog.askopenfilename(
+            title=f"Datei für Deck {'A' if idx == 0 else 'B'}",
+            filetypes=[("Audio", "*.wav *.flac *.mp3 *.ogg *.m4a *.aif *.aiff"),
+                       ("Alle Dateien", "*.*")])
+        if not path or self.dj_engine is None:
+            return
+        w = self.dj_w[idx]
+        w["name"].config(text=os.path.basename(path))
+        w["bpm"].config(text="…", fg=COL_MUTED)
+        w["pos"].config(text="analysiere …")
+        w["play"].config(state="disabled")
+        if not self.warmed:
+            self._warm_blocking()
+        threading.Thread(target=self._dj_analyze_thread,
+                         args=(idx, path), daemon=True).start()
+
+    def _warm_blocking(self):
+        try:
+            ww = np.zeros(int(core.ANALYSIS_SR * core.WINDOW_SECONDS),
+                          dtype=np.float32)
+            ww[::core.ANALYSIS_SR // 4] = 0.5
+            core.estimate_tempo(ww, core.ANALYSIS_SR)
+            core.chroma_pcp(ww, core.ANALYSIS_SR)
+        except Exception:
+            pass
+        self.warmed = True
+
+    def _dj_analyze_thread(self, idx, path):
+        try:
+            y_an, audio, sr_play = core.load_audio_file(path)
+            info = core.analyze_file_beatmap(y_an, core.ANALYSIS_SR,
+                                             core.MIN_BPM, core.MAX_BPM)
+        except Exception:
+            info = None
+            audio, sr_play = None, 0
+        key = ""
+        if info is not None:
+            try:
+                pcp = core.chroma_pcp(y_an, core.ANALYSIS_SR)
+                key = core.classify_key(pcp)
+            except Exception:
+                key = ""
+        self._dj_load_res = (idx, audio, sr_play, info, key,
+                             os.path.basename(path))
+
+    def _dj_poll_load(self):
+        res = self._dj_load_res
+        if res is None:
+            return
+        self._dj_load_res = None
+        idx, audio, sr_play, info, key, name = res
+        w = self.dj_w[idx]
+        if info is None or audio is None or self.dj_engine is None:
+            w["bpm"].config(text="—", fg=COL_MUTED)
+            w["pos"].config(text="kein Tempo / Format?")
+            return
+        try:
+            self.dj_engine.load(idx, audio, sr_play, info, key, name)
+        except Exception as e:
+            w["pos"].config(text=f"Fehler: {e}")
+            return
+        w["bpm"].config(text=f"{int(round(info['bpm']))}", fg=COL_FG)
+        w["key"].config(text=key or "")
+        w["play"].config(state="normal")
+        dur = info.get("duration", 0.0)
+        w["pos"].config(text=f"0:00 / {self._fmt_pos(dur)}")
+
+    def _dj_play(self, idx):
+        if self.dj_engine is None:
+            return
+        d = self.dj_engine.decks[idx]
+        if d.audio is None:
+            return
+        if d.playing:
+            self.dj_engine.stop(idx)
+            self.dj_w[idx]["play"].config(text="▶")
+        else:
+            self.dj_engine.play(idx)
+            self.dj_w[idx]["play"].config(text="⏸")
+
+    def _dj_fade(self, idx):
+        if self.dj_engine is None or self.dj_engine.decks[idx].audio is None:
+            return
+        self.dj_engine.fade_to(idx)
+        self.dj_w[idx]["play"].config(text="⏸")
+
+    def _dj_cross(self, val):
+        if self.dj_engine is None:
+            return
+        try:
+            x = float(val) / 100.0
+        except (TypeError, ValueError):
+            return
+        with self.dj_engine.lock:
+            self.dj_engine.cross_target = x
+
+    def _dj_tick(self):
+        eng = self.dj_engine
+        if eng is None or self.dj_win is None or not self.dj_win.winfo_exists():
+            return
+        self._dj_poll_load()
+        for idx in (0, 1):
+            d = eng.decks[idx]
+            w = self.dj_w[idx]
+            if d.audio is not None:
+                dur = d.frames_total / float(core.DJ_SR)
+                pos = max(0.0, min(dur, eng.play_pos(idx)))
+                w["pos"].config(text=f"{self._fmt_pos(pos)} / {self._fmt_pos(dur)}")
+                if not d.playing:
+                    w["play"].config(text="▶")
+            db = 20.0 * math.log10(d.level) if d.level > 1e-6 else -120.0
+            frac = max(0.0, min(1.0, (db + 60.0) / 60.0))
+            cw = w["lvl"].winfo_width()
+            w["lvl"].coords(w["lvlrect"], 0, 0, int(cw * frac), 10)
+            dom = eng.dominant() == idx and eng.any_playing()
+            w["panel"].config(highlightbackground=COL_OK if dom else COL_BG)
+        # Fader-Position dem (geglaetteten) Crossfade nachführen
+        with eng.lock:
+            cx = eng.cross
+        try:
+            if abs(self.dj_cross.get() / 100.0 - cx) > 0.01:
+                self.dj_cross.set(int(round(cx * 100)))
+        except Exception:
+            pass
+        if eng.any_playing():
+            letter = "B" if eng.dominant() else "A"
+            self.dj_clock_lbl.config(
+                text=f"Clock folgt: Deck {letter}"
+                + ("" if self.dj_midi else "  (ohne MIDI)"),
+                fg=COL_OK if self.dj_midi else COL_MUTED)
+        else:
+            self.dj_clock_lbl.config(text="Clock: –", fg=COL_MUTED)
+        self.dj_win.after(150, self._dj_tick)
+
+    def _dj_teardown(self):
+        if self.dj_clock_stop is not None:
+            self.dj_clock_stop.set()
+        if self.dj_clock_thread is not None:
+            self.dj_clock_thread.join(timeout=1.5)
+        self.dj_clock_thread = self.dj_clock_stop = None
+        if self.dj_engine is not None:
+            try:
+                self.dj_engine.teardown()
+            except Exception:
+                pass
+            self.dj_engine = None
+        if self.dj_midi is not None:
+            try:
+                self.dj_midi.close()
+            except Exception:
+                pass
+            self.dj_midi = None
+        if self.dj_win is not None:
+            try:
+                self.dj_win.destroy()
+            except Exception:
+                pass
+            self.dj_win = None
+        self.dj_w = [{}, {}]
+        self._dj_load_res = None
+
+    def _dj_close(self):
+        self._dj_teardown()
+        self.show_setup()
+
     def on_setup_start(self):
         sel = self.lb_in.curselection()
         if not sel or not self.sources:
@@ -1222,6 +1524,8 @@ class DisplayApp:
             pass
         if self.file_mode or self.file_player is not None:
             self.stop_file()                  # ggf. Datei-Wiedergabe beenden
+        if self.dj_engine is not None or self.dj_win is not None:
+            self._dj_teardown()               # ggf. DJ-Fenster/Engine beenden
         if self.hold:
             self._set_hold(False)
         if (self.stream is not None or self.cap_thread is not None

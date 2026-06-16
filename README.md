@@ -64,6 +64,13 @@ Eingänge; unter macOS leistet das ein virtuelles Ausgabegerät wie
   getrennt angeboten – jedes mit **Namensvorschlag aus BPM und Tonart**, unsichere
   Grenzen gedimmt; „Alle speichern" legt sie in einen Ordner, der für das nächste
   Mal gemerkt wird. Mirror der Webversion.
+- **DJ-Modus** (optional) – zwei Decks nebeneinander laden und analysieren (auch
+  während eines läuft), in **einem** Ausgabe-Stream gemischt. Ein Klick aufs Deck
+  (oder der Crossfader) blendet per **Equal-Power-Crossfade** über; die MIDI-Clock
+  **folgt automatisch dem lauteren Deck** (driftfrei aus dessen Wiedergabeposition,
+  Tempowechsel beim Überblenden inklusive). In der GUI über die Schaltfläche „DJ",
+  in der Konsole über `--dj DATEI_A DATEI_B` (Tasten `a`/`b` zum Überblenden).
+  Mirror der Webversion.
 - **Zwei Oberflächen** – Konsolen-Version (`realtime_bpm_key_midiclock.py`)
   und Touch-taugliche Kiosk-GUI (`bpm_key_display.py`) für ein 7-Zoll-Display
   am Raspberry Pi; unter Windows und macOS läuft sie im Fenster.

@@ -2810,6 +2810,238 @@ def save_wav_slice(audio, sr, s0, s1, path):
 
 
 # ===========================================================================
+# DJ-Modus: zwei Decks, Equal-Power-Crossfade, Clock folgt dem Ziel-Deck
+# ===========================================================================
+# Mirror der WebApp: zwei Audiodateien werden nebeneinander geladen/analysiert
+# (auch waehrend eine laeuft) und in EINEM Ausgabe-Stream gemischt. Ein Klick
+# blendet zum jeweiligen Deck (Equal-Power: A=cos, B=sin), und die MIDI-Clock
+# folgt automatisch dem dominierenden Deck (driftfrei aus dessen Position).
+DJ_SR       = 44100      # gemeinsame Ausgabe-/Mischrate (Decks werden umgesampelt)
+DJ_FADE_TAU = 0.18       # Zeitkonstante (s) der Crossfade-Glaettung
+
+
+class DJDeck:
+    def __init__(self):
+        self.audio = None          # (frames, ch) float32 @ DJ_SR
+        self.frames_total = 0
+        self.beats = None
+        self.ticks = None
+        self.info = None
+        self.key = ""
+        self.name = ""
+        self.pos = 0               # aktueller Frame
+        self.playing = False
+        self.anchor_pos = 0
+        self.anchor_perf = 0.0
+        self.level = 0.0           # RMS des zuletzt ausgegebenen Blocks (Anzeige)
+
+
+class DJEngine:
+    """Zwei Decks in einem gemischten OutputStream. Threadsicher (ein Lock):
+    der Audio-Callback mischt, die Steuer-/Clock-Threads lesen Position und
+    Dominanz."""
+
+    def __init__(self, channels=2, device=None, blocksize=1024):
+        self.decks = [DJDeck(), DJDeck()]
+        self.channels = int(channels)
+        self.device = device
+        self.blocksize = int(blocksize)
+        self.lock = threading.Lock()
+        self.cross = 0.0           # 0 = A, 1 = B (aktuell)
+        self.cross_target = 0.0
+        self.latency = blocksize / float(DJ_SR)
+        self.stream = None
+
+    def load(self, idx, audio, sr, info, key, name=""):
+        """Deck mit (bereits analysiertem) Audio belegen. audio (frames[,ch])
+        wird auf DJ_SR und die Engine-Kanalzahl gebracht. Beats/Ticks sind
+        zeitbasiert und bleiben nach dem Resampling gueltig."""
+        a = np.asarray(audio, dtype=np.float32)
+        if a.ndim == 1:
+            a = a.reshape(-1, 1)
+        if int(sr) != DJ_SR:
+            try:
+                a = librosa.resample(a.T, orig_sr=int(sr), target_sr=DJ_SR).T
+                a = np.ascontiguousarray(a, dtype=np.float32)
+            except Exception:
+                pass
+        if a.shape[1] == 1 and self.channels >= 2:
+            a = np.repeat(a, self.channels, axis=1)
+        elif a.shape[1] > self.channels:
+            a = np.ascontiguousarray(a[:, :self.channels])
+        elif a.shape[1] < self.channels:
+            a = np.repeat(a[:, :1], self.channels, axis=1)
+        with self.lock:
+            d = self.decks[idx]
+            d.playing = False
+            d.audio = a
+            d.frames_total = a.shape[0]
+            d.pos = 0
+            d.info = info
+            d.beats = info["beats"] if info else None
+            d.ticks = info["ticks"] if info else None
+            d.key = key
+            d.name = name
+
+    def _callback(self, outdata, frames, time_info, status):
+        with self.lock:
+            block_dt = frames / float(DJ_SR)
+            if abs(self.cross - self.cross_target) > 1e-4:
+                coeff = 1.0 - math.exp(-block_dt / DJ_FADE_TAU)
+                self.cross += (self.cross_target - self.cross) * coeff
+                if abs(self.cross - self.cross_target) < 1e-3:
+                    self.cross = self.cross_target
+            x = min(1.0, max(0.0, self.cross))
+            gains = (math.cos(x * math.pi / 2), math.sin(x * math.pi / 2))
+            out = np.zeros((frames, self.channels), dtype=np.float32)
+            for i, d in enumerate(self.decks):
+                if d.playing and d.audio is not None:
+                    d.anchor_pos = d.pos
+                    d.anchor_perf = time.perf_counter()
+                    s = d.pos
+                    e = min(s + frames, d.frames_total)
+                    n = e - s
+                    if n > 0:
+                        block = d.audio[s:e]
+                        out[:n] += block * gains[i]
+                        d.level = float(np.sqrt(np.mean(block * block))) * gains[i]
+                        d.pos = e
+                    if e >= d.frames_total:
+                        d.playing = False
+                else:
+                    d.level = 0.0
+            outdata[:] = out
+
+    def start_stream(self):
+        if sd is None:
+            raise RuntimeError("sounddevice nicht verfuegbar")
+        self.stream = sd.OutputStream(
+            samplerate=DJ_SR, channels=self.channels, blocksize=self.blocksize,
+            device=self.device, dtype='float32', callback=self._callback)
+        self.stream.start()
+        try:
+            self.latency = float(self.stream.latency)
+        except Exception:
+            self.latency = self.blocksize / float(DJ_SR)
+
+    def play(self, idx):
+        with self.lock:
+            d = self.decks[idx]
+            if d.audio is None:
+                return
+            if d.pos >= d.frames_total:
+                d.pos = 0
+            d.anchor_pos = d.pos
+            d.anchor_perf = time.perf_counter()
+            d.playing = True
+
+    def stop(self, idx):
+        with self.lock:
+            self.decks[idx].playing = False
+
+    def fade_to(self, idx):
+        """Zu Deck idx ueberblenden (ggf. starten); die Clock folgt automatisch."""
+        if self.decks[idx].audio is None:
+            return
+        if not self.decks[idx].playing:
+            self.play(idx)
+        with self.lock:
+            self.cross_target = 1.0 if idx else 0.0
+
+    def play_pos(self, idx):
+        with self.lock:
+            d = self.decks[idx]
+            ap, aperf, playing = d.anchor_pos, d.anchor_perf, d.playing
+            pos_frame = d.pos
+        if not playing:
+            return pos_frame / float(DJ_SR)
+        return ap / float(DJ_SR) - self.latency + (time.perf_counter() - aperf)
+
+    def dominant(self):
+        with self.lock:
+            return 1 if self.cross >= 0.5 else 0
+
+    def any_playing(self):
+        with self.lock:
+            return self.decks[0].playing or self.decks[1].playing
+
+    def teardown(self):
+        for i in (0, 1):
+            self.stop(i)
+        st, self.stream = self.stream, None
+        if st is not None:
+            try:
+                st.stop()
+                st.close()
+            except Exception:
+                pass
+
+
+def dj_clock_worker(engine, midi_out, stop_event):
+    """MIDI-Clock fuer den DJ-Modus: folgt dem dominierenden Deck und sendet
+    dessen 24-PPQN-Ticks driftfrei aus der Wiedergabeposition. Beim Deck-Wechsel
+    rastet der Tick-Index auf die aktuelle Position des neuen Decks ein."""
+    winmm = _realtime_timer_begin()
+    clock_msg = mido.Message('clock')
+    started = False
+    cur_deck = -1
+    i = 0
+    while not stop_event.is_set():
+        if not engine.any_playing():
+            if started:
+                try:
+                    if midi_out is not None:
+                        midi_out.send(mido.Message('stop'))
+                except Exception:
+                    pass
+                started = False
+            cur_deck = -1
+            time.sleep(0.03)
+            continue
+        dom = engine.dominant()
+        d = engine.decks[dom]
+        ticks = d.ticks
+        if ticks is None or len(ticks) == 0 or not d.playing:
+            time.sleep(0.02)
+            continue
+        if not started:
+            try:
+                if midi_out is not None:
+                    midi_out.send(mido.Message('start'))
+                started = True
+            except Exception:
+                pass
+        pos = engine.play_pos(dom)
+        if dom != cur_deck:
+            cur_deck = dom
+            i = int(np.searchsorted(ticks, max(0.0, pos)))
+        if i >= len(ticks):
+            time.sleep(0.02)
+            continue
+        target = float(ticks[i])
+        wait = target - pos
+        if wait > 0.0:
+            precise_sleep_until(time.perf_counter() + wait, stop_event)
+            if stop_event.is_set():
+                break
+        try:
+            if midi_out is not None:
+                midi_out.send(clock_msg)
+        except Exception:
+            break
+        i += 1
+        pos2 = engine.play_pos(dom)
+        if i < len(ticks) and pos2 - target > 0.25:
+            i = int(np.searchsorted(ticks, pos2))
+    try:
+        if midi_out is not None and started:
+            midi_out.send(mido.Message('stop'))
+    except Exception:
+        pass
+    _realtime_timer_end(winmm)
+
+
+# ===========================================================================
 # Quellen-Auswahl
 # ===========================================================================
 def choose_capture_mode():
@@ -3446,6 +3678,89 @@ def run_file_mode(path):
     print("\nFertig.")
 
 
+def run_dj_mode(path_a, path_b):
+    """Konsolen-DJ: zwei Dateien laden/analysieren, in einem Stream mischen;
+    [a]/[b] blenden zum jeweiligen Deck, die MIDI-Clock folgt automatisch."""
+    try:
+        mido.set_backend('mido.backends.rtmidi')
+    except Exception:
+        pass
+    for p in (path_a, path_b):
+        if not os.path.exists(p):
+            sys.exit(f"Datei nicht gefunden: {p}")
+    midi_name = choose_midi_output()
+    try:
+        midi_out = open_midi_output(midi_name) if midi_name else None
+    except Exception as e:
+        sys.exit(f"MIDI-Ausgang fehlgeschlagen: {e}")
+    print("\nLade & analysiere beide Decks (einmalig, kann kurz dauern) ...")
+    try:
+        _w = np.zeros(int(ANALYSIS_SR * WINDOW_SECONDS), dtype=np.float32)
+        _w[::ANALYSIS_SR // 4] = 0.5
+        estimate_tempo(_w, ANALYSIS_SR)
+    except Exception:
+        pass
+    eng = DJEngine(channels=2)
+    for idx, p in enumerate((path_a, path_b)):
+        try:
+            y_an, audio, sr_play = load_audio_file(p)
+            info = analyze_file_beatmap(y_an, ANALYSIS_SR, MIN_BPM, MAX_BPM)
+        except Exception as e:
+            sys.exit(f"Deck {'AB'[idx]} fehlgeschlagen: {e}")
+        key = ""
+        try:
+            key = classify_key(chroma_pcp(y_an, ANALYSIS_SR))
+        except Exception:
+            pass
+        eng.load(idx, audio, sr_play, info, key, os.path.basename(p))
+        print(f"  Deck {'AB'[idx]}: {os.path.basename(p)} -> "
+              f"{int(round(info['bpm'])) if info else '-'} BPM"
+              f"{' ' + key if key else ''}"
+              f"{'' if info else '  (kein klares Tempo)'}")
+    try:
+        eng.start_stream()
+    except Exception as e:
+        sys.exit(f"Audioausgabe fehlgeschlagen: {e}")
+    stop_event = threading.Event()
+    clk = threading.Thread(target=dj_clock_worker,
+                           args=(eng, midi_out, stop_event), daemon=True)
+    clk.start()
+    eng.play(0)                                # Deck A startet
+    keys = KeyPoller()
+    print(f"\nMIDI-Ausgang: {midi_output_desc(midi_name)}")
+    print("[a] zu Deck A faden   [b] zu Deck B faden   [q] Beenden\n"
+          if keys.available else "(Beenden mit Strg+C; ohne Tastatursteuerung)")
+    keys.resume()
+    try:
+        while True:
+            ch = keys.poll()
+            if ch == 'q':
+                break
+            elif ch == 'a':
+                eng.fade_to(0)
+            elif ch == 'b':
+                eng.fade_to(1)
+            pa, pb = eng.play_pos(0), eng.play_pos(1)
+            dom = 'B' if eng.dominant() else 'A'
+            print(f"\rA {int(pa) // 60}:{int(pa) % 60:02d}  |  "
+                  f"B {int(pb) // 60}:{int(pb) % 60:02d}  |  "
+                  f"Clock folgt: {dom}   ", end="", flush=True)
+            time.sleep(0.1)
+    except KeyboardInterrupt:
+        pass
+    finally:
+        keys.pause()
+        stop_event.set()
+        clk.join(timeout=1.0)
+        eng.teardown()
+        if midi_out is not None:
+            try:
+                midi_out.close()
+            except Exception:
+                pass
+    print("\nFertig.")
+
+
 def _console_stop_and_save(shared):
     """Konsole: laufende Aufnahme stoppen, in Stuecke zerlegen und als WAV
     speichern (gemeinsamer Zielordner, Namensvorschlag BPM+Tonart)."""
@@ -3504,6 +3819,15 @@ def main():
     file_path = _arg_value('--file')
     if file_path:
         run_file_mode(file_path)
+        return
+
+    # DJ-Modus: zwei Dateien nebeneinander, Crossfade, Clock folgt
+    if '--dj' in sys.argv:
+        i = sys.argv.index('--dj')
+        if i + 2 < len(sys.argv):
+            run_dj_mode(sys.argv[i + 1], sys.argv[i + 2])
+        else:
+            sys.exit("Verwendung: --dj DATEI_A DATEI_B")
         return
 
     winmm = None
