@@ -26,17 +26,28 @@ Dann:
    den gewünschten Eingang wählen.
 2. **MIDI-Ausgang**: die Liste öffnen (fragt den MIDI-Zugriff an) und einen
    Port wählen, z. B. „loopMIDI Port". „Kein MIDI" zeigt nur an.
-3. Optional **BPM-Bereich** anpassen (Standard 70–140) und über den Button
-   **„Tonart"** die Tonart-Anzeige einblenden.
+3. Optional **BPM-Bereich** anpassen (Standard 70–140) und über die Buttons
+   **„Tonart"** bzw. **„Akkord"** die jeweilige Anzeige einblenden.
 4. **Start** drücken.
 
 Die große Zahl zeigt das erkannte Tempo; die MIDI-Clock startet automatisch
 mit der ersten stabilen Schätzung (MIDI `start`) und hält bei Stille an
 (`stop`).
 
-Über **„Modus"** stehen vier Betriebsarten zur Wahl: „Tempo & MIDI-Clock"
-(live, oben beschrieben), „Datei → MIDI-Clock (driftfrei)" (siehe unten) sowie
-die beiden Noten-Modi (monophon/polyphon).
+**Tonart & Akkord (optional, parallel):** Über **„Tonart"** wird die Grundtonart
+(mit Paralleltonart) eingeblendet, über **„Akkord"** zusätzlich der aktuell
+erkannte Akkord daneben (gröberer Eindruck aus dem Vollmix; unsichere Erkennung
+wird gedimmt). **Sind beide aus, läuft nur die BPM-Erkennung** – das spart die
+teure Chroma-FFT und gibt maximale Performance (wichtig auf Handy/Raspberry Pi).
+
+**Hold (Anzeige einfrieren):** Der Button **„Hold"** friert BPM/Tonart/Akkord
+ein und lässt die **MIDI-Clock konstant weiterlaufen** – ideal für lange Breaks
+oder Übergänge, in denen die Live-Analyse sonst „abreißen" würde. Erneuter Klick
+setzt fort; die bisherige Tempo-/Tonart-Historie bleibt erhalten.
+
+Über **„Modus"** stehen mehrere Betriebsarten zur Wahl: „Tempo & MIDI-Clock"
+(live, oben beschrieben), „Datei/Aufnahme → MIDI-Clock (driftfrei)" (siehe
+unten) sowie die Noten-Modi (monophon/polyphon/Akkorde).
 
 ## Datei/Aufnahme → MIDI-Clock (driftfrei)
 

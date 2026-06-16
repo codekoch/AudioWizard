@@ -89,7 +89,8 @@ main {
 .bpm.notes { font-size: clamp(36px, 9vw, 100px); }   /* Noten-Modus: mehrere Namen */
 /* Akkord-Modus: erkannte Noten klein, grau, in Klammern unter dem Akkord */
 .bpm .chordsub { display: block; font-size: .28em; font-weight: 600; color: var(--muted); line-height: 1.2; margin-top: .12em; }
-.keyblock { margin-top: 26px; text-align: center; }
+.keyrow { display: flex; gap: 56px; justify-content: center; align-items: flex-start; margin-top: 26px; flex-wrap: wrap; }
+.keyblock { text-align: center; }
 .key { font-size: clamp(40px, 9vw, 88px); font-weight: 700; line-height: 1; }
 #keyName { color: var(--accent); }
 #keyName.idle { color: var(--muted); opacity: .6; }
@@ -223,6 +224,16 @@ main {
       <button id="keyToggle" class="ghost"
               title="Grundtonart (mit Paralleltonart) anzeigen">anzeigen</button>
     </div>
+    <div class="field" id="chordField">
+      <label>Akkord</label>
+      <button id="chordToggle" class="ghost"
+              title="Erkannten Akkord neben der Tonart anzeigen (optional)">anzeigen</button>
+    </div>
+    <div class="field" id="holdField">
+      <label>Hold</label>
+      <button id="holdBtn" class="ghost"
+              title="Anzeige einfrieren (für lange Breaks); die MIDI-Clock läuft konstant weiter">anhalten</button>
+    </div>
     <div class="field" id="syncField">
       <label for="beatSync">Beat-Sync</label>
       <label class="chk" title="Clock regelmäßig auf den erkannten Beat nachführen (gegen Drift). Bei undeutlichem Beat läuft sie frei weiter.">
@@ -300,9 +311,15 @@ main {
     <div class="cap" id="bpmCap">BPM</div>
     <div class="raw" id="raw">roh: —</div>
     <div class="status" id="status">bereit</div>
-    <div class="keyblock" id="keyBlock" style="display:none">
-      <div class="key"><span id="keyName" class="idle">—</span><span class="par" id="keyPar"></span></div>
-      <div class="cap">TONART</div>
+    <div class="keyrow" id="keyRow" style="display:none">
+      <div class="keyblock" id="keyBlock" style="display:none">
+        <div class="key"><span id="keyName" class="idle">—</span><span class="par" id="keyPar"></span></div>
+        <div class="cap">TONART</div>
+      </div>
+      <div class="keyblock" id="chordBlock" style="display:none">
+        <div class="key"><span id="chordName" class="idle">—</span></div>
+        <div class="cap">AKKORD</div>
+      </div>
     </div>
     <div class="level">
       <span class="lbl">PEGEL</span>
@@ -391,6 +408,12 @@ const CHORD_OFF_FRAMES = 6;       // leise Frames bis Akkord-Off (Akkorde klinge
 const CHORD_EMA        = 0.5;     // Glaettung des Chroma ueber Frames (Stabilitaet bei gehaltenem Akkord)
 const CHORD_FMIN       = 70;      // Chroma nur aus diesem Frequenzbereich -> Grundtoene, weniger Oberton-Mulm
 const CHORD_FMAX       = 1100;
+
+// Akkordanzeige im Clock-Modus (optional, parallel zur Tonart; gröberer Eindruck
+// aus dem Vollmix -> tolerantere Schwellen als der Gitarren-Akkord-Modus).
+const CHORD_CLK_MIN_SCORE = 0.60;   // ab dieser Cosinus-Aehnlichkeit ueberhaupt anzeigen
+const CHORD_CLK_CONF      = 0.72;   // ab hier "sicher" (nicht gedimmt)
+const CHORD_CLK_CONFIRM   = 2;      // Frames gleicher Akkord vor Anzeigewechsel
 
 // ===========================================================================
 // Radix-2-FFT (in-place)
@@ -1231,12 +1254,17 @@ const SAVE_PICKER_ID = 'audio2midi-save';   // Browser merkt sich pro id den let
 
 // Beat-Sync (Clock-Phasenkopplung) -- optional, Standard an
 let beatSyncEnabled = true;
+// Hold (Anzeige einfrieren, Clock laeuft konstant weiter) -- wie Python-Version
+let holdActive = false;
 
 // Tonart-Zustand (zweistufige Mittelung + Hysterese wie im Python-Kern)
 let keyEnabled = false;
 let keyDisp = '—', keyPend = null, keyPendN = 0, keyConfident = false;
 let emaPcp = null, emaBass = null, cumPcp = null, cumBass = null, cumN = 0;
 const KEY_EMA_A = ANALYSIS_INTERVAL / KEY_EMA_SEC;
+// Akkordanzeige im Clock-Modus (optional, parallel zur Tonart)
+let chordEnabled = false;
+let chordDisp = '—', chordPend = null, chordPendN = 0, chordConfident = false;
 
 const $ = (id) => document.getElementById(id);
 const elMode = $('opMode'), elBpmCap = $('bpmCap');
@@ -1247,6 +1275,9 @@ const elBpm = $('bpm'), elRaw = $('raw'), elStatus = $('status');
 const elBar = $('levelBar'), elDb = $('db'), elHint = $('hint');
 const elKeyToggle = $('keyToggle'), elKeyBlock = $('keyBlock');
 const elKeyName = $('keyName'), elKeyPar = $('keyPar');
+const elKeyRow = $('keyRow'), elChordField = $('chordField'), elChordToggle = $('chordToggle');
+const elChordBlock = $('chordBlock'), elChordName = $('chordName');
+const elHoldField = $('holdField'), elHoldBtn = $('holdBtn');
 const elStartStop = $('startStop');
 const elSyncField = $('syncField'), elBeatSync = $('beatSync');
 const elOctave = $('octave');
@@ -1375,6 +1406,8 @@ function applyModeControls() {
   elMin.disabled = note;               // BPM-Bereich: Clock + Datei nutzen ihn, Noten nicht
   elMax.disabled = note;
   elKeyToggle.disabled = note || file; // Tonart nur im Clock-Modus
+  elChordToggle.disabled = note || file; // Akkordanzeige nur im Clock-Modus
+  elHoldBtn.disabled = note || file;   // Hold nur im Clock-Modus
   elBeatSync.disabled = note || file;  // Beat-Sync nur im Clock-Modus
   elStartStop.disabled = note;         // Start/Stop fuer Clock + Datei relevant
   elOctave.disabled = !note;           // Oktav-Transponierung nur im Noten-Modus
@@ -1384,6 +1417,7 @@ function applyModeControls() {
   if (elFileBtn) elFileBtn.disabled = !file;
 }
 function applyMode() {
+  if (holdActive) setHold(false);      // Hold beim Moduswechsel loesen
   opMode = elMode.value;
   const note = (opMode === 'mono' || opMode === 'poly' || opMode === 'chord');
   const file = opMode === 'file';
@@ -1395,6 +1429,8 @@ function applyMode() {
   elFileField.style.display = file ? '' : 'none';
   elRecField.style.display  = file ? '' : 'none';
   elKeyField.style.display  = file ? 'none' : '';
+  elChordField.style.display = file ? 'none' : '';
+  elHoldField.style.display = file ? 'none' : '';
   elOctField.style.display  = file ? 'none' : '';
   if (!file) closeSavePanel();
   applyModeControls();
@@ -1402,8 +1438,8 @@ function applyMode() {
   elBpm.classList.toggle('notes', note);
   setBpmText('—');
   elRaw.textContent = (opMode === 'clock') ? 'roh: —' : '';
+  updateKeyChordVis();                 // Tonart-/Akkord-Bloecke je nach Modus + Schaltern
   if (file) {
-    elKeyBlock.style.display = 'none';
     elStart.textContent = 'Abspielen & senden';
     elStart.classList.remove('stop');
     elStart.disabled = !(fileBuffer && fileTickTimes && fileTickTimes.length);
@@ -1419,7 +1455,6 @@ function applyMode() {
     elStart.textContent = 'Start';
     elStart.disabled = false;
     if (note) {
-      elKeyBlock.style.display = 'none';
       if (opMode === 'mono') {
         setHint('Monophon: erkennt EINE Note (Gesang/Bass/Lead/einzelnes Instrument) und sendet '
               + 'sie als MIDI-Note. Klare, einstimmige Quelle nötig. MIDI-Ausgang wählen.');
@@ -1432,7 +1467,6 @@ function applyMode() {
               + 'MIDI-Ausgang wählen.');
       }
     } else {
-      if (keyEnabled) elKeyBlock.style.display = '';
       applySource();
     }
   }
@@ -1633,6 +1667,7 @@ async function start() {
 
 function stop() {
   if (opMode === 'file') return stopFile();
+  if (holdActive) setHold(false);
   running = false;
   if (analyzeTimer) { clearInterval(analyzeTimer); analyzeTimer = null; }
   clock.disable();
@@ -1645,6 +1680,7 @@ function stop() {
   analyzer = null; haveEstimate = false; estimates = [];
   resetKey();
   if (keyEnabled) updateKeyDisplay();
+  if (chordEnabled) updateChordDisplay();
   elStart.textContent = 'Start';
   elStart.classList.remove('stop');
   setControlsDisabled(false);
@@ -2596,7 +2632,7 @@ function resetFileMode() {
 
 // --- Audio-Bloecke + Analyse ---
 function onChunk(chunk) {
-  if (!analyzer) return;
+  if (!analyzer || holdActive) return;   // Hold: Bloecke verwerfen (Anzeige/Clock eingefroren)
   lastChunkTime = performance.now();
   analyzer.pushChunk(chunk);
   let sum = 0;
@@ -2605,7 +2641,7 @@ function onChunk(chunk) {
   levelEma = 0.85 * levelEma + 0.15 * rms;
 }
 function analyze() {
-  if (!analyzer) return;
+  if (!analyzer || holdActive) return;   // Hold: Analyse eingefroren, Clock laeuft konstant weiter
   const db = levelEma > 0 ? 20 * Math.log10(levelEma) : -120;
   if (db < SILENCE_DB) {
     estimates = []; haveEstimate = false; clock.setTargetBpm(null);
@@ -2632,10 +2668,10 @@ function analyze() {
       }
     }
   }
-  // Tonart-Chroma (grosse FFT) nur rechnen, wenn die Anzeige aktiv ist -- spart
-  // spuerbar Rechenzeit (v. a. auf dem Handy), wenn die Tonart nicht gebraucht wird.
-  // Bei der Aufnahme wird sie immer mitgerechnet (Anzeige gewuenscht).
-  if (keyEnabled || recMonitoring) updateKey();
+  // Chroma (grosse FFT) nur rechnen, wenn Tonart- ODER Akkordanzeige aktiv ist
+  // (oder bei der Aufnahme). Sind beide aus, laeuft NUR die BPM-Erkennung ->
+  // maximale Performance (wichtig fuers Handy / den Raspberry Pi).
+  if (keyEnabled || chordEnabled || recMonitoring) updateKey();
 }
 
 // --- Tonart: Chroma -> 50% schnelle EMA + 50% Gesamtmittel -> Klassifikation
@@ -2643,6 +2679,7 @@ function analyze() {
 //     Anzeige erscheint nur, wenn der Tonart-Button aktiv ist.
 function resetKey() {
   keyDisp = '—'; keyPend = null; keyPendN = 0; keyConfident = false;
+  chordDisp = '—'; chordPend = null; chordPendN = 0; chordConfident = false;
   emaPcp = emaBass = cumPcp = cumBass = null; cumN = 0;
   if (analyzer) { analyzer.cbuf.fill(0); analyzer.cbufFilled = 0; }
 }
@@ -2650,34 +2687,53 @@ function updateKey() {
   const ch = analyzer.computeChroma();
   if (!ch) return;
   const p = ch.pcp, b = ch.bass;
-  if (emaPcp === null) {
-    emaPcp = p.slice(); emaBass = b.slice();
-    cumPcp = p.slice(); cumBass = b.slice(); cumN = 1;
-  } else {
-    for (let i = 0; i < 12; i++) {
-      emaPcp[i]  = (1 - KEY_EMA_A) * emaPcp[i]  + KEY_EMA_A * p[i];
-      emaBass[i] = (1 - KEY_EMA_A) * emaBass[i] + KEY_EMA_A * b[i];
-      cumPcp[i] += p[i]; cumBass[i] += b[i];
+  // Tonart (geglaettet) -- nur wenn benoetigt (Anzeige oder Aufnahme-Monitor).
+  if (keyEnabled || recMonitoring) {
+    if (emaPcp === null) {
+      emaPcp = p.slice(); emaBass = b.slice();
+      cumPcp = p.slice(); cumBass = b.slice(); cumN = 1;
+    } else {
+      for (let i = 0; i < 12; i++) {
+        emaPcp[i]  = (1 - KEY_EMA_A) * emaPcp[i]  + KEY_EMA_A * p[i];
+        emaBass[i] = (1 - KEY_EMA_A) * emaBass[i] + KEY_EMA_A * b[i];
+        cumPcp[i] += p[i]; cumBass[i] += b[i];
+      }
+      cumN++;
     }
-    cumN++;
+    const prof = new Float32Array(12), bprof = new Float32Array(12);
+    for (let i = 0; i < 12; i++) {
+      prof[i]  = 0.5 * emaPcp[i]  + 0.5 * (cumPcp[i]  / cumN);
+      bprof[i] = 0.5 * emaBass[i] + 0.5 * (cumBass[i] / cumN);
+    }
+    const r = classifyKey(prof, bprof);
+    const cand = r.name;
+    // Hysterese: Wechsel erst nach KEY_SWITCH_CONFIRM gleichen Folgeschaetzungen.
+    if (cand !== keyDisp) {
+      if (keyDisp === '—' || cand === '—') { keyDisp = cand; keyPend = null; keyPendN = 0; }
+      else if (cand === keyPend) {
+        keyPendN++;
+        if (keyPendN >= KEY_SWITCH_CONFIRM) { keyDisp = cand; keyPend = null; keyPendN = 0; }
+      } else { keyPend = cand; keyPendN = 1; }
+    } else { keyPend = null; keyPendN = 0; }
+    keyConfident = (cand === keyDisp && cand !== '—'
+                    && r.margin >= KEY_CONFIDENT_MARGIN && cumN >= KEY_CONFIDENT_MIN_N);
   }
-  const prof = new Float32Array(12), bprof = new Float32Array(12);
-  for (let i = 0; i < 12; i++) {
-    prof[i]  = 0.5 * emaPcp[i]  + 0.5 * (cumPcp[i]  / cumN);
-    bprof[i] = 0.5 * emaBass[i] + 0.5 * (cumBass[i] / cumN);
-  }
-  const r = classifyKey(prof, bprof);
-  const cand = r.name;
-  // Hysterese: Wechsel erst nach KEY_SWITCH_CONFIRM gleichen Folgeschaetzungen.
-  if (cand !== keyDisp) {
-    if (keyDisp === '—' || cand === '—') { keyDisp = cand; keyPend = null; keyPendN = 0; }
-    else if (cand === keyPend) {
-      keyPendN++;
-      if (keyPendN >= KEY_SWITCH_CONFIRM) { keyDisp = cand; keyPend = null; keyPendN = 0; }
-    } else { keyPend = cand; keyPendN = 1; }
-  } else { keyPend = null; keyPendN = 0; }
-  keyConfident = (cand === keyDisp && cand !== '—'
-                  && r.margin >= KEY_CONFIDENT_MARGIN && cumN >= KEY_CONFIDENT_MIN_N);
+  // Akkord (schneller, aus dem aktuellen Chroma) -- nur wenn die Anzeige an ist.
+  if (chordEnabled) updateChord(p);
+}
+// Akkord aus dem aktuellen Chroma (responsiver als die geglaettete Tonart),
+// mit Hysterese gegen Flackern. Gedimmt, solange die Schaetzung unsicher ist.
+function updateChord(pcp) {
+  const m = bestChord(pcp);
+  const cand = (m && m.score >= CHORD_CLK_MIN_SCORE && m.margin >= CHORD_MIN_MARGIN)
+    ? NOTE_NAMES[m.root] + CHORD_TYPES[m.typeIdx][0] : '—';
+  if (cand !== chordDisp) {
+    if (chordDisp === '—' || cand === '—') { chordDisp = cand; chordPend = null; chordPendN = 0; }
+    else if (cand === chordPend) {
+      if (++chordPendN >= CHORD_CLK_CONFIRM) { chordDisp = cand; chordPend = null; chordPendN = 0; }
+    } else { chordPend = cand; chordPendN = 1; }
+  } else { chordPend = null; chordPendN = 0; }
+  chordConfident = (cand === chordDisp && cand !== '—' && m && m.score >= CHORD_CLK_CONF);
 }
 function updateKeyDisplay() {
   const show = (running || recMonitoring) && keyDisp !== '—';
@@ -2686,6 +2742,11 @@ function updateKeyDisplay() {
   elKeyPar.textContent = par ? '(' + par + ')' : '';
   // Gedimmt, solange die Erkennung noch unsicher ist (wie im Python-Kern).
   elKeyName.classList.toggle('idle', !(show && keyConfident));
+}
+function updateChordDisplay() {
+  const show = running && chordDisp !== '—';
+  elChordName.textContent = show ? chordDisp : '—';
+  elChordName.classList.toggle('idle', !(show && chordConfident));
 }
 
 // --- Anzeige ---
@@ -2697,7 +2758,10 @@ function render() {
     updateLevel(db);
     if (performance.now() - lastChunkTime > 1500 || db < SILENCE_DB || !haveEstimate) setBpmText('—');
     else setBpmText(String(Math.round(median(estimates))));
-    elKeyBlock.style.display = (keyDisp !== '—') ? '' : 'none';
+    const showK = (keyDisp !== '—');
+    elKeyBlock.style.display = showK ? '' : 'none';
+    elChordBlock.style.display = 'none';
+    elKeyRow.style.display = showK ? '' : 'none';
     updateKeyDisplay();
     requestAnimationFrame(render);
     return;
@@ -2723,6 +2787,9 @@ function render() {
       }
       elBpm.classList.toggle('idle', disp === '—');
       elRaw.textContent = '';
+    } else if (holdActive) {
+      // Hold: Anzeige eingefroren (BPM/Tonart/Akkord bleiben stehen), Clock laeuft weiter.
+      setStatus('HALTEN');
     } else if (performance.now() - lastChunkTime > 1500) {
       setStatus('KEIN AUDIO – Eingang prüfen'); setBpmText('—');
     } else if (db < SILENCE_DB) {
@@ -2734,7 +2801,10 @@ function render() {
       elRaw.textContent = 'roh: ' + (lastRaw ? lastRaw.toFixed(1) : '—');
     }
   }
-  if (keyEnabled && opMode !== 'file') updateKeyDisplay();
+  if (opMode !== 'file') {
+    if (keyEnabled) updateKeyDisplay();
+    if (chordEnabled) updateChordDisplay();
+  }
   requestAnimationFrame(render);
 }
 
@@ -2778,13 +2848,40 @@ elOctave.addEventListener('change', () => {
   noteTranspose = oct * 12;
   if (noteEngine) noteEngine.setTranspose(noteTranspose);   // offene Noten sauber umsetzen
 });
+// Sichtbarkeit der Tonart-/Akkord-Bloecke (nur Clock-Modus) zentral steuern.
+function updateKeyChordVis() {
+  const clk = (opMode === 'clock');
+  const showKey = clk && keyEnabled, showChord = clk && chordEnabled;
+  elKeyBlock.style.display = showKey ? '' : 'none';
+  elChordBlock.style.display = showChord ? '' : 'none';
+  elKeyRow.style.display = (showKey || showChord) ? '' : 'none';
+}
 elKeyToggle.addEventListener('click', () => {
   keyEnabled = !keyEnabled;
-  elKeyBlock.style.display = keyEnabled ? '' : 'none';
   elKeyToggle.textContent = keyEnabled ? 'ausblenden' : 'anzeigen';
   elKeyToggle.classList.toggle('on', keyEnabled);
+  updateKeyChordVis();
   if (keyEnabled) updateKeyDisplay();
 });
+elChordToggle.addEventListener('click', () => {
+  chordEnabled = !chordEnabled;
+  elChordToggle.textContent = chordEnabled ? 'ausblenden' : 'anzeigen';
+  elChordToggle.classList.toggle('on', chordEnabled);
+  updateKeyChordVis();
+  if (chordEnabled) updateChordDisplay();
+});
+elHoldBtn.addEventListener('click', () => setHold(!holdActive));
+function setHold(on) {
+  holdActive = on;
+  elHoldBtn.textContent = on ? 'fortsetzen' : 'anhalten';
+  elHoldBtn.classList.toggle('on', on);
+  if (on) {
+    // Wie Python: Roll-Puffer leeren, damit nach dem Fortsetzen nichts verklebt;
+    // BPM-/Tonart-Historie bleibt erhalten (Anzeige + Clock-Tempo eingefroren).
+    if (analyzer) { analyzer.onset.length = 0; analyzer._havePrev = false; }
+    setStatus('HALTEN');
+  }
+}
 
 // Kalibrierung: Panel ein-/ausblenden, Slider live anwenden, zuruecksetzen.
 elCalibToggle.addEventListener('click', () => {
