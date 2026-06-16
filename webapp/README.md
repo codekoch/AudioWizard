@@ -11,6 +11,8 @@ App steckt in einer einzigen Datei: **`index.html`**.
 
 > **Online ausprobieren:** <a href="https://codekoch.github.io/Audio2Midi/webapp/">https://codekoch.github.io/Audio2Midi/webapp/</a>
 
+![Webversion im Browser](../docs/screenshot_webapp.png)
+
 ## Starten
 
 - **Lokal:** `index.html` einfach im Browser öffnen (Doppelklick im
