@@ -68,14 +68,17 @@ so sieht man sofort, ob Audio ankommt und was erkannt wird.
 
 **Speichern (mit Namensvorschlag):** Nach der Aufnahme öffnet **„Speichern…"**
 ein Panel. Die Aufnahme wird automatisch in **Stücke** zerlegt (Indiz: kurze
-Stille + BPM/Tonart-Wechsel); jedes Stück erscheint mit Zeit, BPM und Tonart und
-einem **frei editierbaren Dateinamen** – vorbelegt aus **BPM + Tonart** (z. B.
-`120BPM_C_Dur`). Unsichere Grenzen sind gedimmt markiert. Du kannst jedes Stück
-einzeln oder **„Alle speichern"**, alles **„Als ein Stück"** zusammenfassen oder
-**„Nach Zeit trennen…"** (feste Minuten-Abstände). Format **WAV** (auch je Stück)
-oder **WebM-Original** (klein, aber nur die **ganze** Aufnahme, da komprimierte
-Streams nicht verlustfrei geschnitten werden können). Der Speichern-Dialog
-erlaubt freie Namens-/Ortswahl (Chrome/Edge).
+Stille + BPM/Tonart-Wechsel); jedes Stück erscheint mit **Start–Ende, Dauer,
+BPM und Tonart** und einem **frei editierbaren Dateinamen** – vorbelegt aus
+**BPM + Tonart** (z. B. `120BPM_C_Dur`). Unsichere Grenzen sind gedimmt
+markiert. Du kannst jedes Stück einzeln oder **„Alle speichern"**, alles **„Als
+ein Stück"** zusammenfassen oder **„Nach Zeit trennen…"** (feste
+Minuten-Abstände). Format **WAV** (auch je Stück) oder **WebM-Original** (klein,
+aber nur die **ganze** Aufnahme, da komprimierte Streams nicht verlustfrei
+geschnitten werden können). Der Speichern-Dialog erlaubt freie Namens-/Ortswahl
+(Chrome/Edge); **„Alle speichern" (WAV)** lässt einmal einen **Ordner** wählen
+und legt alle Stücke dort ab. Der **zuletzt genutzte Ordner wird gemerkt** und
+beim nächsten Speichern wieder vorgeschlagen.
 
 Aufnahme/Mithören gibt es nur, wo der Browser es unterstützt
 (Windows/Chrome/Edge mit Systemaudio, sonst Tab-Audio bzw. Audio-Eingang); auf

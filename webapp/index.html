@@ -121,7 +121,7 @@ main {
 .savep .seg { display: flex; align-items: center; gap: 10px; flex-wrap: wrap; padding: 6px 0; border-top: 1px solid var(--surface); }
 .savep .seg.unsure { opacity: .7; }
 .savep .seg .ix { font-size: 12px; color: var(--muted); width: 1.6em; text-align: right; }
-.savep .seg .meta { font-size: 13px; color: var(--fg); font-variant-numeric: tabular-nums; min-width: 230px; }
+.savep .seg .meta { font-size: 13px; color: var(--fg); font-variant-numeric: tabular-nums; min-width: 300px; }
 .savep .seg .meta .q { color: var(--warn); }
 .savep .seg input[type="text"] { flex: 1; min-width: 150px; background: var(--surface); color: var(--fg); border: 1px solid var(--surface-hi); border-radius: 6px; padding: 6px 8px; font-size: 13px; }
 .savep .saveactions { display: flex; gap: 10px; flex-wrap: wrap; }
@@ -1223,6 +1223,8 @@ let recording = false;         // laeuft gerade eine Aufnahme?
 let recBlob = null;            // fertige Aufnahme (Original, fuer WebM-Speichern)
 let recSegments = [];          // erkannte Stuecke fuer das Speichern-Panel
 let recMonitoring = false;     // Live-Analyse (Pegel/BPM/Tonart) waehrend Bereitstellen+Aufnahme
+let lastSaveDir = null;        // zuletzt gewaehlter Ordner (FileSystem-Handle) -> startIn
+const SAVE_PICKER_ID = 'audio2midi-save';   // Browser merkt sich pro id den letzten Ordner
 
 // Beat-Sync (Clock-Phasenkopplung) -- optional, Standard an
 let beatSyncEnabled = true;
@@ -1953,7 +1955,11 @@ async function saveBlob(blob, suggestedBase, ext, mime) {
   const fname = (suggestedBase || 'Aufnahme').replace(/[\\/:*?"<>|]+/g, '_') + '.' + ext;
   if (window.showSaveFilePicker) {
     try {
-      const handle = await window.showSaveFilePicker({ suggestedName: fname, types: [{ description: ext.toUpperCase() + '-Audio', accept: { [mime]: ['.' + ext] } }] });
+      // id: der Browser merkt sich pro id den zuletzt genutzten Ordner;
+      // startIn: zusaetzlich der zuletzt (per Ordnerwahl) gemerkte Ordner.
+      const opts = { id: SAVE_PICKER_ID, suggestedName: fname, types: [{ description: ext.toUpperCase() + '-Audio', accept: { [mime]: ['.' + ext] } }] };
+      if (lastSaveDir) opts.startIn = lastSaveDir;
+      const handle = await window.showSaveFilePicker(opts);
       const w = await handle.createWritable(); await w.write(blob); await w.close();
       return true;
     } catch (e) { if (e && e.name === 'AbortError') return false; }   // sonst: Fallback
@@ -1975,6 +1981,36 @@ async function saveWholeWebm() {
   const base = (recSegments[0] && recSegments[0].name) || 'Aufnahme';
   await saveBlob(recBlob, base, 'webm', 'audio/webm');
 }
+// "Alle speichern": WebM -> ganze Aufnahme; WAV -> wenn moeglich EINMAL einen
+// Ordner waehlen (gemerkt fuers naechste Mal) und alle Stuecke dort ablegen,
+// sonst pro Stueck der Reihe nach der Speichern-Dialog.
+async function saveAllWav() {
+  if (elFmtWebm.checked) { await saveWholeWebm(); return; }
+  if (!fileBuffer || !recSegments.length) return;
+  if (window.showDirectoryPicker) {
+    let dir = null;
+    try {
+      const opts = { id: SAVE_PICKER_ID, mode: 'readwrite' };
+      if (lastSaveDir) opts.startIn = lastSaveDir;
+      dir = await window.showDirectoryPicker(opts);
+    } catch (e) { if (e && e.name === 'AbortError') return; dir = null; }
+    if (dir) {
+      lastSaveDir = dir;
+      let ok = 0;
+      for (const seg of recSegments) {
+        const base = (seg.name || suggestName(seg)).replace(/[\\/:*?"<>|]+/g, '_');
+        try {
+          const fh = await dir.getFileHandle(base + '.wav', { create: true });
+          const w = await fh.createWritable(); await w.write(bufferSliceToWav(fileBuffer, seg.startS, seg.endS)); await w.close();
+          ok++;
+        } catch (e) {}
+      }
+      setHint(ok + ' von ' + recSegments.length + ' Stück(en) im gewählten Ordner gespeichert.');
+      return;
+    }
+  }
+  for (let i = 0; i < recSegments.length; i++) await saveSegmentWav(i);   // Fallback: einzeln
+}
 
 // --- Speichern-/Pruef-Panel ---
 async function openSavePanel() {
@@ -1995,7 +2031,7 @@ function closeSavePanel() { if (elSavePanel) elSavePanel.style.display = 'none';
 function updateSaveNote() {
   elSaveNote.textContent = (elFmtWebm && elFmtWebm.checked)
     ? 'WebM speichert die GANZE Aufnahme als Original (kleiner). Einzelne Stücke nur als WAV. „Alle speichern" → ganze Aufnahme.'
-    : 'WAV: jedes Stück einzeln oder „Alle speichern". Dateiname ist frei wählbar – Vorschlag aus BPM + Tonart.';
+    : 'WAV: jedes Stück einzeln (Name frei wählbar) oder „Alle speichern" → einmal einen Ordner wählen, dort landen alle Stücke. Der Ordner wird fürs nächste Mal gemerkt.';
 }
 function renderSegList() {
   if (!fileBuffer) return;
@@ -2006,6 +2042,7 @@ function renderSegList() {
     const ix = document.createElement('span'); ix.className = 'ix'; ix.textContent = (idx + 1) + '.';
     const meta = document.createElement('span'); meta.className = 'meta';
     meta.appendChild(document.createTextNode(fmtTime(seg.startS / sr) + '–' + fmtTime(seg.endS / sr)
+      + ' · Dauer ' + fmtTime((seg.endS - seg.startS) / sr)
       + ' · ' + (seg.bpm ? Math.round(seg.bpm) + ' BPM' : '– BPM') + ' · '));
     const ks = document.createElement('span'); ks.textContent = seg.key || '?'; if (!seg.confident) ks.className = 'q'; meta.appendChild(ks);
     const inp = document.createElement('input'); inp.type = 'text'; inp.value = seg.name;
@@ -2769,10 +2806,7 @@ elAudioFile.addEventListener('change', (e) => {
 elRecArm.addEventListener('click', armRecording);
 elRecToggle.addEventListener('click', () => recording ? stopRecording() : startRecording());
 elRecSave.addEventListener('click', openSavePanel);
-elSaveAll.addEventListener('click', async () => {
-  if (elFmtWebm.checked) { await saveWholeWebm(); return; }
-  for (let i = 0; i < recSegments.length; i++) await saveSegmentWav(i);
-});
+elSaveAll.addEventListener('click', saveAllWav);
 elMergeAll.addEventListener('click', async () => {
   if (!fileBuffer) return;
   setStatus('analysiere …'); await new Promise(r => setTimeout(r, 0));
