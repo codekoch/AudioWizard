@@ -78,6 +78,11 @@ try:
 except ImportError:
     sys.exit("Fehlt: 'librosa'. Installiere mit: pip install librosa")
 
+try:
+    import soundfile as sf  # nur fuer den Datei-Modus (verlustfreies Laden zur Wiedergabe)
+except ImportError:
+    sf = None
+
 
 # ===========================================================================
 # Konfiguration
@@ -2163,6 +2168,499 @@ def clock_worker(shared, midi_out, stop_event):
 
 
 # ===========================================================================
+# Datei-Modus: Offline-Beat-Map + driftfreie Wiedergabe-Clock
+# ===========================================================================
+# Mirror der WebApp ("Datei/Aufnahme -> MIDI-Clock (driftfrei)"): Eine Datei
+# wird einmal vorab zu einer Beat-Map analysiert (globales Tempo -> Beat-Tracker
+# -> konstant/variabel). Bei der Wiedergabe taktet die MIDI-Clock NICHT frei
+# mit, sondern wird aus der Wiedergabeposition abgeleitet -- die Tick-Zeitpunkte
+# stehen als feste Sekunden-Marken (24 PPQN am Beat-Raster) fest und werden zu
+# genau der Zeit gesendet, zu der die Wiedergabe sie erreicht. Driftfrei, weil
+# die Position aus dem Geraete-Takt (ausgegebene Frames) kommt.
+FILE_CONST_DRIFT = 0.015    # <=1,5% Tempo-Unterschied 1./2. Haelfte -> "konstant"
+FILE_FOLD_REL    = 0.006    # Feinsuche der Periode: +-0,6% um den Median-Beat-Abstand
+FILE_FOLD_MIN_R  = 0.45     # ab dieser Phasenkohaerenz wird die verfeinerte Periode genutzt
+FILE_ONSET_HOP   = 256      # Onset-Hop fuer die Offline-Beat-Map (~11,6 ms @ 22,05 kHz)
+
+
+def _refine_beats_to_onset(frames, oe):
+    """Beat-Frames auf die naechste Onset-Spitze ziehen und sub-Frame-genau
+    parabolisch interpolieren (reduziert die Frame-Quantisierung)."""
+    L = len(oe)
+    r = 2
+    out = np.empty(len(frames), dtype=np.float64)
+    for n, bf in enumerate(frames):
+        b = int(round(bf))
+        best_i = b
+        best_v = oe[b] if 0 <= b < L else -1e18
+        for j in range(-r, r + 1):
+            k = b + j
+            if 0 <= k < L and oe[k] > best_v:
+                best_v = oe[k]
+                best_i = k
+        frac = 0.0
+        if 0 < best_i < L - 1:
+            y0, y1, y2 = oe[best_i - 1], oe[best_i], oe[best_i + 1]
+            den = y0 - 2.0 * y1 + y2
+            if den != 0:
+                d = 0.5 * (y0 - y2) / den
+                if -1.0 < d < 1.0:
+                    frac = d
+        out[n] = best_i + frac
+    return out
+
+
+def _local_period_curve(onset, env_rate, tau0, min_bpm, max_bpm):
+    """Zeitlich variable Periodenkurve (Frames/Beat), oktav-fest um tau0. Pro
+    halbe Sekunde wird die lokale Autokorrelation (6-s-Fenster) ausgewertet,
+    mit sanftem Prior auf tau0, dann ueber 3 Knoten geglaettet und auf jeden
+    Frame linear interpoliert. Mirror der WebApp-localPeriodCurve."""
+    L = len(onset)
+    win_len = max(int(round(6 * env_rate)), int(round(5 * tau0)))
+    hop = max(1, int(round(0.5 * env_rate)))
+    lag_lo = max(2, int(round(tau0 * 0.7)))
+    lag_hi = int(round(tau0 * 1.45))
+    lag_lo = max(lag_lo, int(math.floor(60 * env_rate / max_bpm)))
+    lag_hi = min(lag_hi, int(math.ceil(60 * env_rate / min_bpm)))
+    if lag_hi <= lag_lo:
+        return np.full(L, float(tau0))
+    half_w = win_len >> 1
+    lags = np.arange(lag_lo, lag_hi + 1)
+    prior = np.exp(-0.5 * (np.log(lags / tau0) / 0.35) ** 2)
+    knot_x, knot_lag = [], []
+    for c in range(0, L, hop):
+        s = max(0, c - half_w)
+        e = min(L, c + half_w)
+        nn = e - s
+        if nn <= lag_hi + 2:
+            knot_x.append(c)
+            knot_lag.append(float(tau0))
+            continue
+        x = onset[s:e] - onset[s:e].mean()
+        energy = float(np.dot(x, x))
+        best_lag = float(tau0)
+        if energy > 0:
+            scores = np.empty(len(lags), dtype=np.float64)
+            for li, lag in enumerate(lags):
+                acc = float(np.dot(x[:nn - lag], x[lag:nn]))
+                scores[li] = acc / energy * prior[li]
+            best_lag = float(lags[int(np.argmax(scores))])
+        knot_x.append(c)
+        knot_lag.append(best_lag)
+    kl = np.array(knot_lag, dtype=np.float64)
+    sm = kl.copy()
+    for i in range(len(kl)):
+        sm[i] = kl[max(0, i - 1):min(len(kl), i + 2)].mean()
+    if len(knot_x) == 1:
+        return np.full(L, sm[0])
+    return np.interp(np.arange(L), np.array(knot_x, dtype=np.float64), sm)
+
+
+def _dp_beats(local, period, tightness):
+    """Dynamische Programmierung (Ellis): beste Beat-Folge bei lokal erwarteter
+    Periode. Mirror der WebApp-dpBeats; innere Schleife vektorisiert."""
+    L = len(local)
+    cum = np.zeros(L, dtype=np.float64)
+    back = np.full(L, -1, dtype=np.int64)
+    for i in range(L):
+        p = period[i] if period[i] > 1 else 1.0
+        lo = max(1, int(round(p * 0.5)))
+        hi = int(round(p * 2.0))
+        if hi < lo:
+            cum[i] = local[i]
+            continue
+        lagvals = np.arange(lo, hi + 1)
+        js = i - lagvals
+        ok = js >= 0
+        if not ok.any():
+            cum[i] = local[i]
+            continue
+        lv = lagvals[ok]
+        jj = js[ok]
+        r = np.log(lv / p)
+        sc = cum[jj] - tightness * (r * r)
+        b = int(np.argmax(sc))
+        cum[i] = local[i] + sc[b]
+        back[i] = jj[b]
+    p_last = period[L - 1] if period[L - 1] > 1 else 1.0
+    tail_start = max(0, L - int(round(p_last)))
+    seg = cum[tail_start:]
+    if len(seg) == 0:
+        return []
+    best_end = tail_start + int(np.argmax(seg))
+    beats = []
+    i = best_end
+    while i >= 0:
+        beats.append(i)
+        i = int(back[i])
+    beats.reverse()
+    return beats
+
+
+def _fold_period(beats, p0, rel):
+    """Phasenfaltung: feine Periodensuche eng um p0 (Sek.). Faltet alle Beats
+    auf ihre Phase (Beat modulo P) und sucht die Periode mit der staerksten
+    Buendelung (Resultierenden-Laenge R, 0..1). Unempfindlich gegen
+    ausgelassene/doppelte Beats. Rueckgabe (P, R)."""
+    beats = np.asarray(beats, dtype=np.float64)
+    m = len(beats)
+
+    def coh_grid(ps):
+        a = (2.0 * np.pi) * (beats[None, :] / ps[:, None])
+        return np.hypot(np.cos(a).sum(axis=1), np.sin(a).sum(axis=1)) / m
+
+    lo, hi = p0 * (1.0 - rel), p0 * (1.0 + rel)
+    best_p, best_r = p0, -1.0
+    for _ in range(3):                       # grob -> fein um das Maximum
+        steps = 400
+        ps = np.linspace(lo, hi, steps + 1)
+        rs = coh_grid(ps)
+        bi = int(np.argmax(rs))
+        best_p, best_r = float(ps[bi]), float(rs[bi])
+        span = (hi - lo) / steps * 4.0
+        lo, hi = best_p - span, best_p + span
+    return best_p, best_r
+
+
+def _grid_phase(beats, p):
+    """Zirkulaeres Mittel der Beat-Phasen modulo P -> bester globaler Anker (s)
+    in [0, P). Robust gegen Ausreisser (Vektormittel)."""
+    beats = np.asarray(beats, dtype=np.float64)
+    a = (2.0 * np.pi) * (beats / p)
+    ph = math.atan2(float(np.sin(a).sum()), float(np.cos(a).sum())) / (2.0 * np.pi) * p
+    ph %= p
+    if ph < 0:
+        ph += p
+    return ph
+
+
+def _build_tick_times(beats, duration):
+    """24 PPQN am Beat-Raster. Ist ein Beat-Abstand ~doppelt so lang wie seine
+    Nachbarn (vom Tracker uebersprungener Beat), bekommt er 48 Ticks (mult=2) ->
+    die Clock-Geschwindigkeit bleibt durchgehend korrekt und phasenrichtig.
+    Ueber den letzten Beat hinaus wird mit dem letzten Intervall bis Dateiende
+    verlaengert."""
+    beats = np.asarray(beats, dtype=np.float64)
+    m = len(beats)
+    if m < 2:
+        return np.array([], dtype=np.float64)
+    ibi = np.diff(beats)
+
+    def local_med(k):
+        w = ibi[max(0, k - 2):min(len(ibi), k + 3)]
+        return float(np.median(w)) if len(w) else 0.0
+
+    ticks = []
+    for k in range(m - 1):
+        t0 = beats[k]
+        d = beats[k + 1] - beats[k]
+        med = local_med(k) or d
+        mult = int(round(d / med)) if med > 0 else 1
+        mult = min(4, max(1, mult))
+        sub = PPQN * mult
+        for j in range(sub):
+            ticks.append(t0 + d * (j / sub))
+    last_ivl = beats[m - 1] - beats[m - 2]
+    if last_ivl > 0:
+        t = beats[m - 1]
+        while t <= duration + 1e-6:
+            for j in range(PPQN):
+                tt = t + last_ivl * (j / PPQN)
+                if tt <= duration + 1e-6:
+                    ticks.append(tt)
+            t += last_ivl
+    else:
+        ticks.append(beats[m - 1])
+    return np.array(ticks, dtype=np.float64)
+
+
+def file_bpm_at(beats, pos, fallback=0.0):
+    """Momentantempo (BPM) an Wiedergabeposition pos (s) aus dem Beat-Raster."""
+    b = np.asarray(beats, dtype=np.float64)
+    if b is None or len(b) < 2:
+        return fallback
+    if pos <= b[0]:
+        d = b[1] - b[0]
+        return 60.0 / d if d > 0 else fallback
+    if pos >= b[-1]:
+        d = b[-1] - b[-2]
+        return 60.0 / d if d > 0 else fallback
+    i = int(np.searchsorted(b, pos)) - 1
+    i = min(max(i, 0), len(b) - 2)
+    d = b[i + 1] - b[i]
+    return 60.0 / d if d > 0 else fallback
+
+
+def analyze_file_beatmap(y, sr, min_bpm=MIN_BPM, max_bpm=MAX_BPM):
+    """Offline-Beat-Map aus Mono-Audio y@sr. Rueckgabe-dict oder None:
+        beats      np.ndarray  Beat-Zeiten (s)
+        ticks      np.ndarray  Tick-Zeiten (s, 24 PPQN am Raster)
+        constant   bool        konstantes Tempo erkannt (perfektes Raster)
+        bpm        float       (mittleres) Tempo
+        bpm_min/max float      bei variablem Tempo die Spanne (10/90-Perzentil)
+        duration   float       Laenge (s)
+    """
+    if y is None or len(y) < sr:                  # < 1 s -> keine sinnvolle Schaetzung
+        return None
+    duration = len(y) / float(sr)
+    hop = FILE_ONSET_HOP
+    try:
+        oe = librosa.onset.onset_strength(y=y, sr=sr, hop_length=hop)
+    except Exception:
+        return None
+    if oe is None or not np.any(oe):
+        return None
+    fr = sr / hop
+    g_bpm = _tempo_from_onset_env(oe, fr, 0.0)    # globales Tempo (Prior + Bereich)
+    if not g_bpm or not np.isfinite(g_bpm):
+        return None
+    tau0 = 60.0 * fr / g_bpm                       # Frames pro Beat (Startwert)
+    # Lokale Periodenkurve (folgt Tempowechseln) -> DP-Beat-Tracker. Anders als
+    # librosas konstant-Tempo-Tracker erlaubt das, variables Tempo zu erkennen.
+    period = _local_period_curve(oe, fr, tau0, min_bpm, max_bpm)
+    std = float(oe.std())
+    local = oe / std if std > 0 else oe
+    beat_idx = _dp_beats(local, period, 100.0)     # FILE_TIGHTNESS = 100
+    if len(beat_idx) < 2:
+        return None
+    beat_frames = _refine_beats_to_onset(np.array(beat_idx, dtype=np.float64), oe)
+    beats = beat_frames * hop / float(sr)
+    # sanitisieren: streng monoton steigend
+    keep = [beats[0]]
+    for t in beats[1:]:
+        if np.isfinite(t) and t > keep[-1] + 1e-4:
+            keep.append(t)
+    beats = np.array(keep, dtype=np.float64)
+    if len(beats) < 2:
+        return None
+
+    ibis = np.diff(beats)
+    ibis = ibis[ibis > 0]
+    if len(ibis) < 2:
+        return None
+    med_ivl = float(np.median(ibis))
+    mid = len(beats) // 2
+
+    def med_half(lo, hi):
+        w = np.diff(beats[lo:hi])
+        w = w[w > 0]
+        return float(np.median(w)) if len(w) else 0.0
+
+    mh1, mh2 = med_half(0, mid + 1), med_half(mid, len(beats))
+    drift = (abs(mh2 - mh1) / (0.5 * (mh1 + mh2))) if (mh1 > 0 and mh2 > 0) else 1.0
+
+    if med_ivl > 0 and drift < FILE_CONST_DRIFT:
+        # konstantes Tempo: Periode per Phasenfaltung verfeinern, globales
+        # Raster ueber die volle Laenge legen -> perfekt driftfrei.
+        fold_p, fold_r = _fold_period(beats, med_ivl, FILE_FOLD_REL)
+        period = fold_p if fold_r >= FILE_FOLD_MIN_R else med_ivl
+        ph = _grid_phase(beats, period)
+        arr = []
+        k = math.ceil((0.0 - ph) / period - 1e-9)
+        while True:
+            t = ph + period * k
+            if t > duration:
+                break
+            if t >= 0:
+                arr.append(t)
+            k += 1
+        if len(arr) >= 2:
+            grid = np.array(arr, dtype=np.float64)
+            bpm = 60.0 / period
+            return {"beats": grid, "ticks": _build_tick_times(grid, duration),
+                    "constant": True, "bpm": bpm, "bpm_min": bpm, "bpm_max": bpm,
+                    "duration": duration}
+
+    # variabel: robuste Kennzahlen
+    sorted_ibi = np.sort(ibis)
+    q10 = float(sorted_ibi[int(round(0.1 * (len(sorted_ibi) - 1)))])
+    q90 = float(sorted_ibi[int(round(0.9 * (len(sorted_ibi) - 1)))])
+    return {"beats": beats, "ticks": _build_tick_times(beats, duration),
+            "constant": False, "bpm": 60.0 / med_ivl,
+            "bpm_min": 60.0 / q90 if q90 > 0 else 0.0,
+            "bpm_max": 60.0 / q10 if q10 > 0 else 0.0,
+            "duration": duration}
+
+
+def load_audio_file(path):
+    """Laedt eine Audiodatei zweifach: Mono @ ANALYSIS_SR fuer die Analyse und
+    (verlustfrei, native Rate, alle Kanaele) fuer die Wiedergabe. Rueckgabe
+    (y_analyse, audio_play[frames,ch] float32, sr_play) oder wirft."""
+    y_an, _ = librosa.load(path, sr=ANALYSIS_SR, mono=True)
+    if sf is not None:
+        audio, sr_play = sf.read(path, dtype='float32', always_2d=True)
+    else:
+        # Fallback ueber librosa (resampelt ggf.); native Rate beibehalten
+        y2, sr_play = librosa.load(path, sr=None, mono=False)
+        audio = y2.T if y2.ndim > 1 else y2.reshape(-1, 1)
+        audio = np.ascontiguousarray(audio, dtype=np.float32)
+    return y_an, audio, int(sr_play)
+
+
+def _realtime_timer_begin():
+    """Win11: 1-ms-Timeraufloesung + Timer-Throttling aus + hohe Thread-
+    Prioritaet fuer tickgenaues Senden. Rueckgabe winmm-Handle oder None."""
+    if sys.platform != 'win32':
+        return None
+    winmm = None
+    try:
+        import ctypes
+        try:
+            winmm = ctypes.windll.winmm
+            winmm.timeBeginPeriod(1)
+        except Exception:
+            winmm = None
+        try:
+            class _PowerThrottling(ctypes.Structure):
+                _fields_ = [("Version", ctypes.c_ulong),
+                            ("ControlMask", ctypes.c_ulong),
+                            ("StateMask", ctypes.c_ulong)]
+            st = _PowerThrottling(1, 0x4, 0)
+            ctypes.windll.kernel32.SetProcessInformation(
+                ctypes.windll.kernel32.GetCurrentProcess(),
+                4, ctypes.byref(st), ctypes.sizeof(st))
+        except Exception:
+            pass
+        try:
+            ctypes.windll.kernel32.SetThreadPriority(
+                ctypes.windll.kernel32.GetCurrentThread(), 15)
+        except Exception:
+            pass
+    except Exception:
+        pass
+    return winmm
+
+
+def _realtime_timer_end(winmm):
+    if winmm is not None:
+        try:
+            winmm.timeEndPeriod(1)
+        except Exception:
+            pass
+
+
+class FilePlayer:
+    """Spielt einen dekodierten Audiopuffer ueber sounddevice ab und stellt der
+    Clock eine driftfreie Wiedergabeposition bereit. Die Position kommt aus dem
+    GERAETE-Takt (ausgegebene Frames), nicht aus perf_counter -- deshalb laeuft
+    eine daraus getaktete MIDI-Clock nicht gegen die Wiedergabe weg. Zwischen
+    zwei Callbacks wird linear interpoliert (Bloecke sind klein/gleichmaessig)."""
+
+    def __init__(self, audio, sr, device=None, blocksize=1024):
+        if audio.ndim == 1:
+            audio = audio.reshape(-1, 1)
+        self.audio = np.ascontiguousarray(audio, dtype=np.float32)
+        self.frames_total = self.audio.shape[0]
+        self.channels = self.audio.shape[1]
+        self.sr = int(sr)
+        self.device = device
+        self.blocksize = blocksize
+        self.lock = threading.Lock()
+        self.pos = 0                       # naechster auszugebender Frame
+        self.anchor_pos = 0                # Frames vor dem letzten Callback
+        self.anchor_perf = time.perf_counter()
+        self.latency = blocksize / float(sr)   # Ausgabe-Latenz (s), s. start()
+        self.finished = False
+        self.playing = False
+        self.stream = None
+
+    def _callback(self, outdata, frames, time_info, status):
+        with self.lock:
+            self.anchor_pos = self.pos
+            self.anchor_perf = time.perf_counter()
+        start = self.pos
+        end = min(start + frames, self.frames_total)
+        n = end - start
+        if n > 0:
+            outdata[:n] = self.audio[start:end]
+            self.pos = end
+        if n < frames:
+            outdata[n:] = 0
+            self.finished = True
+            raise sd.CallbackStop
+
+    def start(self):
+        if sd is None:
+            raise RuntimeError("sounddevice nicht verfuegbar")
+        self.stream = sd.OutputStream(
+            samplerate=self.sr, channels=self.channels, blocksize=self.blocksize,
+            device=self.device, dtype='float32', callback=self._callback)
+        self.stream.start()
+        try:
+            self.latency = float(self.stream.latency)
+        except Exception:
+            self.latency = self.blocksize / float(self.sr)
+        self.playing = True
+
+    def play_pos(self):
+        """Aktuelle Wiedergabeposition (s), driftfrei aus dem Geraete-Takt."""
+        with self.lock:
+            ap, aperf = self.anchor_pos, self.anchor_perf
+        return ap / float(self.sr) - self.latency + (time.perf_counter() - aperf)
+
+    def is_done(self):
+        return self.finished or self.pos >= self.frames_total
+
+    def stop(self):
+        self.playing = False
+        st, self.stream = self.stream, None
+        if st is not None:
+            try:
+                st.stop()
+                st.close()
+            except Exception:
+                pass
+
+
+def file_clock_worker(shared, player, ticks, midi_out, stop_event):
+    """Treibt die MIDI-Clock streng aus der Wiedergabeposition des FilePlayer.
+    Die Tick-Zeitpunkte (Sek.) stehen vorab fest; jeder Tick wird zu der
+    perf_counter-Zeit gesendet, zu der die Wiedergabe diese Position erreicht
+    -- daher driftfrei. Bei Aussetzer/Seek wird der Tick-Index neu auf die
+    aktuelle Position gesetzt (kein Tick-Burst)."""
+    winmm = _realtime_timer_begin()
+    clock_msg = mido.Message('clock')
+    ticks = np.asarray(ticks, dtype=np.float64)
+    n = len(ticks)
+    started = False
+    try:
+        if midi_out is not None:
+            midi_out.send(mido.Message('start'))
+        started = True
+    except Exception:
+        pass
+
+    i = int(np.searchsorted(ticks, max(0.0, player.play_pos()))) if n else 0
+    while not stop_event.is_set():
+        if player.is_done() or i >= n:
+            break
+        target = float(ticks[i])
+        pos = player.play_pos()
+        wait = target - pos
+        if wait > 0.0:
+            precise_sleep_until(time.perf_counter() + wait, stop_event)
+            if stop_event.is_set():
+                break
+        try:
+            if midi_out is not None:
+                midi_out.send(clock_msg)
+        except Exception:
+            break
+        i += 1
+        # bei grossem Rueckstand (Aussetzer/Seek) neu einrasten statt Burst
+        pos2 = player.play_pos()
+        if i < n and pos2 - target > 0.25:
+            i = int(np.searchsorted(ticks, pos2))
+
+    try:
+        if midi_out is not None and started:
+            midi_out.send(mido.Message('stop'))
+    except Exception:
+        pass
+    _realtime_timer_end(winmm)
+
+
+# ===========================================================================
 # Quellen-Auswahl
 # ===========================================================================
 def choose_capture_mode():
@@ -2709,9 +3207,104 @@ def choose_run_mode(midi_name):
 
 
 # ===========================================================================
+# Datei-Modus (Konsole): nicht-interaktiver Sonderweg
+# ===========================================================================
+def _arg_value(flag):
+    """Liest --flag WERT oder --flag=WERT aus sys.argv; None, wenn nicht da."""
+    for i, a in enumerate(sys.argv):
+        if a == flag and i + 1 < len(sys.argv):
+            return sys.argv[i + 1]
+        if a.startswith(flag + "="):
+            return a[len(flag) + 1:]
+    return None
+
+
+def run_file_mode(path):
+    """Spielt eine Audiodatei ab und gibt eine driftfreie MIDI-Clock zur
+    Wiedergabe aus (Konsolen-Variante des Datei-Modus). Vorab wird die Datei
+    einmal zu einer Beat-Map analysiert."""
+    try:
+        mido.set_backend('mido.backends.rtmidi')
+    except Exception:
+        pass
+    if not os.path.exists(path):
+        sys.exit(f"Datei nicht gefunden: {path}")
+    midi_name = choose_midi_output()
+    try:
+        midi_out = open_midi_output(midi_name) if midi_name else None
+    except Exception as e:
+        sys.exit(f"MIDI-Ausgang fehlgeschlagen: {e}")
+
+    print("\nLade & analysiere Datei (einmalig, kann kurz dauern) ...")
+    try:                                       # librosa/numba aufwaermen
+        _w = np.zeros(int(ANALYSIS_SR * WINDOW_SECONDS), dtype=np.float32)
+        _w[::ANALYSIS_SR // 4] = 0.5
+        estimate_tempo(_w, ANALYSIS_SR)
+    except Exception:
+        pass
+    try:
+        y_an, audio, sr_play = load_audio_file(path)
+    except Exception as e:
+        sys.exit(f"Datei konnte nicht geladen werden: {e}")
+    info = analyze_file_beatmap(y_an, ANALYSIS_SR, MIN_BPM, MAX_BPM)
+    if info is None:
+        sys.exit("Kein Tempo erkannt -- Datei zu kurz oder ohne klaren Beat?")
+    key = "—"
+    try:
+        pcp = chroma_pcp(y_an, ANALYSIS_SR)
+        key, _m, _s = classify_key(pcp, with_margin=True)
+    except Exception:
+        pass
+    tag = "konstant -> driftfrei" if info["constant"] else "variabel"
+    dur = info["duration"]
+    print(f"Tempo {info['bpm']:.1f} BPM ({tag}), Tonart {key}, "
+          f"Dauer {int(dur) // 60}:{int(dur) % 60:02d} min")
+    print(f"MIDI-Ausgang: {midi_output_desc(midi_name)}\n"
+          f"Wiedergabe laeuft -- Beenden mit Strg+C.\n")
+
+    shared = Shared()
+    player = FilePlayer(audio, sr_play)
+    stop_event = threading.Event()
+    try:
+        player.start()
+    except Exception as e:
+        sys.exit(f"Wiedergabe fehlgeschlagen: {e}")
+    clk = threading.Thread(target=file_clock_worker,
+                           args=(shared, player, info["ticks"], midi_out,
+                                 stop_event), daemon=True)
+    clk.start()
+    try:
+        while not player.is_done():
+            pos = max(0.0, min(dur, player.play_pos()))
+            bpm = file_bpm_at(info["beats"], pos, info["bpm"])
+            print(f"\r{int(pos) // 60}:{int(pos) % 60:02d}/"
+                  f"{int(dur) // 60}:{int(dur) % 60:02d}  "
+                  f"BPM {bpm:6.1f}  Tonart {key:9s}", end="", flush=True)
+            time.sleep(0.2)
+    except KeyboardInterrupt:
+        pass
+    finally:
+        stop_event.set()
+        clk.join(timeout=1.0)
+        player.stop()
+        if midi_out is not None:
+            try:
+                midi_out.close()
+            except Exception:
+                pass
+    print("\nFertig.")
+
+
+# ===========================================================================
 # Hauptprogramm
 # ===========================================================================
 def main():
+    # Datei-Modus: Datei -> MIDI-Clock (driftfrei), nicht-interaktiv
+    file_path = _arg_value('--file')
+    if file_path:
+        run_file_mode(file_path)
+        return
+
     winmm = None
     if sys.platform == 'win32':
         try:

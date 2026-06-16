@@ -44,6 +44,7 @@ import numpy as np
 try:
     import tkinter as tk
     import tkinter.font as tkfont
+    from tkinter import filedialog
 except ImportError:
     sys.exit("Tkinter fehlt. Raspberry Pi OS: sudo apt install python3-tk")
 
@@ -167,6 +168,18 @@ class DisplayApp:
         self._last_width = 0
         self._bpm_big = True                  # BPM-Label gerade gross/aktiv?
         self.hold = False                     # Analyse eingefroren?
+        # ---- Datei-Modus (Datei -> MIDI-Clock, driftfrei) ----
+        self.file_mode = False                # Datei-Wiedergabe statt Live-Analyse?
+        self.file_player = None               # core.FilePlayer
+        self.file_clock_stop = None
+        self.file_clock_thread = None
+        self.file_midi = None                 # eigener MIDI-Ausgang im Datei-Modus
+        self.file_info = None                 # Beat-Map-dict (beats/ticks/bpm/...)
+        self.file_name = ""
+        self.file_key = "—"
+        self.file_key_conf = False
+        self._file_begin_args = None          # vom Analyse-Thread gesetzt;
+                                              #   _tick() startet die Wiedergabe
         self._load_options()                  # Optionen + BPM-Bereich anwenden
 
         # ---- Schriften (Groesse wird bei Resize angepasst) ----
@@ -314,8 +327,9 @@ class DisplayApp:
 
         lvl = tk.Frame(f, bg=COL_BG)
         lvl.grid(row=8, column=0, sticky="ew", padx=24, pady=(0, 4))
-        tk.Label(lvl, text="PEGEL", font=self.f_small,
-                 bg=COL_BG, fg=COL_MUTED).pack(side="left")
+        self.level_cap_label = tk.Label(lvl, text="PEGEL", font=self.f_small,
+                                        bg=COL_BG, fg=COL_MUTED)
+        self.level_cap_label.pack(side="left")
         self.db_label = tk.Label(lvl, text="-60 dB", font=self.f_small,
                                  bg=COL_BG, fg=COL_MUTED, width=7, anchor="e")
         self.db_label.pack(side="right")
@@ -343,6 +357,14 @@ class DisplayApp:
                                    pady=6, highlightthickness=0, takefocus=0,
                                    cursor="hand2")
         self.reset_btn.pack(side="left", padx=(8, 0))
+        self.file_btn = tk.Button(btns, text="Datei …",
+                                  command=self.on_load_file,
+                                  font=self.f_small, bg=COL_SURFACE,
+                                  fg=COL_FG, activebackground=COL_SURF_HI,
+                                  activeforeground=COL_FG, bd=0, padx=16,
+                                  pady=6, highlightthickness=0, takefocus=0,
+                                  cursor="hand2")
+        self.file_btn.pack(side="left", padx=(8, 0))
         self._small_button(btns, "Beenden", self.quit_app).pack(side="right")
         self._small_button(btns, "Einstellungen",
                            self.on_settings).pack(side="right", padx=(0, 8))
@@ -467,6 +489,13 @@ class DisplayApp:
                   bd=0, padx=28, pady=8, highlightthickness=0,
                   cursor="hand2").pack(side="right")
         tk.Button(bottom, text="Aktualisieren", command=self._populate_setup,
+                  font=self.f_btn, bg=COL_SURFACE, fg=COL_FG,
+                  activebackground=COL_SURF_HI, activeforeground=COL_FG,
+                  bd=0, padx=16, pady=8, highlightthickness=0,
+                  cursor="hand2").pack(side="right", padx=(0, 10))
+        # Datei -> MIDI-Clock (driftfrei): braucht keine Live-Quelle, daher
+        # auch direkt aus dem Setup erreichbar.
+        tk.Button(bottom, text="Datei laden …", command=self.on_load_file,
                   font=self.f_btn, bg=COL_SURFACE, fg=COL_FG,
                   activebackground=COL_SURF_HI, activeforeground=COL_FG,
                   bd=0, padx=16, pady=8, highlightthickness=0,
@@ -666,6 +695,183 @@ class DisplayApp:
         with self.shared.lock:
             self.shared.reset_request = True
 
+    # ------------------------------------------------------------------
+    # Datei-Modus: Datei -> MIDI-Clock (driftfrei)
+    # ------------------------------------------------------------------
+    @staticmethod
+    def _fmt_pos(s):
+        s = max(0, int(s))
+        return f"{s // 60}:{s % 60:02d}"
+
+    def on_load_file(self):
+        """Audiodatei waehlen, vorab zu einer Beat-Map analysieren und mit
+        driftfreier MIDI-Clock abspielen (mirror der WebApp). Beendet eine
+        laufende Live-Sitzung."""
+        path = filedialog.askopenfilename(
+            title="Audiodatei waehlen",
+            filetypes=[("Audio", "*.wav *.flac *.mp3 *.ogg *.m4a *.aif *.aiff"),
+                       ("Alle Dateien", "*.*")])
+        if not path:
+            return
+        self.stop_session()                   # Live-Sitzung beenden (zaehlt gen hoch)
+        self.show_main()
+        self.file_mode = True
+        self.file_name = os.path.basename(path)
+        self.file_info = None
+        self.file_player = None
+        self.status_override = "ANALYSIERE DATEI …"
+        nm = self.file_name if len(self.file_name) <= 40 else self.file_name[:39] + "…"
+        self.src_label.config(text=f"DATEI: {nm}")
+        gen = self._session_gen
+        threading.Thread(target=self._analyze_file, args=(path, gen),
+                         daemon=True).start()
+
+    def _analyze_file(self, path, gen):
+        """Im Hintergrund: Datei laden, Beat-Map + Tonart schaetzen. Ergebnis
+        wird ueber _file_begin_args an den Main-Thread uebergeben (Tk-only)."""
+        if not self.warmed:
+            try:
+                w = np.zeros(int(core.ANALYSIS_SR * core.WINDOW_SECONDS),
+                             dtype=np.float32)
+                w[::core.ANALYSIS_SR // 4] = 0.5
+                core.estimate_tempo(w, core.ANALYSIS_SR)
+                core.chroma_pcp(w, core.ANALYSIS_SR)
+            except Exception:
+                pass
+            self.warmed = True
+        try:
+            y_an, audio, sr_play = core.load_audio_file(path)
+        except Exception as e:
+            self._file_begin_args = ("error", gen, f"Datei konnte nicht geladen werden: {e}")
+            return
+        try:
+            info = core.analyze_file_beatmap(y_an, core.ANALYSIS_SR,
+                                             core.MIN_BPM, core.MAX_BPM)
+        except Exception as e:
+            self._file_begin_args = ("error", gen, f"Analyse fehlgeschlagen: {e}")
+            return
+        if info is None:
+            self._file_begin_args = ("error", gen, "Kein Tempo erkannt.")
+            return
+        key, key_conf = "—", False
+        try:
+            pcp = core.chroma_pcp(y_an, core.ANALYSIS_SR)
+            name, margin, _second = core.classify_key(pcp, with_margin=True)
+            key, key_conf = name, margin >= core.KEY_CONFIDENT_MARGIN
+        except Exception:
+            pass
+        self._file_begin_args = ("ok", gen, (audio, sr_play, info, key, key_conf))
+
+    def _file_begin(self, audio, sr_play, info, key, key_conf):
+        """Main-Thread: MIDI oeffnen, Wiedergabe + driftfreie Clock starten."""
+        if self.app_stop.is_set() or not self.file_mode:
+            return
+        self.file_info = info
+        self.file_key = key
+        self.file_key_conf = key_conf
+        # MIDI-Ausgang aus der Konfiguration (wie im Live-Betrieb)
+        self.file_midi = None
+        cfg = load_config()
+        midi_name = cfg.get("midi_output") or None
+        if midi_name and (midi_name == core.VIRTUAL_MIDI
+                          or midi_name in mido.get_output_names()):
+            try:
+                self.file_midi = core.open_midi_output(midi_name)
+            except Exception:
+                self.file_midi = None
+        try:
+            self.file_player = core.FilePlayer(audio, sr_play)
+            self.file_player.start()
+        except Exception as e:
+            if self.file_midi is not None:
+                try:
+                    self.file_midi.close()
+                except Exception:
+                    pass
+                self.file_midi = None
+            self.file_mode = False
+            self.status_override = None
+            self.show_setup(error=f"Wiedergabe fehlgeschlagen: {e}")
+            return
+        self.file_clock_stop = threading.Event()
+        self.file_clock_thread = threading.Thread(
+            target=core.file_clock_worker,
+            args=(self.shared, self.file_player, info["ticks"], self.file_midi,
+                  self.file_clock_stop), daemon=True)
+        self.file_clock_thread.start()
+        # Hold/Reset gelten nur im Live-Betrieb
+        self.hold_btn.config(state="disabled")
+        self.reset_btn.config(state="disabled")
+        self.db_label.config(width=13)
+        self.status_override = None
+
+    def stop_file(self):
+        if self.file_clock_stop is not None:
+            self.file_clock_stop.set()
+        if self.file_clock_thread is not None:
+            self.file_clock_thread.join(timeout=1.5)
+        self.file_clock_thread = self.file_clock_stop = None
+        if self.file_player is not None:
+            try:
+                self.file_player.stop()
+            except Exception:
+                pass
+            self.file_player = None
+        if self.file_midi is not None:
+            try:
+                self.file_midi.close()
+            except Exception:
+                pass
+            self.file_midi = None
+        self.file_mode = False
+        self.file_info = None
+        self._file_begin_args = None
+        try:
+            self.hold_btn.config(state="normal")
+            self.reset_btn.config(state="normal")
+            self.level_cap_label.config(text="PEGEL")
+            self.db_label.config(width=7, text="-60 dB")
+        except Exception:
+            pass
+
+    def _tick_file(self):
+        """Anzeige im Datei-Modus: BPM aus dem Beat-Raster an der aktuellen
+        Wiedergabeposition, Tonart aus der Vorab-Schaetzung, Fortschrittsbalken."""
+        player, info = self.file_player, self.file_info
+        if player is None or info is None:
+            return
+        if player.is_done():
+            self.stop_file()
+            self.show_setup()
+            return
+        dur = info.get("duration", 0.0) or 0.0
+        pos = max(0.0, player.play_pos())
+        if dur > 0:
+            pos = min(pos, dur)
+        bpm = core.file_bpm_at(info["beats"], pos, info.get("bpm", 0.0))
+        self.bpm_cap_label.config(text="BPM")
+        if not self._bpm_big:
+            self.bpm_label.config(font=self.f_bpm, fg=COL_FG)
+            self._bpm_big = True
+        self.bpm_label.config(
+            text=f"{bpm:.1f}" if self.opt_bpm_decimal else f"{bpm:.0f}", fg=COL_FG)
+        self.key_label.config(text=self.file_key,
+                              fg=COL_ACCENT if self.file_key_conf else COL_MUTED)
+        par = parallel_key(self.file_key)
+        self.key_par_label.config(text=f"   {par}" if par else "")
+        if self.opt_chords:
+            self.chord_label.config(text="")
+        self.level_cap_label.config(text="POSITION")
+        frac = max(0.0, min(1.0, pos / dur if dur > 0 else 0.0))
+        w = self.level_canvas.winfo_width()
+        self.level_canvas.coords(self.level_rect, 0, 0, int(w * frac), 14)
+        self.db_label.config(text=f"{self._fmt_pos(pos)} / {self._fmt_pos(dur)}")
+        tag = "DRIFTFREI" if info.get("constant") else "VARIABEL"
+        if self.file_midi is not None:
+            self.status_label.config(text=f"● DATEI · {tag}", fg=COL_OK)
+        else:
+            self.status_label.config(text=f"DATEI · {tag} · OHNE MIDI", fg=COL_MUTED)
+
     def on_setup_start(self):
         sel = self.lb_in.curselection()
         if not sel or not self.sources:
@@ -825,6 +1031,8 @@ class DisplayApp:
         self._session_gen += 1                # laufenden Warmup entwerten
         self._begin_args = None
         self.status_override = None
+        if self.file_mode or self.file_player is not None:
+            self.stop_file()                  # ggf. Datei-Wiedergabe beenden
         if self.hold:
             self._set_hold(False)
         if (self.stream is not None or self.cap_thread is not None
@@ -871,6 +1079,22 @@ class DisplayApp:
     # Anzeige-Aktualisierung (~6x pro Sekunde)
     # ------------------------------------------------------------------
     def _tick(self):
+        # Datei-Modus: verzoegerter Start (Analyse-Thread -> Main-Thread, Tk-only)
+        if self._file_begin_args is not None:
+            kind, gen, payload = self._file_begin_args
+            self._file_begin_args = None
+            if gen == self._session_gen and self.file_mode:
+                if kind == "error":
+                    self.file_mode = False
+                    self.status_override = None
+                    self.show_setup(error=payload)
+                else:
+                    self._file_begin(*payload)
+        if self.file_mode:
+            self._tick_file()
+            self.root.after(150, self._tick)
+            return
+
         if self._begin_args is not None:
             gen, src, midi_name = self._begin_args
             self._begin_args = None

@@ -47,6 +47,16 @@ Eingänge; unter macOS leistet das ein virtuelles Ausgabegerät wie
   geringe Latenz. Tracking-Parameter (Schwellen, YIN-Strenge, Entprellung) sind
   über die Konfiguration kalibrierbar. In Konsole und GUI wählbar; auch in der
   Webversion vorhanden.
+- **Datei-Modus (Datei → MIDI-Clock, driftfrei)** (optional) – eine Audiodatei
+  wird einmal vorab zu einer Beat-Map analysiert (globales Tempo → Beat-Tracker
+  mit lokaler Periodenkurve, dadurch Erkennung von **konstantem vs. variablem**
+  Tempo) und dann abgespielt. Die MIDI-Clock wird dabei nicht frei mitgetaktet,
+  sondern streng aus der **Wiedergabeposition** abgeleitet (die Tick-Zeitpunkte
+  stehen als feste Marken am Beat-Raster fest) – sie läuft daher nicht gegen den
+  Song weg. Bei konstantem Tempo entsteht ein perfekt gleichmäßiges Raster über
+  die ganze Datei. In der GUI über die Schaltfläche „Datei …" (auch im
+  Einstellungsbildschirm), in der Konsole über `--file DATEI`. Mirror des
+  gleichnamigen Modus der Webversion.
 - **Zwei Oberflächen** – Konsolen-Version (`realtime_bpm_key_midiclock.py`)
   und Touch-taugliche Kiosk-GUI (`bpm_key_display.py`) für ein 7-Zoll-Display
   am Raspberry Pi; unter Windows und macOS läuft sie im Fenster.
@@ -69,6 +79,13 @@ in die Anzeige. Alternativ die Konsolen-Version:
 
 ```
 python realtime_bpm_key_midiclock.py
+```
+
+Eine Audiodatei statt einer Live-Quelle abspielen (Datei-Modus, driftfreie
+Clock zur Wiedergabe) – in der Konsole:
+
+```
+python realtime_bpm_key_midiclock.py --file "C:\Pfad\zum\song.mp3"
 ```
 
 Für die MIDI-Ausgabe an Software auf demselben Rechner braucht es unter
