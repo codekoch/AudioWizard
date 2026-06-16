@@ -486,6 +486,9 @@ class Shared:
         self.beat_period = 0.0    # Beat-Abstand in Sekunden
         self.beat_valid_time = 0.0  # wann der Anker zuletzt erneuert wurde
         self.note_display = "—"   # aktuelle Note(n) im Noten-Modus (Anzeige)
+        self.rec_active = False   # Aufnahme laeuft: der Capture sammelt die
+                                  # analysierten Mono-Bloecke (capture_sr)
+        self.rec_blocks = []      # gesammelte Mono-Bloecke (unter shared.lock)
 
 
 # ===========================================================================
@@ -2661,6 +2664,152 @@ def file_clock_worker(shared, player, ticks, midi_out, stop_event):
 
 
 # ===========================================================================
+# Aufnahme: Segmentierung in Stuecke + Speichern (Mirror der WebApp)
+# ===========================================================================
+REC_GAP_S = 1.2     # Stille-Laenge (s), ab der eine Stueck-Grenze vermutet wird
+REC_MIN_S = 15.0    # kuerzere Segmente werden zum Nachbarn gemerged
+
+
+def _to_analysis_sr(y, sr):
+    """Mono-Signal fuer die Analyse auf ANALYSIS_SR bringen (Tempo/Tonart sind
+    darauf abgestimmt); gespeichert wird spaeter in voller Aufnahmerate."""
+    if int(sr) == ANALYSIS_SR:
+        return y
+    try:
+        return librosa.resample(np.asarray(y, dtype=np.float32),
+                                orig_sr=sr, target_sr=ANALYSIS_SR)
+    except Exception:
+        return y
+
+
+def _seg_bpm(y, sr, min_bpm, max_bpm):
+    ya = _to_analysis_sr(y, sr)
+    if len(ya) < ANALYSIS_SR:
+        return 0.0
+    try:
+        info = analyze_file_beatmap(ya, ANALYSIS_SR, min_bpm, max_bpm)
+    except Exception:
+        info = None
+    return info["bpm"] if info else 0.0
+
+
+def _seg_key(y, sr):
+    ya = _to_analysis_sr(y, sr)
+    try:
+        pcp = chroma_pcp(ya, ANALYSIS_SR)
+        name, margin, _s = classify_key(pcp, with_margin=True)
+        return name, margin
+    except Exception:
+        return "", 0.0
+
+
+def suggest_seg_name(seg):
+    """Namensvorschlag aus BPM + Tonart, z. B. '120BPM_C_Dur'."""
+    parts = []
+    if seg.get("bpm"):
+        parts.append(f"{int(round(seg['bpm']))}BPM")
+    if seg.get("key"):
+        parts.append(seg["key"].replace(" ", "_"))
+    return "_".join(parts) if parts else "Aufnahme"
+
+
+def _merge_short(segs, min_samples):
+    changed = True
+    while changed and len(segs) > 1:
+        changed = False
+        for k in range(len(segs)):
+            if segs[k]["end"] - segs[k]["start"] < min_samples:
+                if k > 0:
+                    segs[k - 1]["end"] = segs[k]["end"]
+                    segs.pop(k)
+                else:
+                    segs[k + 1]["start"] = segs[k]["start"]
+                    segs.pop(k)
+                changed = True
+                break
+    return segs
+
+
+def segment_recording(y, sr, min_bpm=MIN_BPM, max_bpm=MAX_BPM):
+    """Zerlegt eine Aufnahme (Mono y@sr) an kurzer Stille + BPM/Tonart-Wechsel
+    in einzelne Stuecke. Rueckgabe: Liste von dicts mit start/end (Samples in
+    y), bpm, key, key_margin, confident, name. Mirror der WebApp."""
+    y = np.asarray(y, dtype=np.float32)
+    n = len(y)
+    whole = {"start": 0, "end": n, "bpm": 0.0, "key": "", "key_margin": 0.0,
+             "confident": True, "name": "Aufnahme"}
+    if n < sr:                                     # < 1 s -> ein Stueck
+        return [whole]
+    fr = 2048
+    nf = n // fr
+    if nf < 2:
+        return [whole]
+    frames = y[:nf * fr].reshape(nf, fr).astype(np.float64)
+    rms = np.sqrt((frames * frames).mean(axis=1))
+    peak = float(rms.max())
+    thr = max(peak * 0.06, 1e-4)                   # ~ -24 dB unter Peak = "still"
+    gap_frames = math.ceil(REC_GAP_S * sr / fr)
+    cuts = []
+    i = 0
+    while i < nf:
+        if rms[i] < thr:
+            j = i
+            while j < nf and rms[j] < thr:
+                j += 1
+            if j - i >= gap_frames:
+                mid = ((i + j) // 2) * fr
+                if fr * 8 < mid < n - fr * 8:
+                    cuts.append(mid)
+            i = j
+        else:
+            i += 1
+    bounds = [0] + cuts + [n]
+    segs = [{"start": bounds[k], "end": bounds[k + 1]}
+            for k in range(len(bounds) - 1)]
+    segs = _merge_short(segs, int(REC_MIN_S * sr))
+
+    out = []
+    for s in segs:
+        if s["end"] - s["start"] < sr:             # < 1 s ueberspringen
+            continue
+        sub = y[s["start"]:s["end"]]
+        bpm = _seg_bpm(sub, sr, min_bpm, max_bpm)
+        key, margin = _seg_key(sub, sr)
+        out.append({"start": s["start"], "end": s["end"], "bpm": bpm,
+                    "key": key, "key_margin": margin})
+    if not out:
+        return [whole]
+    for k, seg in enumerate(out):
+        if k == 0:
+            seg["confident"] = True
+        else:
+            a, b = out[k - 1], seg
+            bpm_diff = (abs(a["bpm"] - b["bpm"]) / ((a["bpm"] + b["bpm"]) / 2)
+                        if (a["bpm"] and b["bpm"]) else 0.0)
+            seg["confident"] = (bpm_diff > 0.04
+                                or (bool(a["key"]) and bool(b["key"])
+                                    and a["key"] != b["key"]))
+        seg["name"] = suggest_seg_name(seg)
+    return out
+
+
+def sanitize_filename(name):
+    """Unzulaessige Dateinamenzeichen durch '_' ersetzen."""
+    out = []
+    for ch in (name or "Aufnahme"):
+        out.append("_" if ch in '\\/:*?"<>|' else ch)
+    return "".join(out).strip() or "Aufnahme"
+
+
+def save_wav_slice(audio, sr, s0, s1, path):
+    """Schreibt audio[s0:s1] als 16-bit-PCM-WAV (mono oder stereo)."""
+    if sf is None:
+        raise RuntimeError("soundfile nicht verfuegbar (pip install soundfile)")
+    seg = np.asarray(audio)[s0:s1]
+    sf.write(path, seg, int(sr), subtype='PCM_16')
+
+
+# ===========================================================================
 # Quellen-Auswahl
 # ===========================================================================
 def choose_capture_mode():
@@ -2955,6 +3104,8 @@ def update_level(shared, block):
     with shared.lock:
         shared.level = 0.7 * shared.level + 0.3 * rms
         shared.level_time = time.perf_counter()
+        if shared.rec_active:          # Aufnahme: analysierten Block mitschneiden
+            shared.rec_blocks.append(np.asarray(block, dtype=np.float32).copy())
 
 
 def monitor_worker(out_stream, monitor_q, channels, stop_event):
@@ -3295,6 +3446,56 @@ def run_file_mode(path):
     print("\nFertig.")
 
 
+def _console_stop_and_save(shared):
+    """Konsole: laufende Aufnahme stoppen, in Stuecke zerlegen und als WAV
+    speichern (gemeinsamer Zielordner, Namensvorschlag BPM+Tonart)."""
+    with shared.lock:
+        shared.rec_active = False
+        blocks = shared.rec_blocks
+        shared.rec_blocks = []
+        sr = int(shared.capture_sr)
+    if not blocks:
+        print("\n[Aufnahme leer.]")
+        return
+    rec = np.concatenate(blocks).astype(np.float32)
+    if len(rec) < sr:
+        print("\n[Aufnahme zu kurz zum Speichern.]")
+        return
+    print(f"\nAufnahme {len(rec) / sr:.1f}s -- analysiere Stuecke ...")
+    try:
+        segs = segment_recording(rec, sr, MIN_BPM, MAX_BPM)
+    except Exception as e:
+        print(f"[Segmentierung fehlgeschlagen: {e}] -- speichere als ein Stueck.")
+        segs = [{"start": 0, "end": len(rec), "bpm": 0.0, "key": "",
+                 "confident": True, "name": "Aufnahme"}]
+    print(f"{len(segs)} Stueck(e):")
+    for i, s in enumerate(segs):
+        a, b = int(s['start'] / sr), int(s['end'] / sr)
+        print(f"  [{i + 1}] {a // 60}:{a % 60:02d}-{b // 60}:{b % 60:02d}  "
+              f"{int(round(s['bpm'])) if s['bpm'] else '-'} BPM  "
+              f"{s['key'] or '?'}  -> {s['name']}.wav")
+    if sf is None:
+        print("Speichern nicht moeglich: 'soundfile' fehlt (pip install soundfile).")
+        return
+    target = input("Zielordner (leer = aktueller, x = abbrechen): ").strip()
+    if target.lower() == 'x':
+        print("Abgebrochen.")
+        return
+    target = target or os.getcwd()
+    if not os.path.isdir(target):
+        print(f"Ordner nicht gefunden: {target}")
+        return
+    ok = 0
+    for s in segs:
+        try:
+            save_wav_slice(rec, sr, s['start'], s['end'],
+                           os.path.join(target, sanitize_filename(s['name']) + '.wav'))
+            ok += 1
+        except Exception as e:
+            print(f"  Fehler bei {s['name']}: {e}")
+    print(f"{ok} von {len(segs)} Stueck(en) in '{target}' gespeichert.\n")
+
+
 # ===========================================================================
 # Hauptprogramm
 # ===========================================================================
@@ -3388,7 +3589,7 @@ def main():
 
         keys = KeyPoller()
         hotkeys = ("[i] Eingang wechseln   [o] Mithör-Ausgang   "
-                   "[s] Signal-Scan   [?] Hilfe   [q] Beenden"
+                   "[s] Signal-Scan   [r] Aufnahme   [?] Hilfe   [q] Beenden"
                    if keys.available else "(Beenden mit Strg+C)")
         mode_desc = {"clock": "Tempo & MIDI-Clock",
                      "mono": "Noten -> MIDI (monophon)",
@@ -3446,6 +3647,19 @@ def main():
                     print()
                     scan_input_levels()
                     print()
+
+                elif ch == 'r':
+                    with shared.lock:
+                        active = shared.rec_active
+                    if not active:
+                        with shared.lock:
+                            shared.rec_blocks = []
+                            shared.rec_active = True
+                        print("\n[Aufnahme laeuft -- 'r' stoppt und speichert]\n")
+                    else:
+                        keys.pause()
+                        _console_stop_and_save(shared)
+                        keys.resume()
 
                 elif ch == 'i':
                     keys.pause()    # input()-Dialoge brauchen den Normalmodus

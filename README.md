@@ -57,6 +57,13 @@ Eingänge; unter macOS leistet das ein virtuelles Ausgabegerät wie
   die ganze Datei. In der GUI über die Schaltfläche „Datei …" (auch im
   Einstellungsbildschirm), in der Konsole über `--file DATEI`. Mirror des
   gleichnamigen Modus der Webversion.
+- **Aufnahme + Speichern** (optional) – das live analysierte Signal lässt sich
+  mitschneiden (GUI-Schaltfläche „● Aufnahme", Konsole Taste `r`) und danach als
+  WAV speichern. Enthält der Mitschnitt **mehrere Stücke** (kurze Stille +
+  BPM/Tonart-Wechsel), werden sie automatisch erkannt und in einer Prüf-Liste
+  getrennt angeboten – jedes mit **Namensvorschlag aus BPM und Tonart**, unsichere
+  Grenzen gedimmt; „Alle speichern" legt sie in einen Ordner, der für das nächste
+  Mal gemerkt wird. Mirror der Webversion.
 - **Zwei Oberflächen** – Konsolen-Version (`realtime_bpm_key_midiclock.py`)
   und Touch-taugliche Kiosk-GUI (`bpm_key_display.py`) für ein 7-Zoll-Display
   am Raspberry Pi; unter Windows und macOS läuft sie im Fenster.

@@ -180,6 +180,13 @@ class DisplayApp:
         self.file_key_conf = False
         self._file_begin_args = None          # vom Analyse-Thread gesetzt;
                                               #   _tick() startet die Wiedergabe
+        # ---- Aufnahme (Mitschnitt der Live-Analyse + Speichern) ----
+        self.rec_start_perf = 0.0
+        self._rec_audio = None                # fertiger Mitschnitt (Mono)
+        self._rec_sr = 0
+        self._rec_segs = None                 # vom Segmentier-Thread gesetzt
+        self._rec_name_vars = []
+        self._rec_save_win = None
         self._load_options()                  # Optionen + BPM-Bereich anwenden
 
         # ---- Schriften (Groesse wird bei Resize angepasst) ----
@@ -365,6 +372,14 @@ class DisplayApp:
                                   pady=6, highlightthickness=0, takefocus=0,
                                   cursor="hand2")
         self.file_btn.pack(side="left", padx=(8, 0))
+        self.rec_btn = tk.Button(btns, text="● Aufnahme",
+                                 command=self.toggle_record,
+                                 font=self.f_small, bg=COL_SURFACE,
+                                 fg=COL_FG, activebackground=COL_SURF_HI,
+                                 activeforeground=COL_FG, bd=0, padx=16,
+                                 pady=6, highlightthickness=0, takefocus=0,
+                                 cursor="hand2")
+        self.rec_btn.pack(side="left", padx=(8, 0))
         self._small_button(btns, "Beenden", self.quit_app).pack(side="right")
         self._small_button(btns, "Einstellungen",
                            self.on_settings).pack(side="right", padx=(0, 8))
@@ -799,9 +814,10 @@ class DisplayApp:
             args=(self.shared, self.file_player, info["ticks"], self.file_midi,
                   self.file_clock_stop), daemon=True)
         self.file_clock_thread.start()
-        # Hold/Reset gelten nur im Live-Betrieb
+        # Hold/Reset/Aufnahme gelten nur im Live-Betrieb
         self.hold_btn.config(state="disabled")
         self.reset_btn.config(state="disabled")
+        self.rec_btn.config(state="disabled")
         self.db_label.config(width=13)
         self.status_override = None
 
@@ -829,6 +845,7 @@ class DisplayApp:
         try:
             self.hold_btn.config(state="normal")
             self.reset_btn.config(state="normal")
+            self.rec_btn.config(state="normal")
             self.level_cap_label.config(text="PEGEL")
             self.db_label.config(width=7, text="-60 dB")
         except Exception:
@@ -872,6 +889,170 @@ class DisplayApp:
         else:
             self.status_label.config(text=f"DATEI · {tag} · OHNE MIDI", fg=COL_MUTED)
 
+    # ------------------------------------------------------------------
+    # Aufnahme: Mitschnitt der Live-Analyse + Speichern (mehrere Stuecke)
+    # ------------------------------------------------------------------
+    def _rec_btn_idle(self):
+        self.rec_btn.config(text="● Aufnahme", bg=COL_SURFACE, fg=COL_FG,
+                            activebackground=COL_SURF_HI, activeforeground=COL_FG)
+
+    def toggle_record(self):
+        """Mitschnitt des gerade analysierten Live-Signals starten/stoppen.
+        Nur im Live-Betrieb (nicht im Datei-Modus)."""
+        if self.file_mode:
+            return
+        if self.stream is None and self.cap_thread is None:
+            return                            # keine laufende Live-Sitzung
+        with self.shared.lock:
+            active = self.shared.rec_active
+        if not active:
+            with self.shared.lock:
+                self.shared.rec_blocks = []
+                self.shared.rec_active = True
+            self.rec_start_perf = core.time.perf_counter()
+            self.rec_btn.config(text="■ Aufnahme 0:00", bg=COL_WARN,
+                                fg="#412402", activebackground="#FAC775",
+                                activeforeground="#412402")
+        else:
+            self._finish_record()
+
+    def _finish_record(self):
+        with self.shared.lock:
+            self.shared.rec_active = False
+            blocks = self.shared.rec_blocks
+            self.shared.rec_blocks = []
+            sr = int(self.shared.capture_sr)
+        self._rec_btn_idle()
+        if not blocks:
+            return
+        try:
+            rec = np.concatenate(blocks).astype(np.float32)
+        except Exception:
+            return
+        if len(rec) < sr:                     # < 1 s -> nichts Sinnvolles
+            self.status_override = None
+            return
+        self._open_rec_save(rec, sr)
+
+    def _open_rec_save(self, rec, sr):
+        """Speichern-/Pruef-Fenster: Stuecke erkennen, Namen anpassen, als WAV
+        ablegen (einzeln oder alle in einen Ordner; Ordner wird gemerkt)."""
+        self._rec_audio = rec
+        self._rec_sr = sr
+        self._rec_segs = None
+        self._rec_name_vars = []
+        win = tk.Toplevel(self.root)
+        win.title("Aufnahme speichern")
+        win.configure(bg=COL_BG)
+        win.geometry("680x440")
+        win.transient(self.root)
+        self._rec_save_win = win
+        dur = len(rec) / sr
+        tk.Label(win, text="Aufnahme speichern", font=self.f_h1,
+                 bg=COL_BG, fg=COL_FG).pack(pady=(14, 4))
+        self._rec_info = tk.Label(
+            win, text=f"Länge {self._fmt_pos(dur)} · Stück-Grenzen werden gesucht …",
+            font=self.f_small, bg=COL_BG, fg=COL_MUTED)
+        self._rec_info.pack(pady=(0, 8))
+        self._rec_listf = tk.Frame(win, bg=COL_BG)
+        self._rec_listf.pack(fill="both", expand=True, padx=16)
+        bf = tk.Frame(win, bg=COL_BG)
+        bf.pack(fill="x", padx=16, pady=12)
+        self._rec_all_btn = tk.Button(
+            bf, text="Alle speichern …", command=self._save_all_rec,
+            font=self.f_small, bg="#1D9E75", fg="#04342C",
+            activebackground=COL_OK, activeforeground="#04342C", bd=0,
+            padx=18, pady=6, highlightthickness=0, cursor="hand2",
+            state="disabled")
+        self._rec_all_btn.pack(side="left")
+        self._small_button(bf, "Schließen", win.destroy).pack(side="right")
+        threading.Thread(target=self._segment_rec_thread, daemon=True).start()
+        win.after(250, self._poll_rec_segs)
+
+    def _segment_rec_thread(self):
+        rec, sr = self._rec_audio, self._rec_sr
+        try:
+            segs = core.segment_recording(rec, sr, core.MIN_BPM, core.MAX_BPM)
+        except Exception:
+            n = len(rec)
+            segs = [{"start": 0, "end": n, "bpm": 0.0, "key": "",
+                     "key_margin": 0.0, "confident": True, "name": "Aufnahme"}]
+        self._rec_segs = segs
+
+    def _poll_rec_segs(self):
+        if self._rec_save_win is None or not self._rec_save_win.winfo_exists():
+            return
+        if self._rec_segs is None:
+            self._rec_save_win.after(250, self._poll_rec_segs)
+            return
+        self._render_rec_segs()
+
+    def _render_rec_segs(self):
+        segs, sr = self._rec_segs, self._rec_sr
+        self._rec_info.config(
+            text=(f"{len(segs)} Stücke erkannt" if len(segs) > 1 else "ein Stück")
+            + " — Namen anpassen, dann speichern. Unsichere Grenzen sind gedimmt.")
+        self._rec_name_vars = []
+        for idx, seg in enumerate(segs):
+            row = tk.Frame(self._rec_listf, bg=COL_BG)
+            row.pack(fill="x", pady=3)
+            dur = (seg["end"] - seg["start"]) / sr
+            bpm = f"{int(round(seg['bpm']))}" if seg["bpm"] else "–"
+            key = seg["key"] or "?"
+            meta = (f"{idx + 1}. {self._fmt_pos(seg['start'] / sr)}"
+                    f"–{self._fmt_pos(seg['end'] / sr)} · {self._fmt_pos(dur)}"
+                    f" · {bpm} BPM · {key}")
+            fg = COL_FG if seg.get("confident") else COL_MUTED
+            tk.Label(row, text=meta, font=self.f_small, bg=COL_BG, fg=fg,
+                     anchor="w").pack(side="left")
+            var = tk.StringVar(value=seg["name"])
+            self._rec_name_vars.append(var)
+            self._small_button(row, "Speichern",
+                               lambda i=idx: self._save_one_rec(i)).pack(side="right")
+            tk.Entry(row, textvariable=var, font=self.f_small, bg=COL_SURFACE,
+                     fg=COL_FG, width=18, bd=0, insertbackground=COL_FG
+                     ).pack(side="right", padx=(0, 8), ipady=2)
+        self._rec_all_btn.config(state="normal")
+
+    def _save_one_rec(self, idx):
+        seg = self._rec_segs[idx]
+        base = core.sanitize_filename(self._rec_name_vars[idx].get())
+        cfg = load_config()
+        path = filedialog.asksaveasfilename(
+            title="Stück speichern", defaultextension=".wav",
+            initialfile=base + ".wav",
+            initialdir=cfg.get("last_save_dir") or None,
+            filetypes=[("WAV-Audio", "*.wav")])
+        if not path:
+            return
+        try:
+            core.save_wav_slice(self._rec_audio, self._rec_sr,
+                                seg["start"], seg["end"], path)
+            save_config({**cfg, "last_save_dir": os.path.dirname(path)})
+            self._rec_info.config(text=f"Gespeichert: {os.path.basename(path)}")
+        except Exception as e:
+            self._rec_info.config(text=f"Fehler beim Speichern: {e}")
+
+    def _save_all_rec(self):
+        cfg = load_config()
+        d = filedialog.askdirectory(title="Ordner für alle Stücke wählen",
+                                    initialdir=cfg.get("last_save_dir") or None)
+        if not d:
+            return
+        ok = 0
+        for idx, seg in enumerate(self._rec_segs):
+            base = core.sanitize_filename(self._rec_name_vars[idx].get())
+            try:
+                core.save_wav_slice(self._rec_audio, self._rec_sr,
+                                    seg["start"], seg["end"],
+                                    os.path.join(d, base + ".wav"))
+                ok += 1
+            except Exception:
+                pass
+        save_config({**cfg, "last_save_dir": d})
+        self._rec_info.config(
+            text=f"{ok} von {len(self._rec_segs)} Stück(en) im Ordner gespeichert.")
+
     def on_setup_start(self):
         sel = self.lb_in.curselection()
         if not sel or not self.sources:
@@ -892,7 +1073,8 @@ class DisplayApp:
             self.err_label.config(
                 text="BPM-Bereich ungueltig (30 bis 300, von < bis).")
             return
-        save_config({"input_type": kind, "input_name": name,
+        save_config({**load_config(),    # vorhandene Keys (z. B. last_save_dir) erhalten
+                     "input_type": kind, "input_name": name,
                      "midi_output": midi or "",
                      "bpm_dezimal": bool(self.var_dec.get()),
                      "beat_sync": bool(self.var_beat.get()),
@@ -1031,6 +1213,13 @@ class DisplayApp:
         self._session_gen += 1                # laufenden Warmup entwerten
         self._begin_args = None
         self.status_override = None
+        with self.shared.lock:                # laufende Aufnahme verwerfen
+            self.shared.rec_active = False
+            self.shared.rec_blocks = []
+        try:
+            self._rec_btn_idle()
+        except Exception:
+            pass
         if self.file_mode or self.file_player is not None:
             self.stop_file()                  # ggf. Datei-Wiedergabe beenden
         if self.hold:
@@ -1129,6 +1318,12 @@ class DisplayApp:
             level_time = self.shared.level_time
             have = self.shared.have_estimate
             note_disp = self.shared.note_display
+            rec_active = self.shared.rec_active
+
+        # Aufnahme-Knopf: laufende Dauer anzeigen
+        if rec_active:
+            el = int(core.time.perf_counter() - self.rec_start_perf)
+            self.rec_btn.config(text=f"■ Aufnahme {el // 60}:{el % 60:02d}")
 
         age = core.time.perf_counter() - level_time
         if age > 0.3:
