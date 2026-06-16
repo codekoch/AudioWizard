@@ -354,50 +354,37 @@ class DisplayApp:
         self.level_rect = self.level_canvas.create_rectangle(
             0, 0, 0, 14, fill=COL_OK, width=0)
 
+        # Zwei Reihen, damit die Knoepfe auch auf dem 7-Zoll-Display (800 px)
+        # nicht aus dem Bild laufen: oben Live-Analyse + Navigation, unten die
+        # Quellen/Modi (Datei/Aufnahme/DJ).
         btns = tk.Frame(f, bg=COL_BG)
         btns.grid(row=9, column=0, sticky="ew", padx=24, pady=(0, 12))
-        self.hold_btn = tk.Button(btns, text="Analyse anhalten",
-                                  command=self.toggle_hold,
-                                  font=self.f_small, bg=COL_SURFACE,
-                                  fg=COL_FG, activebackground=COL_SURF_HI,
-                                  activeforeground=COL_FG, bd=0, padx=16,
-                                  pady=6, highlightthickness=0, takefocus=0,
-                                  cursor="hand2")
+        row1 = tk.Frame(btns, bg=COL_BG)
+        row1.pack(fill="x")
+        row2 = tk.Frame(btns, bg=COL_BG)
+        row2.pack(fill="x", pady=(8, 0))
+
+        def _ctl(parent, text, cmd):
+            return tk.Button(parent, text=text, command=cmd, font=self.f_small,
+                             bg=COL_SURFACE, fg=COL_FG,
+                             activebackground=COL_SURF_HI,
+                             activeforeground=COL_FG, bd=0, padx=16, pady=6,
+                             highlightthickness=0, takefocus=0, cursor="hand2")
+
+        self.hold_btn = _ctl(row1, "Analyse anhalten", self.toggle_hold)
         self.hold_btn.pack(side="left")
-        self.reset_btn = tk.Button(btns, text="Analyse neu starten",
-                                   command=self.reset_analysis,
-                                   font=self.f_small, bg=COL_SURFACE,
-                                   fg=COL_FG, activebackground=COL_SURF_HI,
-                                   activeforeground=COL_FG, bd=0, padx=16,
-                                   pady=6, highlightthickness=0, takefocus=0,
-                                   cursor="hand2")
+        self.reset_btn = _ctl(row1, "Analyse neu starten", self.reset_analysis)
         self.reset_btn.pack(side="left", padx=(8, 0))
-        self.file_btn = tk.Button(btns, text="Datei …",
-                                  command=self.on_load_file,
-                                  font=self.f_small, bg=COL_SURFACE,
-                                  fg=COL_FG, activebackground=COL_SURF_HI,
-                                  activeforeground=COL_FG, bd=0, padx=16,
-                                  pady=6, highlightthickness=0, takefocus=0,
-                                  cursor="hand2")
-        self.file_btn.pack(side="left", padx=(8, 0))
-        self.rec_btn = tk.Button(btns, text="● Aufnahme",
-                                 command=self.toggle_record,
-                                 font=self.f_small, bg=COL_SURFACE,
-                                 fg=COL_FG, activebackground=COL_SURF_HI,
-                                 activeforeground=COL_FG, bd=0, padx=16,
-                                 pady=6, highlightthickness=0, takefocus=0,
-                                 cursor="hand2")
-        self.rec_btn.pack(side="left", padx=(8, 0))
-        self.dj_btn = tk.Button(btns, text="DJ", command=self.open_dj,
-                                font=self.f_small, bg=COL_SURFACE, fg=COL_FG,
-                                activebackground=COL_SURF_HI,
-                                activeforeground=COL_FG, bd=0, padx=16, pady=6,
-                                highlightthickness=0, takefocus=0,
-                                cursor="hand2")
-        self.dj_btn.pack(side="left", padx=(8, 0))
-        self._small_button(btns, "Beenden", self.quit_app).pack(side="right")
-        self._small_button(btns, "Einstellungen",
+        self._small_button(row1, "Beenden", self.quit_app).pack(side="right")
+        self._small_button(row1, "Einstellungen",
                            self.on_settings).pack(side="right", padx=(0, 8))
+
+        self.file_btn = _ctl(row2, "Datei …", self.on_load_file)
+        self.file_btn.pack(side="left")
+        self.rec_btn = _ctl(row2, "● Aufnahme", self.toggle_record)
+        self.rec_btn.pack(side="left", padx=(8, 0))
+        self.dj_btn = _ctl(row2, "DJ", self.open_dj)
+        self.dj_btn.pack(side="left", padx=(8, 0))
 
     def _small_button(self, parent, text, cmd):
         return tk.Button(parent, text=text, command=cmd, font=self.f_small,
