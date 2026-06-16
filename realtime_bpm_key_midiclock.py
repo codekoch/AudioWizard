@@ -1615,6 +1615,13 @@ NOTE_WIN_MONO    = 2048    # YIN-Analysefenster
 NOTE_WIN_POLY    = 4096    # FFT-Fenster fuer den polyphonen Pfad
 NOTE_BLOCKSIZE   = 512     # kleine Capture-Bloecke -> geringe Latenz (Eingang)
 NOTE_MAX_POLY    = 6       # max. gleichzeitige Noten
+NOTE_SUSTAIN_RMS = 0.0015  # gehaltene Note/Akkord bleibt an, solange Pegel darueber
+NOTE_OFF_FRAMES  = 3       # leise Frames bis Note-Off (mono, entprellt)
+# Akkord-Trigger-Modus (sauberer MIDI-Akkord aus dem Klang, z. B. Gitarre)
+CHORD_TRIG_MIN_SCORE = 0.50   # Mindest-Korrelation Chroma<->Akkord-Schablone
+CHORD_TRIG_MARGIN    = 0.05   # Abstand zum besten Akkord mit anderem Grundton
+CHORD_TRIG_CONFIRM   = 3      # Frames Bestaetigung vor Akkordwechsel
+CHORD_TRIG_OFF_FRAMES = 6     # leise Frames bis Akkord-Off (Akkorde klingen aus)
 
 
 def midi_name(m):
@@ -1671,18 +1678,40 @@ class NoteDetector:
     """Haelt ein rollendes Fenster, erkennt Tonhoehe(n) und meldet die noetigen
     MIDI-Noten-Ereignisse ueber die uebergebene send(status, note, vel)."""
 
-    def __init__(self, sr, poly):
+    def __init__(self, sr, mode):
         self.sr = float(sr)
-        self.poly = poly
-        self.win = NOTE_WIN_POLY if poly else NOTE_WIN_MONO
+        self.mode = mode                       # 'mono' | 'poly' | 'chord'
+        self.poly = (mode == "poly")
+        use_fft = mode in ("poly", "chord")
+        self.win = NOTE_WIN_POLY if use_fft else NOTE_WIN_MONO
         self.buf = np.zeros(self.win, dtype=np.float32)
         self.filled = 0
         self.cur = -1
         self.cand = -1
         self.cand_n = 0
+        self.off_n = 0
         self.active = {}                       # midi -> Frames ohne Beleg
-        self.han = np.hanning(self.win).astype(np.float32) if poly else None
+        self.han = np.hanning(self.win).astype(np.float32) if use_fft else None
         self.display = "—"
+        # Kalibrierbare Parameter (Default = Konstanten; die GUI kann sie setzen).
+        self.silence_rms = NOTE_SILENCE_RMS
+        self.sustain_rms = NOTE_SUSTAIN_RMS
+        self.off_frames = NOTE_OFF_FRAMES
+        self.yin_threshold = YIN_THRESHOLD
+        self.change_frames = 2
+        self.max_poly = NOTE_MAX_POLY
+        # Akkord-Trigger-Zustand
+        self.chord_notes = []
+        self.chord_idx = -1
+        self.chord_cand = -1
+        self.chord_cand_n = 0
+        if mode == "chord":                    # Bin -> Tonklasse (70..1100 Hz)
+            freqs = np.arange(self.win // 2 + 1) * self.sr / self.win
+            self._chroma_pc = np.full(freqs.shape, -1, dtype=np.int64)
+            band = (freqs >= 70.0) & (freqs <= 1100.0)
+            with np.errstate(divide="ignore"):
+                midi = np.round(12 * np.log2(np.where(freqs > 0, freqs, 1.0) / 440.0) + 69)
+            self._chroma_pc[band] = (midi[band].astype(np.int64) % 12)
 
     def push(self, x):
         h = len(x)
@@ -1697,37 +1726,49 @@ class NoteDetector:
     def process(self, level, send):
         if self.filled < self.win:
             return
-        if self.poly:
+        if self.mode == "mono":
+            self._mono(level, send)
+        elif self.mode == "poly":
             self._poly(level, send)
         else:
-            self._mono(level, send)
+            self._chord(level, send)
 
     def _mono(self, level, send):
         note = -1
-        if level > NOTE_SILENCE_RMS:
-            f = yin_pitch(self.buf, self.sr)
+        # Zum HALTEN genuegt ein niedrigerer Pegel (Hysterese) -> ein ausklingender
+        # Ton reisst nicht ab und wird nicht neu getriggert.
+        gate = self.sustain_rms if self.cur != -1 else self.silence_rms
+        if level > gate:
+            f = yin_pitch(self.buf, self.sr, self.yin_threshold)
             if f > 0:
                 m = int(round(69 + 12 * math.log2(f / 440.0)))
                 if NOTE_MIN_MIDI <= m <= NOTE_MAX_MIDI:
                     note = m
+        if note == self.cur and self.cur != -1:        # klar gehalten
+            self.off_n = 0
+            self.cand = -1
+            self.cand_n = 0
+            return
         if note == -1:
-            if self.cur != -1:
-                send(0x80, self.cur, 0)
-                self.cur = -1
+            if self.cur != -1 and level > self.sustain_rms:
+                self.off_n = 0                          # klingt noch -> halten
+            elif self.cur != -1:
+                self.off_n += 1
+                if self.off_n >= self.off_frames:
+                    send(0x80, self.cur, 0)
+                    self.cur = -1
+                    self.off_n = 0
+                    self.display = "—"
             self.cand = -1
             self.cand_n = 0
-            self.display = "—"
             return
-        if note == self.cur:
-            self.cand = -1
-            self.cand_n = 0
-            return
+        self.off_n = 0
         if note == self.cand:
             self.cand_n += 1
         else:
             self.cand = note
             self.cand_n = 1
-        need = 1 if self.cur == -1 else 2      # aus Stille sofort, Wechsel entprellen
+        need = 1 if self.cur == -1 else self.change_frames
         if self.cand_n >= need:
             if self.cur != -1:
                 send(0x80, self.cur, 0)
@@ -1737,9 +1778,96 @@ class NoteDetector:
             self.cand_n = 0
             self.display = midi_name(note)
 
+    def _chord(self, level, send):
+        # Akkord aus dem Chroma (FFT-Magnitude in 12 Tonklassen, 70..1100 Hz) mit
+        # den vorhandenen Akkord-Schablonen erkennen; Fehltoene fallen weg, der
+        # Akkord wird als sauberes Voicing gesendet und GEHALTEN.
+        gate = self.sustain_rms if self.chord_idx != -1 else self.silence_rms
+        if level <= gate:
+            if self.chord_idx != -1:
+                self.off_n += 1
+                if self.off_n >= CHORD_TRIG_OFF_FRAMES:
+                    self._chord_off(send)
+            self.chord_cand = -1
+            self.chord_cand_n = 0
+            return
+        self.off_n = 0
+        mag = np.abs(np.fft.rfft(self.buf * self.han))
+        chroma = np.zeros(12)
+        pc = self._chroma_pc
+        valid = pc >= 0
+        np.add.at(chroma, pc[valid], mag[valid])
+        scores = chord_scores(chroma)
+        if scores is None:
+            self.chord_cand = -1
+            self.chord_cand_n = 0
+            return
+        nt = len(CHORD_TYPES)
+        order = np.argsort(scores)[::-1]
+        best = int(order[0])
+        best_score = float(scores[best])
+        best_root = best // nt
+        second = -1.0
+        for k in order[1:]:                            # bester mit ANDEREM Grundton
+            if int(k) // nt != best_root:
+                second = float(scores[int(k)])
+                break
+        if best_score < CHORD_TRIG_MIN_SCORE or (best_score - second) < CHORD_TRIG_MARGIN:
+            self.chord_cand = -1
+            self.chord_cand_n = 0
+            return
+        if best == self.chord_idx:                     # gleicher Akkord -> halten
+            self.chord_cand = -1
+            self.chord_cand_n = 0
+            return
+        if best == self.chord_cand:
+            self.chord_cand_n += 1
+        else:
+            self.chord_cand = best
+            self.chord_cand_n = 1
+        need = 1 if self.chord_idx == -1 else CHORD_TRIG_CONFIRM
+        if self.chord_cand_n >= need:
+            self._chord_off(send)
+            notes = self._chord_voicing(best)
+            vel = vel_from_level(level)
+            for m in notes:
+                send(0x90, m, vel)
+            self.chord_notes = notes
+            self.chord_idx = best
+            self.chord_cand = -1
+            self.chord_cand_n = 0
+            self.display = CHORD_NAMES[best] + "  " + " ".join(midi_name(m) for m in notes)
+
+    def _chord_voicing(self, idx):
+        nt = len(CHORD_TYPES)
+        root = idx // nt
+        ivs = sorted(CHORD_TYPES[idx % nt][1].keys())
+        base = 48                                       # Register-Anker (C3)
+        root_midi = root + 12 * int(round((base - root) / 12.0))
+        if root_midi > base:
+            root_midi -= 12
+        while root_midi < NOTE_MIN_MIDI:
+            root_midi += 12
+        out = []
+        for iv in ivs:
+            m = root_midi + iv
+            while m > NOTE_MAX_MIDI:
+                m -= 12
+            if m not in out:
+                out.append(m)
+        return sorted(out)
+
+    def _chord_off(self, send):
+        for m in self.chord_notes:
+            send(0x80, m, 0)
+        self.chord_notes = []
+        self.chord_idx = -1
+        self.off_n = 0
+        self.display = "—"
+
     def _poly(self, level, send):
         detected = set()
-        if level > NOTE_SILENCE_RMS:
+        if level > self.silence_rms:
             mag = np.abs(np.fft.rfft(self.buf * self.han))
             mx = float(mag.max()) if mag.size else 0.0
             if mx > 0:
@@ -1757,7 +1885,7 @@ class NoteDetector:
                 peaks.sort(reverse=True)
                 accepted = []
                 for _b, freq in peaks:
-                    if len(accepted) >= NOTE_MAX_POLY:
+                    if len(accepted) >= self.max_poly:
                         break
                     if freq <= 0:
                         continue
@@ -1797,15 +1925,24 @@ class NoteDetector:
         for m in list(self.active):
             send(0x80, m, 0)
         self.active.clear()
+        for m in self.chord_notes:
+            send(0x80, m, 0)
+        self.chord_notes = []
+        self.chord_idx = -1
         self.display = "—"
 
 
-def note_worker(shared, audio_q, midi_out, stop_event, poly):
+def note_worker(shared, audio_q, midi_out, stop_event, mode, calib=None):
     """Verbraucht die Capture-Bloecke (wie der Analyse-Worker) und sendet
-    erkannte Tonhoehen als MIDI-Noten -- ohne die teure Tempo-/Tonart-Analyse."""
+    erkannte Tonhoehen/Akkorde als MIDI -- ohne die teure Tempo-/Tonart-Analyse.
+    mode: 'mono' | 'poly' | 'chord'. calib: optionales dict mit Tracking-Parametern."""
     with shared.lock:
         sr = shared.capture_sr
-    det = NoteDetector(sr, poly)
+    det = NoteDetector(sr, mode)
+    if calib:
+        for k, v in calib.items():
+            if hasattr(det, k):
+                setattr(det, k, v)
 
     def send(status, note, vel):
         if midi_out is None:
@@ -2645,7 +2782,7 @@ def main():
         if note_mode:
             note_thread = threading.Thread(
                 target=note_worker,
-                args=(shared, audio_q, midi_out, stop_event, poly), daemon=True)
+                args=(shared, audio_q, midi_out, stop_event, run_mode), daemon=True)
             note_thread.start()
         else:
             analysis_thread = threading.Thread(

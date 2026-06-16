@@ -80,7 +80,8 @@ CONFIG_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)),
 # Betriebsart: Tempo/Clock oder Noten-Modus (Pitch -> MIDI)
 MODE_LABELS = {"clock": "Tempo & MIDI-Clock",
                "mono": "Noten → MIDI (monophon)",
-               "poly": "Noten → MIDI (polyphon)"}
+               "poly": "Noten → MIDI (polyphon)",
+               "chord": "Noten → MIDI (Akkorde)"}
 MODE_FROM_LABEL = {v: k for k, v in MODE_LABELS.items()}
 
 # Farbschema (dunkles Kiosk-Display)
@@ -625,6 +626,34 @@ class DisplayApp:
                 return              # noch nichts zu halten
         self._set_hold(not self.hold)
 
+    def note_calib(self):
+        """Tracking-Parameter fuer den Noten-/Akkord-Worker aus der Konfiguration
+        (mit sinnvollen Vorgaben). dB-Schwellen werden in RMS umgerechnet."""
+        cfg = load_config()
+
+        def db2rms(db):
+            try:
+                return 10.0 ** (float(db) / 20.0)
+            except (TypeError, ValueError):
+                return None
+        c = {}
+        sil = db2rms(cfg.get("note_silence_db", -48))
+        sus = db2rms(cfg.get("note_sustain_db", -56))
+        if sil:
+            c["silence_rms"] = sil
+        if sus:
+            c["sustain_rms"] = sus
+        for key, attr in (("note_off_frames", "off_frames"),
+                          ("note_change_frames", "change_frames"),
+                          ("note_max_poly", "max_poly")):
+            v = cfg.get(key)
+            if isinstance(v, (int, float)):
+                c[attr] = int(v)
+        y = cfg.get("yin_threshold")
+        if isinstance(y, (int, float)):
+            c["yin_threshold"] = float(y)
+        return c
+
     def reset_analysis(self):
         """Analyse von vorn beginnen, z. B. wenn ein Songwechsel ohne
         Pause die Historie mit dem alten Stueck gefuellt hat: der Worker
@@ -740,7 +769,6 @@ class DisplayApp:
         core.drain_queue(self.audio_q)
 
         note_mode = self.opt_note_mode != "clock"
-        poly = self.opt_note_mode == "poly"
         cap_bs = core.NOTE_BLOCKSIZE if note_mode else core.AUDIO_BLOCKSIZE
 
         try:
@@ -773,7 +801,7 @@ class DisplayApp:
             self.note_thread = threading.Thread(
                 target=core.note_worker,
                 args=(self.shared, self.audio_q, self.midi_out, self.note_stop,
-                      poly), daemon=True)
+                      self.opt_note_mode, self.note_calib()), daemon=True)
             self.note_thread.start()
         else:
             self.clock_stop = threading.Event()
@@ -889,7 +917,8 @@ class DisplayApp:
             # Noten-Modus: aktuelle Note(n) in mittlerer Schrift; mehrere
             # Namen passen sonst nicht in die BPM-Riesenschrift.
             self.bpm_cap_label.config(
-                text="NOTEN" if self.opt_note_mode == "poly" else "NOTE")
+                text="AKKORD" if self.opt_note_mode == "chord"
+                else "NOTEN" if self.opt_note_mode == "poly" else "NOTE")
             if self._bpm_big:
                 self.bpm_label.config(font=self.f_key)
                 self._bpm_big = False

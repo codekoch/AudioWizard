@@ -38,12 +38,15 @@ Eingänge; unter macOS leistet das ein virtuelles Ausgabegerät wie
   **beat-synchron**: Tick 1 von 24 rastet auf die erkannte Zählzeit ein
   (sanfte Phasenregelung, gemessen ~1–2 ms Streuung).
 - **Noten-Modus (Pitch → MIDI)** (optional) – statt der Tempo-Analyse werden
-  erkannte Tonhöhen direkt als MIDI-Noten an den gewählten Ausgang gesendet:
-  **monophon** (YIN, geringe Latenz, für Gesang/Bass/Lead/einzelnes
-  Instrument) oder **polyphon** (FFT-Peaks mit Oberton-Unterdrückung). In
-  diesem Modus laufen die teuren Analyseschritte (HPSS/Chroma/Tempo/Clock)
-  bewusst nicht mit – für möglichst geringe Latenz. In Konsole und GUI
-  wählbar; auch in der Webversion vorhanden.
+  erkannte Tonhöhen direkt als MIDI gesendet: **monophon** (YIN, geringe Latenz,
+  mit Halte-Hysterese gegen Neutrigger beim Ausklingen), **polyphon** (FFT-Peaks
+  mit Oberton-Unterdrückung) oder **Akkorde** – aus dem Klang (z. B. Gitarre)
+  wird der wahrscheinlichste Akkord erkannt und als sauberes MIDI-Voicing
+  gesendet, Fehltöne fallen weg. In diesem Modus laufen die teuren
+  Analyseschritte (HPSS/Chroma/Tempo/Clock) bewusst nicht mit – für möglichst
+  geringe Latenz. Tracking-Parameter (Schwellen, YIN-Strenge, Entprellung) sind
+  über die Konfiguration kalibrierbar. In Konsole und GUI wählbar; auch in der
+  Webversion vorhanden.
 - **Zwei Oberflächen** – Konsolen-Version (`realtime_bpm_key_midiclock.py`)
   und Touch-taugliche Kiosk-GUI (`bpm_key_display.py`) für ein 7-Zoll-Display
   am Raspberry Pi; unter Windows und macOS läuft sie im Fenster.
