@@ -44,9 +44,10 @@ Eingänge; unter macOS leistet das ein virtuelles Ausgabegerät wie
   wird der wahrscheinlichste Akkord erkannt und als sauberes MIDI-Voicing
   gesendet, Fehltöne fallen weg. In diesem Modus laufen die teuren
   Analyseschritte (HPSS/Chroma/Tempo/Clock) bewusst nicht mit – für möglichst
-  geringe Latenz. Tracking-Parameter (Schwellen, YIN-Strenge, Entprellung) sind
-  über die Konfiguration kalibrierbar. In Konsole und GUI wählbar; auch in der
-  Webversion vorhanden.
+  geringe Latenz. Tracking-Parameter (Schwellen, YIN-Strenge, Entprellung,
+  Polyphonie) sind kalibrierbar – in der GUI über „Noten-Kalibrierung …" im
+  Einstellungsbildschirm (Slider), sonst über die Konfiguration. In Konsole und
+  GUI wählbar; auch in der Webversion vorhanden.
 - **Datei-Modus (Datei → MIDI-Clock, driftfrei)** (optional) – eine Audiodatei
   wird einmal vorab zu einer Beat-Map analysiert (globales Tempo → Beat-Tracker
   mit lokaler Periodenkurve, dadurch Erkennung von **konstantem vs. variablem**

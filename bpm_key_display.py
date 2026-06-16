@@ -513,6 +513,8 @@ class DisplayApp:
                  fg=COL_MUTED).pack(anchor="w")
         tk.Label(left, text="codekoch / claude", font=self.f_tiny,
                  bg=COL_BG, fg="#55544E").pack(anchor="w", pady=(2, 0))
+        self._small_button(bottom, "Noten-Kalibrierung …",
+                           self.open_note_calib).pack(side="left", padx=(16, 0))
         tk.Button(bottom, text="Start", command=self.on_setup_start,
                   font=self.f_btn, bg="#1D9E75", fg="#04342C",
                   activebackground=COL_OK, activeforeground="#04342C",
@@ -1354,6 +1356,74 @@ class DisplayApp:
     def _dj_close(self):
         self._dj_teardown()
         self.show_setup()
+
+    # ------------------------------------------------------------------
+    # Noten-Kalibrierung (Slider): Tracking-Parameter der Noten-/Akkord-Modi
+    # ------------------------------------------------------------------
+    _CALIB_DEFAULTS = {"note_silence_db": -48, "note_sustain_db": -56,
+                       "note_off_frames": 3, "note_change_frames": 2,
+                       "note_max_poly": 6, "yin_threshold": 0.15}
+    _CALIB_INT = ("note_off_frames", "note_change_frames", "note_max_poly")
+
+    def open_note_calib(self):
+        """Slider-Fenster für die Tracking-Parameter der Noten-/Akkord-Modi.
+        Die Werte landen in der Konfiguration und wirken beim nächsten Start
+        des Noten-/Akkord-Modus (note_calib() liest sie in _begin)."""
+        cfg = load_config()
+        win = tk.Toplevel(self.root)
+        win.title("Noten-Kalibrierung")
+        win.configure(bg=COL_BG)
+        win.geometry("470x430")
+        win.transient(self.root)
+        tk.Label(win, text="Noten-Kalibrierung", font=self.f_h1, bg=COL_BG,
+                 fg=COL_FG).pack(pady=(12, 2))
+        tk.Label(win, text="Für die Noten-/Akkord-Modi · wirkt beim nächsten Start",
+                 font=self.f_tiny, bg=COL_BG, fg=COL_MUTED).pack(pady=(0, 8))
+        body = tk.Frame(win, bg=COL_BG)
+        body.pack(fill="both", expand=True, padx=20)
+        self._calib_vars = {}
+
+        def row(key, label, frm, to, res):
+            f = tk.Frame(body, bg=COL_BG)
+            f.pack(fill="x", pady=4)
+            tk.Label(f, text=label, font=self.f_small, bg=COL_BG, fg=COL_FG,
+                     width=24, anchor="w").pack(side="left")
+            v = tk.DoubleVar(value=float(cfg.get(key, self._CALIB_DEFAULTS[key])))
+            self._calib_vars[key] = v
+            tk.Scale(f, from_=frm, to=to, orient="horizontal", resolution=res,
+                     variable=v, bg=COL_BG, fg=COL_FG, troughcolor=COL_SURFACE,
+                     highlightthickness=0, bd=0, length=200,
+                     activebackground=COL_OK).pack(side="right")
+
+        row("note_silence_db", "Stille-Schwelle (dB)", -70, -30, 1)
+        row("note_sustain_db", "Halte-Schwelle (dB)", -75, -40, 1)
+        row("note_off_frames", "Note-Off-Frames", 1, 10, 1)
+        row("note_change_frames", "Wechsel-Frames", 1, 6, 1)
+        row("note_max_poly", "Max. Polyphonie", 1, 8, 1)
+        row("yin_threshold", "YIN-Strenge (klein = streng)", 0.05, 0.40, 0.01)
+
+        bf = tk.Frame(win, bg=COL_BG)
+        bf.pack(fill="x", padx=16, pady=12)
+        tk.Button(bf, text="Speichern", command=lambda: self._save_calib(win),
+                  font=self.f_small, bg="#1D9E75", fg="#04342C",
+                  activebackground=COL_OK, activeforeground="#04342C", bd=0,
+                  padx=18, pady=6, highlightthickness=0,
+                  cursor="hand2").pack(side="right")
+        self._small_button(bf, "Abbrechen", win.destroy).pack(side="right",
+                                                              padx=(0, 8))
+        self._small_button(bf, "Standardwerte", self._reset_calib).pack(side="left")
+
+    def _save_calib(self, win):
+        cfg = load_config()
+        for k, v in self._calib_vars.items():
+            val = v.get()
+            cfg[k] = int(round(val)) if k in self._CALIB_INT else round(val, 2)
+        save_config(cfg)
+        win.destroy()
+
+    def _reset_calib(self):
+        for k, v in self._calib_vars.items():
+            v.set(self._CALIB_DEFAULTS[k])
 
     def on_setup_start(self):
         sel = self.lb_in.curselection()
