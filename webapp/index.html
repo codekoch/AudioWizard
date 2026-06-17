@@ -367,6 +367,7 @@ main.djmode .sv { display: none !important; }   /* Einzeltrack-Anzeige im DJ-Mod
         <div class="deckbtns">
           <button class="ghost" id="djFileA">Datei A…</button>
           <button class="ghost" id="djPlayA" disabled>▶</button>
+          <button class="ghost" id="djSyncA" disabled title="auf das Tempo des anderen Decks einrasten (tonhöhen-erhaltend)">Sync</button>
         </div>
         <div class="deckeq"><span class="eqlbl">EQ</span>
           <button class="ghost eqbtn" data-deck="0" data-band="0">Bass</button>
@@ -389,6 +390,7 @@ main.djmode .sv { display: none !important; }   /* Einzeltrack-Anzeige im DJ-Mod
         <div class="deckbtns">
           <button class="ghost" id="djFileB">Datei B…</button>
           <button class="ghost" id="djPlayB" disabled>▶</button>
+          <button class="ghost" id="djSyncB" disabled title="auf das Tempo des anderen Decks einrasten (tonhöhen-erhaltend)">Sync</button>
         </div>
         <div class="deckeq"><span class="eqlbl">EQ</span>
           <button class="ghost eqbtn" data-deck="1" data-band="0">Bass</button>
@@ -1309,7 +1311,9 @@ function djDeckState() {
     source: null, gain: null, analyser: null, timeBuf: null,
     startCtxTime: 0, nextTickIdx: 0, playing: false,
     eq: [false, false, false], eqLo: null, eqMid: null, eqHi: null,  // EQ-Isolator
-    bpmEl: null, keyEl: null, posEl: null, lvlBar: null, nameEl: null, playBtn: null, deckEl: null };
+    origBuffer: null, origTicks: null, origBeats: null, nativeBpm: 0,  // Tempo-Sync
+    synced: false, syncRatio: 1, syncPending: false,
+    bpmEl: null, keyEl: null, posEl: null, lvlBar: null, nameEl: null, playBtn: null, syncBtn: null, deckEl: null };
 }
 const DJ_EQ_KILL_DB = -40;
 
@@ -1380,9 +1384,9 @@ const elDjPanel = $('djPanel'), elDjCross = $('djCross'), elDjClock = $('djClock
 const elDjToA = $('djToA'), elDjToB = $('djToB'), elDjFileInA = $('djFileInA'), elDjFileInB = $('djFileInB');
 // Deck-Elemente in die djDecks-Struktur haengen
 djDecks[0].bpmEl = $('djBpmA'); djDecks[0].keyEl = $('djKeyA'); djDecks[0].posEl = $('djPosA');
-djDecks[0].lvlBar = $('djLvlA'); djDecks[0].nameEl = $('djNameA'); djDecks[0].playBtn = $('djPlayA'); djDecks[0].deckEl = $('djDeckA');
+djDecks[0].lvlBar = $('djLvlA'); djDecks[0].nameEl = $('djNameA'); djDecks[0].playBtn = $('djPlayA'); djDecks[0].syncBtn = $('djSyncA'); djDecks[0].deckEl = $('djDeckA');
 djDecks[1].bpmEl = $('djBpmB'); djDecks[1].keyEl = $('djKeyB'); djDecks[1].posEl = $('djPosB');
-djDecks[1].lvlBar = $('djLvlB'); djDecks[1].nameEl = $('djNameB'); djDecks[1].playBtn = $('djPlayB'); djDecks[1].deckEl = $('djDeckB');
+djDecks[1].lvlBar = $('djLvlB'); djDecks[1].nameEl = $('djNameB'); djDecks[1].playBtn = $('djPlayB'); djDecks[1].syncBtn = $('djSyncB'); djDecks[1].deckEl = $('djDeckB');
 const elCalibField = $('calibField'), elCalibToggle = $('calibToggle'), elCalibPanel = $('calibPanel');
 const elCalibReset = $('calibReset'), elCalibNote = $('calibNote');
 const cLat = $('cLatency'), cLatV = $('cLatencyV'), cSil = $('cSilence'), cSilV = $('cSilenceV');
@@ -2747,6 +2751,51 @@ function resetFileMode() {
 // (getOutputTimestamp -> driftfrei). Beim Faden uebernimmt die Clock das andere
 // Deck. Beide Decks koennen gleichzeitig laufen (echtes Crossfaden).
 // ===========================================================================
+// Tonhoehen-erhaltende Zeitdehnung (Phase-Vocoder, offline). rate>1 -> kuerzer/
+// schneller (hoeheres Tempo), Tonhoehe bleibt erhalten. Laeuft asynchron mit
+// Yields, damit die Oberflaeche nicht einfriert. Liefert einen neuen AudioBuffer.
+async function pvTimeStretch(ctx, buffer, rate, onProgress) {
+  if (Math.abs(rate - 1) < 1e-3) return buffer;
+  const sr = buffer.sampleRate, nCh = buffer.numberOfChannels;
+  const N = 2048, Ha = 512, Hs = Math.max(1, Math.round(Ha / rate));
+  const win = new Float32Array(N);
+  for (let i = 0; i < N; i++) win[i] = 0.5 - 0.5 * Math.cos(2 * Math.PI * i / (N - 1));
+  const inLen = buffer.length;
+  const nFrames = Math.max(1, Math.floor((inLen - N) / Ha) + 1);
+  const outLen = Math.floor((nFrames - 1) * Hs) + N + 1;
+  const fft = new FFT(N);
+  const out = ctx.createBuffer(nCh, outLen, sr);
+  const re = new Float32Array(N), im = new Float32Array(N);
+  const expct = 2 * Math.PI * Ha / N;
+  for (let c = 0; c < nCh; c++) {
+    const x = buffer.getChannelData(c), y = out.getChannelData(c);
+    const norm = new Float32Array(outLen);
+    const lastPhase = new Float32Array(N / 2 + 1), sumPhase = new Float32Array(N / 2 + 1);
+    let outPos = 0;
+    for (let f = 0; f < nFrames; f++) {
+      const inOff = f * Ha;
+      for (let i = 0; i < N; i++) { const s = inOff + i; re[i] = (s < inLen ? x[s] : 0) * win[i]; im[i] = 0; }
+      fft.transform(re, im);
+      for (let k = 0; k <= N / 2; k++) {
+        const mag = Math.hypot(re[k], im[k]);
+        const phase = Math.atan2(im[k], re[k]);
+        let dphi = phase - lastPhase[k] - k * expct; lastPhase[k] = phase;
+        dphi = ((dphi + Math.PI) % (2 * Math.PI) + 2 * Math.PI) % (2 * Math.PI) - Math.PI;
+        sumPhase[k] += (k * expct + dphi) * (Hs / Ha);
+        re[k] = mag * Math.cos(sumPhase[k]); im[k] = mag * Math.sin(sumPhase[k]);
+      }
+      for (let k = 1; k < N / 2; k++) { re[N - k] = re[k]; im[N - k] = -im[k]; }   // Hermitesch
+      for (let k = 0; k < N; k++) im[k] = -im[k];                                  // inverse per Konjugation
+      fft.transform(re, im);
+      for (let i = 0; i < N; i++) { const o = outPos + i; if (o < outLen) { y[o] += (re[i] / N) * win[i]; norm[o] += win[i] * win[i]; } }
+      outPos += Hs;
+      if ((f & 255) === 0) { if (onProgress) onProgress(f / nFrames); await new Promise(r => setTimeout(r, 0)); }
+    }
+    for (let i = 0; i < outLen; i++) if (norm[i] > 1e-6) y[i] /= norm[i];
+  }
+  return out;
+}
+
 function djEnsureCtx() {
   if (!djCtx) { try { djCtx = new (window.AudioContext || window.webkitAudioContext)(); } catch (e) {} }
   return djCtx;
@@ -2774,14 +2823,21 @@ async function djLoad(deckIdx, file) {
   d.beats = (res && res.beats) ? res.beats : null;
   d.ticks = (res && res.beats && res.beats.length >= 2) ? buildTickTimes(res.beats, buf.duration) : null;
   d.tempoInfo = res; d.key = key ? key.name : '';
+  // Originale fuer Tempo-Sync merken; Sync zuruecksetzen
+  d.origBuffer = buf; d.origBeats = d.beats; d.origTicks = d.ticks;
+  d.nativeBpm = res ? res.bpm : 0;
+  d.synced = false; d.syncRatio = 1; d.syncPending = false;
   d.playBtn.disabled = false;
-  djUpdateDeckStatic(deckIdx);
+  if (d.syncBtn) d.syncBtn.disabled = false;
+  djUpdateDeckStatic(deckIdx); djUpdateSyncBtn(deckIdx);
   setHint('Deck ' + djDeckLetter(deckIdx) + ': ' + (res ? Math.round(res.bpm) + ' BPM' : 'kein klares Tempo')
         + (key ? ' · ' + key.name : '') + '. ▶ zum Abspielen, dann faden.');
 }
 function djUpdateDeckStatic(i) {
   const d = djDecks[i];
-  const bpm = d.tempoInfo ? Math.round(d.tempoInfo.bpm) : 0;
+  const eff = (d.synced && djDecks[1 - i].nativeBpm) ? djDecks[1 - i].nativeBpm
+            : (d.tempoInfo ? d.tempoInfo.bpm : 0);
+  const bpm = eff ? Math.round(eff) : 0;
   d.bpmEl.textContent = bpm ? String(bpm) : '—';
   d.bpmEl.classList.toggle('idle', !bpm);
   d.keyEl.textContent = d.key || '';
@@ -2849,6 +2905,75 @@ function djToggleEq(deckIdx, band, btn) {
   d.eq[band] = !d.eq[band];
   if (btn) btn.classList.toggle('kill', d.eq[band]);
   djApplyEq(deckIdx);
+}
+// --- Tempo-Sync: Deck tonhoehen-erhaltend aufs Tempo des anderen Decks ---
+function djUpdateSyncBtn(i) {
+  const d = djDecks[i];
+  if (!d.syncBtn) return;
+  d.syncBtn.classList.toggle('on', d.synced && !d.syncPending);
+  d.syncBtn.textContent = d.syncPending ? 'synct…' : (d.synced ? 'Sync ✓' : 'Sync');
+  if (d.tempoInfo && d.bpmEl) {
+    const m = djDecks[1 - i];
+    const eff = (d.synced && m.nativeBpm) ? m.nativeBpm : d.nativeBpm;
+    if (eff) { d.bpmEl.textContent = String(Math.round(eff)); d.bpmEl.classList.remove('idle'); }
+  }
+}
+function djPhaseAlign(deckIdx, offS) {
+  const d = djDecks[deckIdx], m = djDecks[1 - deckIdx];
+  if (!djCtx || !m.playing || !m.tempoInfo || !d.beats || d.beats.length < 2 || !m.beats || m.beats.length < 2) return offS;
+  const P = 60 / m.tempoInfo.bpm;
+  const mPos = djCtx.currentTime - m.startCtxTime;
+  const ph = (p, b0) => (((p - b0) / P) % 1 + 1) % 1;
+  let dphi = ph(mPos, m.beats[0]) - ph(offS, d.beats[0]);
+  dphi = ((dphi + 0.5) % 1 + 1) % 1 - 0.5;          // auf [-0.5, 0.5) Beats
+  return Math.max(0, offS + dphi * P);
+}
+function djRestartSource(deckIdx, offset) {
+  const d = djDecks[deckIdx];
+  if (!d.eqLo) return;                               // EQ-Kette existiert nur, wenn gespielt wird
+  if (d.source) { try { d.source.onended = null; d.source.stop(); } catch (e) {} try { d.source.disconnect(); } catch (e) {} }
+  d.source = djCtx.createBufferSource(); d.source.buffer = d.buffer;
+  d.source.connect(d.eqLo);                          // bestehende EQ->Gain->Ausgabe-Kette weiternutzen
+  const startAt = djCtx.currentTime + 0.03;
+  d.startCtxTime = startAt - offset;
+  let lo = 0, hi = d.ticks ? d.ticks.length : 0;
+  while (lo < hi) { const mid = (lo + hi) >> 1; if (d.ticks[mid] < offset) lo = mid + 1; else hi = mid; }
+  d.nextTickIdx = lo;
+  d.source.onended = () => { if (d.playing) djStop(deckIdx); };
+  try { d.source.start(startAt, Math.max(0, offset)); } catch (e) {}
+}
+async function djSyncSet(deckIdx, on) {
+  const d = djDecks[deckIdx], m = djDecks[1 - deckIdx];
+  if (on) {
+    if (!d.origBuffer || !d.nativeBpm || !m.nativeBpm) { setHint('Sync braucht zwei geladene Decks mit Tempo.', true); return; }
+    const r = m.nativeBpm / d.nativeBpm;
+    d.syncPending = true; djUpdateSyncBtn(deckIdx);
+    let stretched;
+    try { stretched = await pvTimeStretch(djCtx, d.origBuffer, r); }
+    catch (e) { d.syncPending = false; djUpdateSyncBtn(deckIdx); setHint('Sync fehlgeschlagen: ' + e.message, true); return; }
+    if (!d.syncPending) return;                       // inzwischen abgebrochen
+    const wasPlaying = d.playing;
+    const posOrig = wasPlaying ? Math.max(0, djCtx.currentTime - d.startCtxTime) : 0;
+    d.buffer = stretched;
+    d.beats = d.origBeats ? Float64Array.from(d.origBeats, t => t / r) : null;
+    d.ticks = d.origTicks ? Float64Array.from(d.origTicks, t => t / r) : null;
+    d.synced = true; d.syncRatio = r; d.syncPending = false;
+    let offS = posOrig / r;
+    offS = djPhaseAlign(deckIdx, offS);
+    if (wasPlaying) djRestartSource(deckIdx, offS);
+    djUpdateSyncBtn(deckIdx);
+    setHint('Deck ' + djDeckLetter(deckIdx) + ' synct auf ' + Math.round(m.nativeBpm) + ' BPM (tonhöhen-erhaltend).');
+  } else {
+    d.syncPending = false;
+    if (!d.synced) { djUpdateSyncBtn(deckIdx); return; }
+    const wasPlaying = d.playing;
+    const posS = wasPlaying ? Math.max(0, djCtx.currentTime - d.startCtxTime) : 0;
+    d.buffer = d.origBuffer; d.beats = d.origBeats; d.ticks = d.origTicks;
+    const offO = posS * d.syncRatio;
+    d.synced = false; d.syncRatio = 1;
+    if (wasPlaying) djRestartSource(deckIdx, offO);
+    djUpdateSyncBtn(deckIdx);
+  }
 }
 function djFadeTo(deckIdx) {
   const d = djDecks[deckIdx];
@@ -2920,6 +3045,9 @@ function djTeardown() {
     const d = djDecks[i];
     d.buffer = null; d.ticks = null; d.beats = null; d.tempoInfo = null; d.key = '';
     d.eq = [false, false, false];
+    d.origBuffer = null; d.origTicks = null; d.origBeats = null; d.nativeBpm = 0;
+    d.synced = false; d.syncRatio = 1; d.syncPending = false;
+    if (d.syncBtn) { d.syncBtn.disabled = true; d.syncBtn.classList.remove('on'); d.syncBtn.textContent = 'Sync'; }
     if (d.nameEl) d.nameEl.textContent = 'keine Datei';
     if (d.bpmEl) { d.bpmEl.textContent = '—'; d.bpmEl.classList.add('idle'); }
     if (d.keyEl) d.keyEl.textContent = '';
@@ -3242,6 +3370,8 @@ elDjToB.addEventListener('click', () => djFadeTo(1));
 document.querySelectorAll('.eqbtn').forEach(b => b.addEventListener('click', (e) => {
   e.stopPropagation(); djToggleEq(+b.dataset.deck, +b.dataset.band, b);
 }));
+$('djSyncA').addEventListener('click', () => djSyncSet(0, !djDecks[0].synced && !djDecks[0].syncPending));
+$('djSyncB').addEventListener('click', () => djSyncSet(1, !djDecks[1].synced && !djDecks[1].syncPending));
 elDjCross.addEventListener('input', () => { djCross = djCrossTarget = (+elDjCross.value) / 100; djApplyCross(); });
 djDecks[0].deckEl.addEventListener('click', () => djFadeTo(0));
 djDecks[1].deckEl.addEventListener('click', () => djFadeTo(1));

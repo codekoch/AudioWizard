@@ -73,7 +73,11 @@ Eingänge; unter macOS leistet das ein virtuelles Ausgabegerät wie
   in der Konsole über `--dj DATEI_A DATEI_B` (Tasten `a`/`b` zum Überblenden).
   Mirror der Webversion. Je Deck gibt es zusätzlich einen **EQ-Isolator**
   (Bass/Mitte/Höhen einzeln stummschalten – echtzeitfähige Frequenzfilterung als
-  schlanker Stem-Ersatz, kein echtes Trennen einzelner Instrumente).
+  schlanker Stem-Ersatz, kein echtes Trennen einzelner Instrumente) und einen
+  **Tempo-Sync** („Sync"): das Deck rastet **tonhöhen-erhaltend** auf das Tempo
+  des anderen Decks ein (Beat-Phasen-Ausrichtung; die MIDI-Clock bleibt beim
+  Überblenden konstant). Die Zeitdehnung wird vorab berechnet (Phase-Vocoder) –
+  bewusst offline statt in Echtzeit, damit es auch auf dem Raspberry Pi läuft.
 - **Zwei Oberflächen** – Konsolen-Version (`realtime_bpm_key_midiclock.py`)
   und Touch-taugliche Kiosk-GUI (`bpm_key_display.py`) für ein 7-Zoll-Display
   am Raspberry Pi; unter Windows und macOS läuft sie im Fenster.
