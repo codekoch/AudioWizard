@@ -2858,6 +2858,22 @@ def _rbj_biquad(kind, f0, db, q, sr):
     return [b0 / a0, b1 / a0, b2 / a0, 1.0, a1 / a0, a2 / a0]
 
 
+def _time_stretch_stereo(audio, rate):
+    """Tonhoehen-erhaltende Zeitdehnung eines (frames[,ch])-Puffers um 'rate'
+    (>1 = schneller/kuerzer = hoeheres Tempo), pro Kanal via librosa-Phase-
+    Vocoder. Tonhoehe bleibt erhalten (anders als reines Resampling)."""
+    a = np.asarray(audio, dtype=np.float32)
+    if a.ndim == 1:
+        a = a.reshape(-1, 1)
+    if abs(rate - 1.0) < 1e-4:
+        return np.ascontiguousarray(a, dtype=np.float32)
+    chans = [librosa.effects.time_stretch(np.ascontiguousarray(a[:, c]), rate=rate)
+             for c in range(a.shape[1])]
+    n = min(len(c) for c in chans)
+    return np.ascontiguousarray(np.column_stack([c[:n] for c in chans]),
+                                dtype=np.float32)
+
+
 def _dj_eq_sos(low_db, mid_db, high_db, sr=DJ_SR):
     """sos-Kaskade fuer den 3-Band-EQ; None, wenn alle Baender neutral (0 dB)."""
     if abs(low_db) < 0.01 and abs(mid_db) < 0.01 and abs(high_db) < 0.01:
@@ -2886,6 +2902,14 @@ class DJDeck:
         self.eq_db = [0.0, 0.0, 0.0]   # Baender low/mid/high (dB; 0 = neutral)
         self.eq_sos = None             # Biquad-Kaskade oder None (neutral)
         self.eq_zi = None              # Filterzustand (Block-Kontinuitaet)
+        # Tempo-Sync (tonhoehen-erhaltend, vorab gedehnt):
+        self.native_bpm = 0.0          # Eigentempo des Stuecks
+        self.orig_audio = None         # ungedehnter Puffer (zum Zuruecksetzen)
+        self.orig_beats = None
+        self.orig_ticks = None
+        self.synced = False            # spielt gerade im Master-Tempo?
+        self.sync_ratio = 1.0          # angewandte Dehnungsrate
+        self.sync_pending = False      # Hintergrund-Render laeuft?
 
 
 class DJEngine:
@@ -2934,6 +2958,14 @@ class DJEngine:
             d.ticks = info["ticks"] if info else None
             d.key = key
             d.name = name
+            # Originale fuer Tempo-Sync merken; Sync zuruecksetzen
+            d.orig_audio = a
+            d.orig_beats = d.beats
+            d.orig_ticks = d.ticks
+            d.native_bpm = float(info["bpm"]) if info else 0.0
+            d.synced = False
+            d.sync_ratio = 1.0
+            d.sync_pending = False
 
     def _callback(self, outdata, frames, time_info, status):
         with self.lock:
@@ -2982,6 +3014,82 @@ class DJEngine:
             d.eq_db = [low_db, mid_db, high_db]
             d.eq_sos = sos
             d.eq_zi = None             # Zustand fuer die neue Kaskade zuruecksetzen
+
+    def _phase_align(self, idx):
+        """Beat-Phase von Deck idx auf das andere (Master-)Deck ziehen. Beide
+        laufen dann im selben Tempo und bleiben damit phasengleich."""
+        d = self.decks[idx]
+        m = self.decks[1 - idx]
+        if (d.beats is None or len(d.beats) < 2 or m.beats is None
+                or len(m.beats) < 2 or m.native_bpm <= 0 or not m.playing):
+            return
+        period = 60.0 / m.native_bpm
+        m_pos = self.play_pos(1 - idx)
+        with self.lock:
+            d_pos = d.pos / float(DJ_SR)
+            db0, mb0 = float(d.beats[0]), float(m.beats[0])
+        ph = lambda p, b0: (((p - b0) / period) % 1.0)
+        dphi = ph(m_pos, mb0) - ph(d_pos, db0)
+        dphi = (dphi + 0.5) % 1.0 - 0.5        # auf [-0.5, 0.5) Beats
+        shift = int(round(dphi * period * DJ_SR))
+        with self.lock:
+            d.pos = min(max(0, d.pos + shift), max(0, d.frames_total - 1))
+
+    def set_sync(self, idx, on, status_cb=None):
+        """Deck idx (tonhoehen-erhaltend) auf das Tempo des anderen Decks
+        einrasten bzw. wieder loesen. Das Dehnen laeuft im Hintergrund; bis es
+        fertig ist, spielt das Deck im Eigentempo weiter. status_cb(idx, ok)
+        wird nach dem Umschalten aufgerufen (z. B. fuer die GUI-Anzeige)."""
+        d = self.decks[idx]
+        other = self.decks[1 - idx]
+        if on:
+            if d.orig_audio is None or other.native_bpm <= 0 or d.native_bpm <= 0:
+                return False
+            r = other.native_bpm / d.native_bpm
+            d.sync_pending = True
+
+            def work():
+                try:
+                    stretched = _time_stretch_stereo(d.orig_audio, r)
+                    sbeats = (d.orig_beats / r) if d.orig_beats is not None else None
+                    sticks = (d.orig_ticks / r) if d.orig_ticks is not None else None
+                except Exception:
+                    d.sync_pending = False
+                    if status_cb:
+                        status_cb(idx, False)
+                    return
+                with self.lock:
+                    if not d.sync_pending:          # inzwischen abgebrochen
+                        return
+                    d.pos = min(int(d.pos / r), max(0, stretched.shape[0] - 1))
+                    d.audio = stretched
+                    d.frames_total = stretched.shape[0]
+                    d.beats = sbeats
+                    d.ticks = sticks
+                    d.eq_zi = None                  # Filterzustand passt nicht mehr
+                    d.synced = True
+                    d.sync_ratio = r
+                    d.sync_pending = False
+                self._phase_align(idx)
+                if status_cb:
+                    status_cb(idx, True)
+
+            threading.Thread(target=work, daemon=True).start()
+            return True
+        else:
+            with self.lock:
+                d.sync_pending = False
+                if d.synced and d.orig_audio is not None:
+                    d.pos = min(int(d.pos * d.sync_ratio),
+                                max(0, d.orig_audio.shape[0] - 1))
+                    d.audio = d.orig_audio
+                    d.frames_total = d.orig_audio.shape[0]
+                    d.beats = d.orig_beats
+                    d.ticks = d.orig_ticks
+                    d.eq_zi = None
+                d.synced = False
+                d.sync_ratio = 1.0
+            return True
 
     def start_stream(self):
         if sd is None:

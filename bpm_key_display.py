@@ -1174,6 +1174,13 @@ class DisplayApp:
                               bd=0, padx=14, pady=4, highlightthickness=0,
                               cursor="hand2", state="disabled")
         w["play"].pack(side="left", padx=4)
+        w["sync"] = tk.Button(bar, text="Sync",
+                              command=lambda i=idx: self._dj_sync_toggle(i),
+                              font=self.f_small, bg=COL_BG, fg=COL_FG,
+                              activebackground=COL_SURF_HI, activeforeground=COL_FG,
+                              bd=0, padx=12, pady=4, highlightthickness=0,
+                              cursor="hand2")
+        w["sync"].pack(side="left", padx=4)
         # EQ-Isolator: Baender killen (Bass/Mitte/Hoehen)
         eqf = tk.Frame(panel, bg=COL_SURFACE)
         eqf.pack(pady=(0, 12))
@@ -1192,6 +1199,17 @@ class DisplayApp:
         # Klick aufs Deck (Anzeigebereich) blendet hierher
         for el in (panel, head, w["name"], w["bpm"], w["key"], w["pos"]):
             el.bind("<Button-1>", lambda e, i=idx: self._dj_fade(i))
+
+    def _dj_sync_toggle(self, idx):
+        """Deck auf das Tempo des anderen Decks einrasten/loesen (tonhöhen-
+        erhaltend, im Hintergrund vorab gedehnt). Status zeigt _dj_tick."""
+        if self.dj_engine is None:
+            return
+        d = self.dj_engine.decks[idx]
+        if d.synced or d.sync_pending:
+            self.dj_engine.set_sync(idx, False)
+        else:
+            self.dj_engine.set_sync(idx, True)   # False, wenn anderes Deck fehlt
 
     def _dj_eq_toggle(self, idx, band):
         """Ein EQ-Band des Decks killen/freigeben (Bass/Mitte/Höhen)."""
@@ -1324,6 +1342,15 @@ class DisplayApp:
             w["lvl"].coords(w["lvlrect"], 0, 0, int(cw * frac), 10)
             dom = eng.dominant() == idx and eng.any_playing()
             w["panel"].config(highlightbackground=COL_OK if dom else COL_BG)
+            sb = w.get("sync")
+            if sb is not None:
+                if d.sync_pending:
+                    sb.config(text="synct …", bg=COL_WARN, fg="#412402")
+                elif d.synced:
+                    sb.config(text=f"Sync ✓ {int(round(eng.decks[1-idx].native_bpm))}",
+                              bg=COL_OK, fg="#04342C")
+                else:
+                    sb.config(text="Sync", bg=COL_BG, fg=COL_FG)
         # Fader-Position dem (geglaetteten) Crossfade nachführen
         with eng.lock:
             cx = eng.cross
