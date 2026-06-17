@@ -432,6 +432,9 @@ const NOTE_NAMES = ['C','C#','D','D#','E','F','F#','G','G#','A','A#','B'];
 const KS_MAJOR = [6.6,2.0,3.5,2.3,4.6,4.0,2.5,5.2,2.4,3.7,2.3,3.4];
 const KS_MINOR = [6.5,2.7,3.5,5.4,2.6,3.5,2.5,5.2,4.0,2.7,4.3,3.2];
 const BASS_TONIC_WEIGHT    = 0.30;
+const KEY_BASS_WEIGHT_FILE = 0.60;   // staerkere Bass-Evidenz fuer die Einmal-Schaetzung
+                                     // (Datei/DJ): entscheidet Dur vs. Mollparallele
+                                     // deutlicher; betrifft NICHT die Live-Analyse.
 const CHROMA_LOG_COMP      = 10.0;
 const KEY_EMA_SEC          = 15.0;
 const KEY_SWITCH_CONFIRM   = 2;
@@ -761,12 +764,13 @@ function profCorr(pcp, prof, i) {
   const den = Math.sqrt(da * db);
   return den > 0 ? num / den : 0;
 }
-function classifyKey(pcp, bass) {
+function classifyKey(pcp, bass, bassWeight) {
   const useBass = bass && bass.some(v => v > 0);
+  const w = (bassWeight == null) ? BASS_TONIC_WEIGHT : bassWeight;
   const scores = [];
   for (let i = 0; i < 12; i++) {
     let bonus = 0;
-    if (useBass) bonus = BASS_TONIC_WEIGHT * (bass[i] + 0.5 * bass[(i + 7) % 12]);
+    if (useBass) bonus = w * (bass[i] + 0.5 * bass[(i + 7) % 12]);
     scores.push([profCorr(pcp, KS_MAJOR, i) + bonus, NOTE_NAMES[i] + ' Dur']);
     scores.push([profCorr(pcp, KS_MINOR, i) + bonus, NOTE_NAMES[i] + ' Moll']);
   }
@@ -2005,7 +2009,7 @@ function estimateKey(chans, sr, s0, s1) {
   }
   if (!frames) return null;
   const pcp = chromaNorm(c), bass = chromaNorm(bas);
-  return pcp ? classifyKey(pcp, bass || new Float32Array(12)) : null;
+  return pcp ? classifyKey(pcp, bass || new Float32Array(12), KEY_BASS_WEIGHT_FILE) : null;
 }
 function keyFileName(name) { return (name || '').replace(/\s+/g, '_'); }
 function suggestName(seg) {
