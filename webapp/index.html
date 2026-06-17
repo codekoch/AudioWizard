@@ -144,6 +144,10 @@ main {
 .dj .djpos { font-size: 12px; color: var(--muted); font-variant-numeric: tabular-nums; }
 .dj .deck-lvl { height: 8px; margin: 8px 0; }
 .dj .deckbtns { display: flex; gap: 8px; justify-content: center; margin-top: 8px; }
+.dj .deckeq { display: flex; gap: 6px; justify-content: center; align-items: center; margin-top: 8px; }
+.dj .deckeq .eqlbl { font-size: 11px; color: var(--muted); margin-right: 2px; }
+.dj .eqbtn { padding: 4px 9px; font-size: 12px; }
+.dj .eqbtn.kill { border-color: #EF9F27; color: #EF9F27; }
 .dj .xfade { display: flex; flex-direction: column; align-items: center; justify-content: center; gap: 12px; min-width: 120px; }
 .dj .xfade input[type="range"] { width: 110px; accent-color: var(--accent); }
 .dj .djclock { font-size: 13px; color: var(--accent); font-weight: 700; }
@@ -364,6 +368,11 @@ main.djmode .sv { display: none !important; }   /* Einzeltrack-Anzeige im DJ-Mod
           <button class="ghost" id="djFileA">Datei A…</button>
           <button class="ghost" id="djPlayA" disabled>▶</button>
         </div>
+        <div class="deckeq"><span class="eqlbl">EQ</span>
+          <button class="ghost eqbtn" data-deck="0" data-band="0">Bass</button>
+          <button class="ghost eqbtn" data-deck="0" data-band="1">Mitte</button>
+          <button class="ghost eqbtn" data-deck="0" data-band="2">Höhen</button>
+        </div>
       </div>
       <div class="xfade">
         <button class="ghost" id="djToA" title="zu Deck A überblenden (Clock folgt)">◀ A</button>
@@ -380,6 +389,11 @@ main.djmode .sv { display: none !important; }   /* Einzeltrack-Anzeige im DJ-Mod
         <div class="deckbtns">
           <button class="ghost" id="djFileB">Datei B…</button>
           <button class="ghost" id="djPlayB" disabled>▶</button>
+        </div>
+        <div class="deckeq"><span class="eqlbl">EQ</span>
+          <button class="ghost eqbtn" data-deck="1" data-band="0">Bass</button>
+          <button class="ghost eqbtn" data-deck="1" data-band="1">Mitte</button>
+          <button class="ghost eqbtn" data-deck="1" data-band="2">Höhen</button>
         </div>
       </div>
       <input type="file" id="djFileInA" accept="audio/*" style="display:none">
@@ -1294,8 +1308,10 @@ function djDeckState() {
   return { buffer: null, ticks: null, beats: null, tempoInfo: null, key: '',
     source: null, gain: null, analyser: null, timeBuf: null,
     startCtxTime: 0, nextTickIdx: 0, playing: false,
+    eq: [false, false, false], eqLo: null, eqMid: null, eqHi: null,  // EQ-Isolator
     bpmEl: null, keyEl: null, posEl: null, lvlBar: null, nameEl: null, playBtn: null, deckEl: null };
 }
+const DJ_EQ_KILL_DB = -40;
 
 // Datei-Modus
 let fileBuffer = null;         // dekodierter AudioBuffer der geladenen Datei
@@ -2780,7 +2796,13 @@ function djPlay(deckIdx) {
     d.source = djCtx.createBufferSource(); d.source.buffer = d.buffer;
     d.gain = djCtx.createGain(); d.gain.gain.value = 0;
     d.analyser = djCtx.createAnalyser(); d.analyser.fftSize = 1024; d.timeBuf = new Float32Array(1024);
-    d.source.connect(d.gain); d.gain.connect(djCtx.destination); d.source.connect(d.analyser);
+    // 3-Band-EQ-Isolator: source -> low-shelf -> peaking -> high-shelf -> gain
+    d.eqLo = djCtx.createBiquadFilter(); d.eqLo.type = 'lowshelf'; d.eqLo.frequency.value = 250;
+    d.eqMid = djCtx.createBiquadFilter(); d.eqMid.type = 'peaking'; d.eqMid.frequency.value = 1000; d.eqMid.Q.value = 0.8;
+    d.eqHi = djCtx.createBiquadFilter(); d.eqHi.type = 'highshelf'; d.eqHi.frequency.value = 3500;
+    d.source.connect(d.eqLo); d.eqLo.connect(d.eqMid); d.eqMid.connect(d.eqHi);
+    d.eqHi.connect(d.gain); d.gain.connect(djCtx.destination); d.eqHi.connect(d.analyser);
+    djApplyEq(deckIdx);
   } catch (e) { setHint('Deck ' + djDeckLetter(deckIdx) + ' Wiedergabe fehlgeschlagen: ' + e.message, true); return; }
   d.startCtxTime = djCtx.currentTime + FILE_LEAD_S;
   d.nextTickIdx = 0;
@@ -2794,6 +2816,7 @@ function djStop(deckIdx) {
   const d = djDecks[deckIdx];
   if (d.source) { try { d.source.onended = null; d.source.stop(); } catch (e) {} try { d.source.disconnect(); } catch (e) {} d.source = null; }
   if (d.gain) { try { d.gain.disconnect(); } catch (e) {} d.gain = null; }
+  for (const k of ['eqLo', 'eqMid', 'eqHi']) { if (d[k]) { try { d[k].disconnect(); } catch (e) {} d[k] = null; } }
   if (d.analyser) { try { d.analyser.disconnect(); } catch (e) {} d.analyser = null; }
   d.timeBuf = null; d.playing = false; d.nextTickIdx = 0;
   if (d.playBtn) d.playBtn.textContent = '▶';
@@ -2812,6 +2835,21 @@ function djApplyCross() {
 }
 // Zu einem Deck faden (Klick/Knopf): Ziel-Deck ggf. starten, sanft ueberblenden;
 // die Clock folgt automatisch, sobald das Ziel-Deck dominiert (djRender).
+// EQ-Isolator: gekillte Baender auf DJ_EQ_KILL_DB absenken (sanft).
+function djApplyEq(deckIdx) {
+  const d = djDecks[deckIdx];
+  if (!djCtx) return;
+  const tc = djCtx.currentTime;
+  if (d.eqLo) d.eqLo.gain.setTargetAtTime(d.eq[0] ? DJ_EQ_KILL_DB : 0, tc, 0.02);
+  if (d.eqMid) d.eqMid.gain.setTargetAtTime(d.eq[1] ? DJ_EQ_KILL_DB : 0, tc, 0.02);
+  if (d.eqHi) d.eqHi.gain.setTargetAtTime(d.eq[2] ? DJ_EQ_KILL_DB : 0, tc, 0.02);
+}
+function djToggleEq(deckIdx, band, btn) {
+  const d = djDecks[deckIdx];
+  d.eq[band] = !d.eq[band];
+  if (btn) btn.classList.toggle('kill', d.eq[band]);
+  djApplyEq(deckIdx);
+}
 function djFadeTo(deckIdx) {
   const d = djDecks[deckIdx];
   if (!d.buffer) return;
@@ -2877,9 +2915,11 @@ function djTeardown() {
   djStopScheduler();
   djStop(0); djStop(1);
   if (djCtx) { try { djCtx.close(); } catch (e) {} djCtx = null; }
+  document.querySelectorAll('.eqbtn').forEach(b => b.classList.remove('kill'));
   for (let i = 0; i < 2; i++) {
     const d = djDecks[i];
     d.buffer = null; d.ticks = null; d.beats = null; d.tempoInfo = null; d.key = '';
+    d.eq = [false, false, false];
     if (d.nameEl) d.nameEl.textContent = 'keine Datei';
     if (d.bpmEl) { d.bpmEl.textContent = '—'; d.bpmEl.classList.add('idle'); }
     if (d.keyEl) d.keyEl.textContent = '';
@@ -3199,6 +3239,9 @@ $('djFileA').addEventListener('click', (e) => e.stopPropagation());
 $('djFileB').addEventListener('click', (e) => e.stopPropagation());
 elDjToA.addEventListener('click', () => djFadeTo(0));
 elDjToB.addEventListener('click', () => djFadeTo(1));
+document.querySelectorAll('.eqbtn').forEach(b => b.addEventListener('click', (e) => {
+  e.stopPropagation(); djToggleEq(+b.dataset.deck, +b.dataset.band, b);
+}));
 elDjCross.addEventListener('input', () => { djCross = djCrossTarget = (+elDjCross.value) / 100; djApplyCross(); });
 djDecks[0].deckEl.addEventListener('click', () => djFadeTo(0));
 djDecks[1].deckEl.addEventListener('click', () => djFadeTo(1));

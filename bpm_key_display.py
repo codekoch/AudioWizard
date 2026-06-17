@@ -1174,9 +1174,38 @@ class DisplayApp:
                               bd=0, padx=14, pady=4, highlightthickness=0,
                               cursor="hand2", state="disabled")
         w["play"].pack(side="left", padx=4)
+        # EQ-Isolator: Baender killen (Bass/Mitte/Hoehen)
+        eqf = tk.Frame(panel, bg=COL_SURFACE)
+        eqf.pack(pady=(0, 12))
+        tk.Label(eqf, text="EQ", font=self.f_tiny, bg=COL_SURFACE,
+                 fg=COL_MUTED).pack(side="left", padx=(0, 6))
+        w["eq"] = [False, False, False]
+        w["eqbtn"] = []
+        for bi, nm in enumerate(("Bass", "Mitte", "Höhen")):
+            b = tk.Button(eqf, text=nm, font=self.f_tiny, bg=COL_BG, fg=COL_FG,
+                          activebackground=COL_SURF_HI, activeforeground=COL_FG,
+                          bd=0, padx=10, pady=3, highlightthickness=0,
+                          cursor="hand2",
+                          command=lambda i=idx, band=bi: self._dj_eq_toggle(i, band))
+            b.pack(side="left", padx=2)
+            w["eqbtn"].append(b)
         # Klick aufs Deck (Anzeigebereich) blendet hierher
         for el in (panel, head, w["name"], w["bpm"], w["key"], w["pos"]):
             el.bind("<Button-1>", lambda e, i=idx: self._dj_fade(i))
+
+    def _dj_eq_toggle(self, idx, band):
+        """Ein EQ-Band des Decks killen/freigeben (Bass/Mitte/Höhen)."""
+        if self.dj_engine is None:
+            return
+        w = self.dj_w[idx]
+        w["eq"][band] = not w["eq"][band]
+        btn = w["eqbtn"][band]
+        if w["eq"][band]:
+            btn.config(bg=COL_WARN, fg="#412402")
+        else:
+            btn.config(bg=COL_BG, fg=COL_FG)
+        db = [core.DJ_EQ_KILL_DB if on else 0.0 for on in w["eq"]]
+        self.dj_engine.set_eq(idx, db[0], db[1], db[2])
 
     def _dj_load(self, idx):
         path = filedialog.askopenfilename(

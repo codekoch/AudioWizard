@@ -83,6 +83,11 @@ try:
 except ImportError:
     sf = None
 
+try:
+    import scipy.signal as _sps  # nur fuer den DJ-EQ-Isolator (Biquad-Filter)
+except ImportError:
+    _sps = None
+
 
 # ===========================================================================
 # Konfiguration
@@ -2818,6 +2823,50 @@ def save_wav_slice(audio, sr, s0, s1, path):
 # folgt automatisch dem dominierenden Deck (driftfrei aus dessen Position).
 DJ_SR       = 44100      # gemeinsame Ausgabe-/Mischrate (Decks werden umgesampelt)
 DJ_FADE_TAU = 0.18       # Zeitkonstante (s) der Crossfade-Glaettung
+# EQ-Isolator (3 Baender pro Deck). Kill = Band auf DJ_EQ_KILL_DB absenken.
+DJ_EQ_LOW_HZ  = 250.0
+DJ_EQ_MID_HZ  = 1000.0
+DJ_EQ_HIGH_HZ = 3500.0
+DJ_EQ_KILL_DB = -40.0
+
+
+def _rbj_biquad(kind, f0, db, q, sr):
+    """RBJ-Cookbook-Biquad (low shelf / peak / high shelf) als sos-Zeile."""
+    A = 10.0 ** (db / 40.0)
+    w0 = 2.0 * math.pi * f0 / sr
+    cw, sw = math.cos(w0), math.sin(w0)
+    al = sw / (2.0 * q)
+    if kind == 'peak':
+        b0, b1, b2 = 1 + al * A, -2 * cw, 1 - al * A
+        a0, a1, a2 = 1 + al / A, -2 * cw, 1 - al / A
+    elif kind == 'low':
+        s = 2.0 * math.sqrt(A) * al
+        b0 = A * ((A + 1) - (A - 1) * cw + s)
+        b1 = 2 * A * ((A - 1) - (A + 1) * cw)
+        b2 = A * ((A + 1) - (A - 1) * cw - s)
+        a0 = (A + 1) + (A - 1) * cw + s
+        a1 = -2 * ((A - 1) + (A + 1) * cw)
+        a2 = (A + 1) + (A - 1) * cw - s
+    else:  # high shelf
+        s = 2.0 * math.sqrt(A) * al
+        b0 = A * ((A + 1) + (A - 1) * cw + s)
+        b1 = -2 * A * ((A - 1) + (A + 1) * cw)
+        b2 = A * ((A + 1) + (A - 1) * cw - s)
+        a0 = (A + 1) - (A - 1) * cw + s
+        a1 = 2 * ((A - 1) - (A + 1) * cw)
+        a2 = (A + 1) - (A - 1) * cw - s
+    return [b0 / a0, b1 / a0, b2 / a0, 1.0, a1 / a0, a2 / a0]
+
+
+def _dj_eq_sos(low_db, mid_db, high_db, sr=DJ_SR):
+    """sos-Kaskade fuer den 3-Band-EQ; None, wenn alle Baender neutral (0 dB)."""
+    if abs(low_db) < 0.01 and abs(mid_db) < 0.01 and abs(high_db) < 0.01:
+        return None
+    return np.array([
+        _rbj_biquad('low', DJ_EQ_LOW_HZ, low_db, 0.7, sr),
+        _rbj_biquad('peak', DJ_EQ_MID_HZ, mid_db, 0.8, sr),
+        _rbj_biquad('high', DJ_EQ_HIGH_HZ, high_db, 0.7, sr),
+    ], dtype=np.float64)
 
 
 class DJDeck:
@@ -2834,6 +2883,9 @@ class DJDeck:
         self.anchor_pos = 0
         self.anchor_perf = 0.0
         self.level = 0.0           # RMS des zuletzt ausgegebenen Blocks (Anzeige)
+        self.eq_db = [0.0, 0.0, 0.0]   # Baender low/mid/high (dB; 0 = neutral)
+        self.eq_sos = None             # Biquad-Kaskade oder None (neutral)
+        self.eq_zi = None              # Filterzustand (Block-Kontinuitaet)
 
 
 class DJEngine:
@@ -2903,6 +2955,8 @@ class DJEngine:
                     n = e - s
                     if n > 0:
                         block = d.audio[s:e]
+                        if d.eq_sos is not None and _sps is not None:
+                            block = self._deck_eq(d, block)
                         out[:n] += block * gains[i]
                         d.level = float(np.sqrt(np.mean(block * block))) * gains[i]
                         d.pos = e
@@ -2911,6 +2965,23 @@ class DJEngine:
                 else:
                     d.level = 0.0
             outdata[:] = out
+
+    def _deck_eq(self, d, block):
+        """3-Band-EQ auf einen Block anwenden (Filterzustand bleibt erhalten)."""
+        if d.eq_zi is None or d.eq_zi.shape[-1] != block.shape[1]:
+            d.eq_zi = np.zeros((d.eq_sos.shape[0], 2, block.shape[1]),
+                               dtype=np.float64)
+        out, d.eq_zi = _sps.sosfilt(d.eq_sos, block, axis=0, zi=d.eq_zi)
+        return out.astype(np.float32)
+
+    def set_eq(self, idx, low_db, mid_db, high_db):
+        """EQ-Baender eines Decks setzen (dB; 0 = neutral, DJ_EQ_KILL_DB = kill)."""
+        sos = _dj_eq_sos(low_db, mid_db, high_db) if _sps is not None else None
+        with self.lock:
+            d = self.decks[idx]
+            d.eq_db = [low_db, mid_db, high_db]
+            d.eq_sos = sos
+            d.eq_zi = None             # Zustand fuer die neue Kaskade zuruecksetzen
 
     def start_stream(self):
         if sd is None:

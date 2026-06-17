@@ -71,7 +71,9 @@ Eingänge; unter macOS leistet das ein virtuelles Ausgabegerät wie
   **folgt automatisch dem lauteren Deck** (driftfrei aus dessen Wiedergabeposition,
   Tempowechsel beim Überblenden inklusive). In der GUI über die Schaltfläche „DJ",
   in der Konsole über `--dj DATEI_A DATEI_B` (Tasten `a`/`b` zum Überblenden).
-  Mirror der Webversion.
+  Mirror der Webversion. Je Deck gibt es zusätzlich einen **EQ-Isolator**
+  (Bass/Mitte/Höhen einzeln stummschalten – echtzeitfähige Frequenzfilterung als
+  schlanker Stem-Ersatz, kein echtes Trennen einzelner Instrumente).
 - **Zwei Oberflächen** – Konsolen-Version (`realtime_bpm_key_midiclock.py`)
   und Touch-taugliche Kiosk-GUI (`bpm_key_display.py`) für ein 7-Zoll-Display
   am Raspberry Pi; unter Windows und macOS läuft sie im Fenster.
