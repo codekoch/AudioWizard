@@ -2823,6 +2823,7 @@ def save_wav_slice(audio, sr, s0, s1, path):
 # folgt automatisch dem dominierenden Deck (driftfrei aus dessen Position).
 DJ_SR       = 44100      # gemeinsame Ausgabe-/Mischrate (Decks werden umgesampelt)
 DJ_FADE_TAU = 0.18       # Zeitkonstante (s) der Crossfade-Glaettung
+DJ_GLIDE_S  = 8.0        # Dauer (s) des Tempo-Uebergangs (Master-Tempo -> Eigentempo)
 # EQ-Isolator (3 Baender pro Deck). Kill = Band auf DJ_EQ_KILL_DB absenken.
 DJ_EQ_LOW_HZ  = 250.0
 DJ_EQ_MID_HZ  = 1000.0
@@ -2874,6 +2875,62 @@ def _time_stretch_stereo(audio, rate):
                                 dtype=np.float32)
 
 
+def _render_glide(orig_audio, sr, orig_ticks, orig_beats, r0, r1, glide_out,
+                  src_start, nseg=12):
+    """Baut einen Puffer, der ab Quellposition src_start (Frames) zunaechst ueber
+    glide_out Sekunden das Tempo von native*r0 nach native*r1 gleiten laesst
+    (stueckweise konstante Rate, tonhoehen-erhaltend) und danach unveraendert
+    weiterspielt. Liefert (audio, ticks, beats) mit Zeiten im Ausgaberaster.
+    Die Tick-Abbildung macht den anschliessenden Clock-Glide automatisch."""
+    orig = np.asarray(orig_audio, dtype=np.float32)
+    total = orig.shape[0]
+    out_chunk = glide_out / nseg
+    xn = max(1, int(0.005 * sr))
+    segs = []
+    src_knot = [src_start / sr]          # Quellzeit am Chunk-Anfang (s)
+    out_knot = [0.0]                     # Ausgabezeit am Chunk-Anfang (s)
+    src = src_start
+    out_acc = 0.0
+    for k in range(nseg):
+        r = r0 + (r1 - r0) * (k + 0.5) / nseg
+        src_len = int(round(out_chunk * r * sr))
+        if src + src_len > total:
+            src_len = total - src
+        if src_len < 32:
+            break
+        st = _time_stretch_stereo(orig[src:src + src_len], r)
+        if segs and len(segs[-1]) > xn and len(st) > xn:
+            w = np.linspace(0, 1, xn, dtype=np.float32)[:, None]
+            segs[-1][-xn:] = segs[-1][-xn:] * (1 - w) + st[:xn] * w
+            st = st[xn:]
+        segs.append(st)
+        src += src_len
+        out_acc += len(st) / sr
+        src_knot.append(src / sr)
+        out_knot.append(out_acc)
+    if src < total:
+        segs.append(orig[src:])          # Rest unveraendert (Rate 1)
+    glide_audio = (np.concatenate(segs) if segs
+                   else np.ascontiguousarray(orig[src_start:]))
+    src_knot = np.array(src_knot, dtype=np.float64)
+    out_knot = np.array(out_knot, dtype=np.float64)
+    glide_src_end, glide_out_end = src_knot[-1], out_knot[-1]
+
+    def map_arr(times):
+        if times is None:
+            return None
+        t = np.asarray(times, dtype=np.float64)
+        t = t[t >= src_knot[0]]
+        if len(t) == 0:
+            return np.array([], dtype=np.float64)
+        within = np.interp(t, src_knot, out_knot)        # Glide-Bereich
+        after = glide_out_end + (t - glide_src_end)       # Rest 1:1
+        return np.where(t >= glide_src_end, after, within)
+
+    return (np.ascontiguousarray(glide_audio, dtype=np.float32),
+            map_arr(orig_ticks), map_arr(orig_beats))
+
+
 def _dj_eq_sos(low_db, mid_db, high_db, sr=DJ_SR):
     """sos-Kaskade fuer den 3-Band-EQ; None, wenn alle Baender neutral (0 dB)."""
     if abs(low_db) < 0.01 and abs(mid_db) < 0.01 and abs(high_db) < 0.01:
@@ -2910,6 +2967,7 @@ class DJDeck:
         self.synced = False            # spielt gerade im Master-Tempo?
         self.sync_ratio = 1.0          # angewandte Dehnungsrate
         self.sync_pending = False      # Hintergrund-Render laeuft?
+        self.gliding = False           # Tempo-Uebergang aktiv/abgespielt?
 
 
 class DJEngine:
@@ -2966,6 +3024,7 @@ class DJEngine:
             d.synced = False
             d.sync_ratio = 1.0
             d.sync_pending = False
+            d.gliding = False
 
     def _callback(self, outdata, frames, time_info, status):
         with self.lock:
@@ -3090,6 +3149,52 @@ class DJEngine:
                 d.synced = False
                 d.sync_ratio = 1.0
             return True
+
+    def set_glide(self, idx, glide_s=DJ_GLIDE_S, status_cb=None):
+        """Tempo-Uebergang: Deck idx gleitet vom Master-Tempo (Tempo des anderen
+        Decks) ueber glide_s Sekunden auf sein Eigentempo. Wird in den Puffer
+        eingebacken; die mitgerechneten Tick-Zeiten lassen die Clock automatisch
+        mitgleiten. Vorberechnung laeuft im Hintergrund."""
+        d = self.decks[idx]
+        other = self.decks[1 - idx]
+        if (d.orig_audio is None or other.native_bpm <= 0 or d.native_bpm <= 0
+                or d.sync_pending):
+            return False
+        r0 = other.native_bpm / d.native_bpm        # Start: Master-Tempo
+        r1 = 1.0                                     # Ziel: Eigentempo
+        with self.lock:
+            src_start = int(d.pos * d.sync_ratio) if d.synced else int(d.pos)
+            src_start = min(max(0, src_start), max(0, d.orig_audio.shape[0] - 1))
+        d.sync_pending = True
+
+        def work():
+            try:
+                audio, ticks, beats = _render_glide(
+                    d.orig_audio, DJ_SR, d.orig_ticks, d.orig_beats,
+                    r0, r1, glide_s, src_start)
+            except Exception:
+                d.sync_pending = False
+                if status_cb:
+                    status_cb(idx, False)
+                return
+            with self.lock:
+                if not d.sync_pending:
+                    return
+                d.audio = audio
+                d.frames_total = audio.shape[0]
+                d.ticks = ticks
+                d.beats = beats
+                d.pos = 0                            # Glide startet an aktueller Musikstelle
+                d.eq_zi = None
+                d.synced = False
+                d.sync_ratio = 1.0
+                d.gliding = True
+                d.sync_pending = False
+            if status_cb:
+                status_cb(idx, True)
+
+        threading.Thread(target=work, daemon=True).start()
+        return True
 
     def start_stream(self):
         if sd is None:

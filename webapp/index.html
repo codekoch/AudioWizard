@@ -143,7 +143,7 @@ main {
 .dj .djkey.idle { color: var(--muted); opacity: .6; }
 .dj .djpos { font-size: 12px; color: var(--muted); font-variant-numeric: tabular-nums; }
 .dj .deck-lvl { height: 8px; margin: 8px 0; }
-.dj .deckbtns { display: flex; gap: 8px; justify-content: center; margin-top: 8px; }
+.dj .deckbtns { display: flex; flex-wrap: wrap; gap: 8px; justify-content: center; margin-top: 8px; }
 .dj .deckeq { display: flex; gap: 6px; justify-content: center; align-items: center; margin-top: 8px; }
 .dj .deckeq .eqlbl { font-size: 11px; color: var(--muted); margin-right: 2px; }
 .dj .eqbtn { padding: 4px 9px; font-size: 12px; }
@@ -368,6 +368,7 @@ main.djmode .sv { display: none !important; }   /* Einzeltrack-Anzeige im DJ-Mod
           <button class="ghost" id="djFileA">Datei A…</button>
           <button class="ghost" id="djPlayA" disabled>▶</button>
           <button class="ghost" id="djSyncA" disabled title="auf das Tempo des anderen Decks einrasten (tonhöhen-erhaltend)">Sync</button>
+          <button class="ghost" id="djGlideA" disabled title="Tempo-Übergang: vom Master-Tempo aufs Eigentempo gleiten">Übergang</button>
         </div>
         <div class="deckeq"><span class="eqlbl">EQ</span>
           <button class="ghost eqbtn" data-deck="0" data-band="0">Bass</button>
@@ -391,6 +392,7 @@ main.djmode .sv { display: none !important; }   /* Einzeltrack-Anzeige im DJ-Mod
           <button class="ghost" id="djFileB">Datei B…</button>
           <button class="ghost" id="djPlayB" disabled>▶</button>
           <button class="ghost" id="djSyncB" disabled title="auf das Tempo des anderen Decks einrasten (tonhöhen-erhaltend)">Sync</button>
+          <button class="ghost" id="djGlideB" disabled title="Tempo-Übergang: vom Master-Tempo aufs Eigentempo gleiten">Übergang</button>
         </div>
         <div class="deckeq"><span class="eqlbl">EQ</span>
           <button class="ghost eqbtn" data-deck="1" data-band="0">Bass</button>
@@ -1312,8 +1314,8 @@ function djDeckState() {
     startCtxTime: 0, nextTickIdx: 0, playing: false,
     eq: [false, false, false], eqLo: null, eqMid: null, eqHi: null,  // EQ-Isolator
     origBuffer: null, origTicks: null, origBeats: null, nativeBpm: 0,  // Tempo-Sync
-    synced: false, syncRatio: 1, syncPending: false,
-    bpmEl: null, keyEl: null, posEl: null, lvlBar: null, nameEl: null, playBtn: null, syncBtn: null, deckEl: null };
+    synced: false, syncRatio: 1, syncPending: false, gliding: false,
+    bpmEl: null, keyEl: null, posEl: null, lvlBar: null, nameEl: null, playBtn: null, syncBtn: null, glideBtn: null, deckEl: null };
 }
 const DJ_EQ_KILL_DB = -40;
 
@@ -1384,9 +1386,9 @@ const elDjPanel = $('djPanel'), elDjCross = $('djCross'), elDjClock = $('djClock
 const elDjToA = $('djToA'), elDjToB = $('djToB'), elDjFileInA = $('djFileInA'), elDjFileInB = $('djFileInB');
 // Deck-Elemente in die djDecks-Struktur haengen
 djDecks[0].bpmEl = $('djBpmA'); djDecks[0].keyEl = $('djKeyA'); djDecks[0].posEl = $('djPosA');
-djDecks[0].lvlBar = $('djLvlA'); djDecks[0].nameEl = $('djNameA'); djDecks[0].playBtn = $('djPlayA'); djDecks[0].syncBtn = $('djSyncA'); djDecks[0].deckEl = $('djDeckA');
+djDecks[0].lvlBar = $('djLvlA'); djDecks[0].nameEl = $('djNameA'); djDecks[0].playBtn = $('djPlayA'); djDecks[0].syncBtn = $('djSyncA'); djDecks[0].glideBtn = $('djGlideA'); djDecks[0].deckEl = $('djDeckA');
 djDecks[1].bpmEl = $('djBpmB'); djDecks[1].keyEl = $('djKeyB'); djDecks[1].posEl = $('djPosB');
-djDecks[1].lvlBar = $('djLvlB'); djDecks[1].nameEl = $('djNameB'); djDecks[1].playBtn = $('djPlayB'); djDecks[1].syncBtn = $('djSyncB'); djDecks[1].deckEl = $('djDeckB');
+djDecks[1].lvlBar = $('djLvlB'); djDecks[1].nameEl = $('djNameB'); djDecks[1].playBtn = $('djPlayB'); djDecks[1].syncBtn = $('djSyncB'); djDecks[1].glideBtn = $('djGlideB'); djDecks[1].deckEl = $('djDeckB');
 const elCalibField = $('calibField'), elCalibToggle = $('calibToggle'), elCalibPanel = $('calibPanel');
 const elCalibReset = $('calibReset'), elCalibNote = $('calibNote');
 const cLat = $('cLatency'), cLatV = $('cLatencyV'), cSil = $('cSilence'), cSilV = $('cSilenceV');
@@ -2826,10 +2828,11 @@ async function djLoad(deckIdx, file) {
   // Originale fuer Tempo-Sync merken; Sync zuruecksetzen
   d.origBuffer = buf; d.origBeats = d.beats; d.origTicks = d.ticks;
   d.nativeBpm = res ? res.bpm : 0;
-  d.synced = false; d.syncRatio = 1; d.syncPending = false;
+  d.synced = false; d.syncRatio = 1; d.syncPending = false; d.gliding = false;
   d.playBtn.disabled = false;
   if (d.syncBtn) d.syncBtn.disabled = false;
-  djUpdateDeckStatic(deckIdx); djUpdateSyncBtn(deckIdx);
+  if (d.glideBtn) d.glideBtn.disabled = false;
+  djUpdateDeckStatic(deckIdx); djUpdateSyncBtn(deckIdx); djUpdateGlideBtn(deckIdx);
   setHint('Deck ' + djDeckLetter(deckIdx) + ': ' + (res ? Math.round(res.bpm) + ' BPM' : 'kein klares Tempo')
         + (key ? ' · ' + key.name : '') + '. ▶ zum Abspielen, dann faden.');
 }
@@ -2975,6 +2978,78 @@ async function djSyncSet(deckIdx, on) {
     djUpdateSyncBtn(deckIdx);
   }
 }
+// --- Tempo-Uebergang: B startet im Master-Tempo und gleitet aufs Eigentempo ---
+// Baut den Glide in den Puffer ein (stueckweise konstante Rate, Phase-Vocoder)
+// und rechnet die passenden Tick-Zeiten mit -> die Clock gleitet automatisch mit.
+async function pvGlide(ctx, orig, origTicks, origBeats, r0, r1, glideOut, srcStartSec, nseg) {
+  const sr = orig.sampleRate, nCh = orig.numberOfChannels, total = orig.length;
+  const outChunk = glideOut / nseg, xn = Math.max(1, Math.round(0.005 * sr));
+  const srcKnot = [srcStartSec], outKnot = [0];
+  const chunks = [];
+  let srcF = Math.floor(srcStartSec * sr), outAcc = 0;
+  for (let k = 0; k < nseg; k++) {
+    const r = r0 + (r1 - r0) * (k + 0.5) / nseg;
+    let srcLen = Math.round(outChunk * r * sr);
+    if (srcF + srcLen > total) srcLen = total - srcF;
+    if (srcLen < 64) break;
+    const sub = ctx.createBuffer(nCh, srcLen, sr);
+    for (let c = 0; c < nCh; c++) sub.getChannelData(c).set(orig.getChannelData(c).subarray(srcF, srcF + srcLen));
+    const st = await pvTimeStretch(ctx, sub, r);
+    const add = chunks.length === 0 ? st.length : (st.length - xn);
+    chunks.push(st); srcF += srcLen; outAcc += add / sr;
+    srcKnot.push(srcF / sr); outKnot.push(outAcc);
+  }
+  const restLen = Math.max(0, total - srcF);
+  let glideLen = 0; chunks.forEach((b, i) => glideLen += (i === 0 ? b.length : b.length - xn));
+  const outLen = Math.max(1, glideLen + restLen);
+  const out = ctx.createBuffer(nCh, outLen, sr);
+  for (let c = 0; c < nCh; c++) {
+    const o = out.getChannelData(c); let p = 0;
+    chunks.forEach((b, i) => {
+      const cd = b.getChannelData(c);
+      if (i === 0) { o.set(cd, 0); p = b.length; }
+      else { for (let j = 0; j < xn; j++) { const w = j / xn; o[p - xn + j] = o[p - xn + j] * (1 - w) + cd[j] * w; } o.set(cd.subarray(xn), p); p += b.length - xn; }
+    });
+    if (restLen > 0) o.set(orig.getChannelData(c).subarray(srcF), p);
+  }
+  const gSrcEnd = srcKnot[srcKnot.length - 1], gOutEnd = outKnot[outKnot.length - 1];
+  const mapArr = (arr) => {
+    if (!arr) return null; const res = [];
+    for (let i = 0; i < arr.length; i++) {
+      const ts = arr[i]; if (ts < srcKnot[0]) continue;
+      if (ts >= gSrcEnd) { res.push(gOutEnd + (ts - gSrcEnd)); continue; }
+      let lo = 0, hi = srcKnot.length - 1; while (lo < hi - 1) { const mid = (lo + hi) >> 1; if (srcKnot[mid] <= ts) lo = mid; else hi = mid; }
+      const f = (ts - srcKnot[lo]) / (srcKnot[lo + 1] - srcKnot[lo]);
+      res.push(outKnot[lo] + f * (outKnot[lo + 1] - outKnot[lo]));
+    }
+    return Float64Array.from(res);
+  };
+  return { buffer: out, ticks: mapArr(origTicks), beats: mapArr(origBeats) };
+}
+function djUpdateGlideBtn(i) {
+  const d = djDecks[i]; if (!d.glideBtn) return;
+  d.glideBtn.classList.toggle('on', d.gliding && !d.syncPending);
+  d.glideBtn.textContent = d.syncPending ? 'rechnet…' : (d.gliding ? 'Übergang ✓' : 'Übergang');
+}
+async function djGlideSet(deckIdx) {
+  const d = djDecks[deckIdx], m = djDecks[1 - deckIdx];
+  if (!d.origBuffer || !d.nativeBpm || !m.nativeBpm) { setHint('Übergang braucht zwei geladene Decks mit Tempo.', true); return; }
+  if (d.syncPending) return;
+  const r0 = m.nativeBpm / d.nativeBpm, r1 = 1.0;
+  const wasPlaying = d.playing;
+  const posAct = wasPlaying ? Math.max(0, djCtx.currentTime - d.startCtxTime) : 0;
+  const srcStartSec = d.synced ? posAct * d.syncRatio : posAct;
+  d.syncPending = true; djUpdateGlideBtn(deckIdx);
+  let res;
+  try { res = await pvGlide(djCtx, d.origBuffer, d.origTicks, d.origBeats, r0, r1, 8.0, srcStartSec, 12); }
+  catch (e) { d.syncPending = false; djUpdateGlideBtn(deckIdx); setHint('Übergang fehlgeschlagen: ' + e.message, true); return; }
+  if (!d.syncPending) return;
+  d.buffer = res.buffer; d.ticks = res.ticks; d.beats = res.beats;
+  d.synced = false; d.syncRatio = 1; d.gliding = true; d.syncPending = false;
+  if (wasPlaying) djRestartSource(deckIdx, 0);
+  djUpdateSyncBtn(deckIdx); djUpdateGlideBtn(deckIdx);
+  setHint('Deck ' + djDeckLetter(deckIdx) + ': Tempo-Übergang auf ' + Math.round(d.nativeBpm) + ' BPM.');
+}
 function djFadeTo(deckIdx) {
   const d = djDecks[deckIdx];
   if (!d.buffer) return;
@@ -3046,8 +3121,9 @@ function djTeardown() {
     d.buffer = null; d.ticks = null; d.beats = null; d.tempoInfo = null; d.key = '';
     d.eq = [false, false, false];
     d.origBuffer = null; d.origTicks = null; d.origBeats = null; d.nativeBpm = 0;
-    d.synced = false; d.syncRatio = 1; d.syncPending = false;
+    d.synced = false; d.syncRatio = 1; d.syncPending = false; d.gliding = false;
     if (d.syncBtn) { d.syncBtn.disabled = true; d.syncBtn.classList.remove('on'); d.syncBtn.textContent = 'Sync'; }
+    if (d.glideBtn) { d.glideBtn.disabled = true; d.glideBtn.classList.remove('on'); d.glideBtn.textContent = 'Übergang'; }
     if (d.nameEl) d.nameEl.textContent = 'keine Datei';
     if (d.bpmEl) { d.bpmEl.textContent = '—'; d.bpmEl.classList.add('idle'); }
     if (d.keyEl) d.keyEl.textContent = '';
@@ -3372,6 +3448,8 @@ document.querySelectorAll('.eqbtn').forEach(b => b.addEventListener('click', (e)
 }));
 $('djSyncA').addEventListener('click', () => djSyncSet(0, !djDecks[0].synced && !djDecks[0].syncPending));
 $('djSyncB').addEventListener('click', () => djSyncSet(1, !djDecks[1].synced && !djDecks[1].syncPending));
+$('djGlideA').addEventListener('click', () => djGlideSet(0));
+$('djGlideB').addEventListener('click', () => djGlideSet(1));
 elDjCross.addEventListener('input', () => { djCross = djCrossTarget = (+elDjCross.value) / 100; djApplyCross(); });
 djDecks[0].deckEl.addEventListener('click', () => djFadeTo(0));
 djDecks[1].deckEl.addEventListener('click', () => djFadeTo(1));

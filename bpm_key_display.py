@@ -1181,6 +1181,13 @@ class DisplayApp:
                               bd=0, padx=12, pady=4, highlightthickness=0,
                               cursor="hand2")
         w["sync"].pack(side="left", padx=4)
+        w["glide"] = tk.Button(bar, text="Übergang",
+                               command=lambda i=idx: self._dj_glide(i),
+                               font=self.f_small, bg=COL_BG, fg=COL_FG,
+                               activebackground=COL_SURF_HI, activeforeground=COL_FG,
+                               bd=0, padx=12, pady=4, highlightthickness=0,
+                               cursor="hand2")
+        w["glide"].pack(side="left", padx=4)
         # EQ-Isolator: Baender killen (Bass/Mitte/Hoehen)
         eqf = tk.Frame(panel, bg=COL_SURFACE)
         eqf.pack(pady=(0, 12))
@@ -1210,6 +1217,13 @@ class DisplayApp:
             self.dj_engine.set_sync(idx, False)
         else:
             self.dj_engine.set_sync(idx, True)   # False, wenn anderes Deck fehlt
+
+    def _dj_glide(self, idx):
+        """Tempo-Übergang anstoßen: Deck gleitet vom Master-Tempo auf sein
+        Eigentempo (in den Puffer eingebacken, die Clock gleitet mit)."""
+        if self.dj_engine is None:
+            return
+        self.dj_engine.set_glide(idx)
 
     def _dj_eq_toggle(self, idx, band):
         """Ein EQ-Band des Decks killen/freigeben (Bass/Mitte/Höhen)."""
@@ -1345,12 +1359,18 @@ class DisplayApp:
             sb = w.get("sync")
             if sb is not None:
                 if d.sync_pending:
-                    sb.config(text="synct …", bg=COL_WARN, fg="#412402")
+                    sb.config(text="rechnet …", bg=COL_WARN, fg="#412402")
                 elif d.synced:
                     sb.config(text=f"Sync ✓ {int(round(eng.decks[1-idx].native_bpm))}",
                               bg=COL_OK, fg="#04342C")
                 else:
                     sb.config(text="Sync", bg=COL_BG, fg=COL_FG)
+            gb = w.get("glide")
+            if gb is not None:
+                if d.gliding and not d.sync_pending:
+                    gb.config(text="Übergang ✓", bg=COL_OK, fg="#04342C")
+                else:
+                    gb.config(text="Übergang", bg=COL_BG, fg=COL_FG)
         # Fader-Position dem (geglaetteten) Crossfade nachführen
         with eng.lock:
             cx = eng.cross
