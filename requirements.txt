@@ -11,3 +11,6 @@ python-rtmidi
 # normale Eingaenge. Unter macOS uebernimmt das ein virtuelles
 # Ausgabegeraet wie BlackHole (https://existential.audio/blackhole/).
 soundcard; sys_platform == 'win32'
+# Optional: lokale KI-Stem-Trennung (Drums/Bass/Gesang/Rest). Zieht PyTorch und
+# ist gross -- daher NICHT standardmaessig installiert. Bei Bedarf separat:
+#   pip install demucs
