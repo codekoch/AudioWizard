@@ -14,3 +14,6 @@ soundcard; sys_platform == 'win32'
 # Optional: lokale KI-Stem-Trennung (Drums/Bass/Gesang/Rest). Zieht PyTorch und
 # ist gross -- daher NICHT standardmaessig installiert. Bei Bedarf separat:
 #   pip install demucs
+# Optional: Song-Sheet (Gesangstext + Akkorde). Braucht zusaetzlich eine lokale
+# Whisper-KI fuer die Transkription (laedt beim ersten Mal ein Sprachmodell):
+#   pip install faster-whisper

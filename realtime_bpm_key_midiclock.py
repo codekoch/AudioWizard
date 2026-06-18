@@ -3074,6 +3074,343 @@ def separate_stems_array(audio, sr, model="htdemucs", log=None):
             pass
 
 
+# ======================================================================
+# Song-Sheet: gesungener Text (lokale Whisper-KI) + Akkorde -> Chord-Sheet
+# (Akkorde ueber den Woertern, wie bei Ultimate Guitar). OFFLINE.
+# Bauteile: Demucs trennt den Gesang heraus (bessere Transkription),
+# der Rest (Begleitung) geht in die vorhandene Akkord-Erkennung.
+# ======================================================================
+_whisper_model = None
+_whisper_kind = None      # "faster" | "openai"
+
+
+def whisper_available():
+    """Schnelltest, ob eine lokale Whisper-Variante installiert ist."""
+    import importlib.util as _u
+    return (_u.find_spec("faster_whisper") is not None
+            or _u.find_spec("whisper") is not None)
+
+
+def _get_whisper(size="small", log=None):
+    """Laedt (und cached) ein Whisper-Modell. Bevorzugt faster-whisper
+    (schnell auf CPU, int8), faellt auf openai-whisper zurueck."""
+    global _whisper_model, _whisper_kind
+    import importlib.util as _u
+    if _whisper_model is not None and getattr(_whisper_model, "_a2m_size", None) == size:
+        return _whisper_model, _whisper_kind
+    if _u.find_spec("faster_whisper") is not None:
+        _emit(log, f"Lade Whisper-Modell '{size}' (faster-whisper) … "
+                   "beim ersten Mal wird es heruntergeladen.")
+        from faster_whisper import WhisperModel
+        m = WhisperModel(size, device="cpu", compute_type="int8")
+        m._a2m_size = size
+        _whisper_model, _whisper_kind = m, "faster"
+    elif _u.find_spec("whisper") is not None:
+        _emit(log, f"Lade Whisper-Modell '{size}' (openai-whisper) …")
+        import whisper
+        m = whisper.load_model(size)
+        m._a2m_size = size
+        _whisper_model, _whisper_kind = m, "openai"
+    else:
+        raise RuntimeError("Keine Whisper-Installation gefunden "
+                           "(pip install faster-whisper).")
+    _emit(log, "Whisper-Modell bereit.")
+    return _whisper_model, _whisper_kind
+
+
+def transcribe_segments(audio, sr, size="medium", language=None, log=None):
+    """Transkribiert (gesungenen) Text mit Wort-Zeitstempeln. audio: np.ndarray
+    (mono oder (frames, ch)) -- wird zu Mono/16 kHz gewandelt. Rueckgabe: Liste
+    von Zeilen [{'text', 'words': [{'word','start','end'}, ...]}, ...]; die
+    Zeilen entsprechen den Whisper-Segmenten (natuerliche Gesangs-Phrasen).
+
+    language: ISO-Code ('de', 'en', ...) erzwingt die Sprache -- bei Gesang
+    DRINGEND empfohlen, weil die automatische Spracherkennung an Musik gerne
+    danebenliegt (ein deutsches Lied wird sonst als Englisch 'uebersetzt').
+    None/''/'auto' = automatisch erkennen.
+
+    Fuer Lieder getunt: VAD ueberspringt Instrumental-/Stille-Passagen (weniger
+    erfundener Text), und condition_on_previous_text=False verhindert, dass sich
+    der Refrain in Endlosschleifen wiederholt."""
+    if language in ("", "auto", None):
+        language = None
+    m, kind = _get_whisper(size, log=log)
+    y = np.asarray(audio, dtype=np.float32)
+    if y.ndim == 2:
+        y = y.mean(axis=1)
+    if int(sr) != 16000:
+        y = librosa.resample(y, orig_sr=int(sr), target_sr=16000)
+    y = np.ascontiguousarray(y, dtype=np.float32)
+    _emit(log, "Transkribiere Gesang … (kann je nach Laenge dauern).")
+    lines = []
+    if kind == "faster":
+        segments, info = m.transcribe(
+            y, word_timestamps=True, language=language,
+            vad_filter=True, condition_on_previous_text=False)
+        lang = getattr(info, "language", None)
+        if lang:
+            _emit(log, f"Sprache: {lang}"
+                       + ("" if language else " (automatisch erkannt)"))
+        for seg in segments:                # Generator -> hier laeuft die KI
+            words = [{"word": (w.word or "").strip(),
+                      "start": float(w.start), "end": float(w.end)}
+                     for w in (seg.words or []) if (w.word or "").strip()]
+            if words:
+                lines.append({"text": seg.text.strip(), "words": words})
+    else:
+        res = m.transcribe(y, word_timestamps=True, language=language,
+                           condition_on_previous_text=False)
+        if res.get("language"):
+            _emit(log, f"Sprache: {res['language']}"
+                       + ("" if language else " (automatisch erkannt)"))
+        for seg in res.get("segments", []):
+            words = [{"word": (w.get("word") or "").strip(),
+                      "start": float(w.get("start", 0.0)),
+                      "end": float(w.get("end", 0.0))}
+                     for w in seg.get("words", []) if (w.get("word") or "").strip()]
+            if words:
+                lines.append({"text": (seg.get("text") or "").strip(),
+                              "words": words})
+    nwords = sum(len(l["words"]) for l in lines)
+    _emit(log, f"{nwords} Woerter in {len(lines)} Zeilen erkannt.")
+    return lines
+
+
+# Fuer ein lesbares Chord-Sheet nur die gaengigen Akkordtypen zulassen --
+# dim/maj7/sus4 flackern auf der gesangslosen Begleitung pro Beat zu stark.
+_SHEET_SUFFIXES = ("", "m", "7", "m7")
+
+
+def _suffix_mask(allowed):
+    """Bool-Maske ueber CHORD_NAMES (gleiche Reihenfolge wie _build_chord_templates):
+    True, wenn der Akkordtyp in 'allowed' liegt."""
+    mask = np.zeros(len(CHORD_NAMES), dtype=bool)
+    k = 0
+    for _i in range(12):
+        for suffix, _ivs in CHORD_TYPES:
+            mask[k] = suffix in allowed
+            k += 1
+    return mask
+
+
+_SHEET_MASK = _suffix_mask(_SHEET_SUFFIXES)
+
+
+def _merge_equal_chords(seq):
+    """Benachbarte gleiche Akkorde zu einem Abschnitt verschmelzen."""
+    out = []
+    for s in seq:
+        if out and out[-1]["chord"] == s["chord"]:
+            out[-1]["end"] = s["end"]
+        else:
+            out.append(dict(s))
+    return out
+
+
+def _merge_short_chords(seq, min_dur):
+    """Zu kurze Abschnitte (< min_dur s) im Nachbarn aufgehen lassen -- entfernt
+    einzelne Ausreisser, damit das Sheet ruhig bleibt."""
+    changed = True
+    while changed and len(seq) > 1:
+        changed = False
+        for i, s in enumerate(seq):
+            if s["end"] - s["start"] < min_dur:
+                if i > 0:
+                    seq[i - 1]["end"] = s["end"]
+                else:
+                    seq[i + 1]["start"] = s["start"]
+                seq.pop(i)
+                changed = True
+                break
+        seq = _merge_equal_chords(seq)
+    return seq
+
+
+def chord_sequence(y, sr, key=None, beat_times=None, win_beats=2,
+                   min_dur=1.2, simple=True, log=None):
+    """Offline-Akkordfolge eines ganzen Stuecks (ueber die vorhandene Erkennung
+    chroma_pcp + chord_scores). Fuer ein lesbares Sheet stabilisiert:
+      * je 'win_beats' Beats EIN Akkord (Chroma ueber das Fenster gemittelt),
+      * 'simple': nur Dur/Moll/7/m7 (kein dim/maj7/sus4-Flackern),
+      * 'min_dur': zu kurze Abschnitte gehen im Nachbarn auf.
+    Mit bekannter Tonart 'key' werden leitereigene Akkorde leicht bevorzugt.
+    Rueckgabe: Liste {'start','end','chord'} (Sekunden)."""
+    y = np.asarray(y, dtype=np.float32)
+    if y.ndim == 2:
+        y = y.mean(axis=1)
+    dur = len(y) / float(sr)
+    if beat_times is None:
+        _emit(log, "Suche Beats / Taktraster …")
+        try:
+            _tempo, frames = librosa.beat.beat_track(y=y, sr=sr)
+            beat_times = librosa.frames_to_time(frames, sr=sr)
+        except Exception:
+            beat_times = None
+    bt = np.asarray(beat_times, dtype=float) if beat_times is not None else None
+    if bt is None or bt.size < 2:
+        bt = np.arange(0.0, dur, 0.5)       # Ausweich: feste 0,5-s-Fenster
+    # Beats zu Fenstern von win_beats gruppieren (weniger, ruhigere Akkorde)
+    edges = list(bt[::max(1, int(win_beats))])
+    if edges[-1] < bt[-1]:
+        edges.append(float(bt[-1]))
+    _emit(log, "Trenne harmonischen Anteil (einmalig) …")
+    try:
+        yh = librosa.effects.harmonic(y, margin=4.0)
+    except Exception:
+        yh = y
+    diatonic = _diatonic_mask(key) if key else None
+    allowed = _SHEET_MASK if simple else None
+    _emit(log, f"Bestimme Akkorde ({max(0, len(edges) - 1)} Fenster) …")
+    raw, prev = [], None
+    minlen = int(0.05 * sr)
+    for i in range(len(edges) - 1):
+        a, b = int(edges[i] * sr), int(edges[i + 1] * sr)
+        if b - a < minlen:
+            continue
+        res = chroma_pcp(yh[a:b], sr, y_harm=yh[a:b])
+        ch = prev or "—"
+        if res:
+            pcp, bass = res[0], res[1]
+            scores = chord_scores(pcp, bass)
+            if scores is not None:
+                if prev is not None:
+                    k = _CHORD_IDX.get(prev)
+                    if k is not None:
+                        scores[k] += CHORD_STICKY
+                if diatonic is not None:
+                    scores = scores + KEY_CHORD_PRIOR * diatonic
+                if allowed is not None:
+                    scores = np.where(allowed, scores, -1e9)
+                ch = CHORD_NAMES[int(np.argmax(scores))]
+        raw.append({"start": float(edges[i]), "end": float(edges[i + 1]),
+                    "chord": ch})
+        prev = ch
+    seq = _merge_equal_chords(raw)
+    seq = _merge_short_chords(seq, min_dur)
+    _emit(log, f"{len(seq)} Akkord-Abschnitte.")
+    return seq
+
+
+def _chord_at(chords, t):
+    """Welcher Akkord klingt zur Zeit t? (lineare Suche, Listen sind kurz)."""
+    last = None
+    for c in chords:
+        if c["start"] <= t:
+            last = c["chord"]
+        else:
+            break
+    return last
+
+
+def build_chord_sheet(lines, chords, title="", key="", bpm=0.0):
+    """Baut aus Text-Zeilen (mit Wort-Zeitstempeln) und der Akkordfolge ein
+    Chord-Sheet. Rueckgabe (text, chordpro):
+      * text: Akkordzeile ueber der Textzeile (Monospace, Ultimate-Guitar-Stil),
+      * chordpro: dasselbe im ChordPro-Format ([C]Wort), transponier-/druckbar.
+    Ein Akkord wird ueber das Wort geschrieben, ueber dem er (gegenueber dem
+    zuletzt gesetzten) wechselt; fuehrende Akkorde stehen ueber dem ersten Wort."""
+    valid = [c for c in chords if c["chord"] and c["chord"] != "—"]
+    head = []
+    if title:
+        head.append(title)
+    meta = []
+    if key:
+        meta.append(f"Tonart: {key}")
+    if bpm and bpm > 0:
+        meta.append(f"Tempo: {bpm:.0f} BPM")
+    if meta:
+        head.append("  ·  ".join(meta))
+    if head:
+        head.append("")
+
+    text_lines, cp_lines = [], []
+    running = None
+    for ln in lines:
+        lyric, chordline, cp = "", "", ""
+        for w in ln["words"]:
+            active = _chord_at(valid, w["start"])
+            label = active if (active and active != running) else None
+            col = len(lyric)
+            if label:
+                # mindestens ein Leerzeichen zum vorigen Akkord -> Text ggf.
+                # nachruecken, damit Labels nie aneinanderkleben ("Gsus4C")
+                if chordline and col <= len(chordline):
+                    pad = len(chordline) - col + 1
+                    lyric += " " * pad
+                    col = len(lyric)
+                chordline = chordline.ljust(col) + label
+                cp += f"[{label}]"
+                running = active
+            cp += w["word"] + " "
+            lyric += w["word"] + " "
+        text_lines.append(chordline.rstrip())
+        text_lines.append(lyric.rstrip())
+        text_lines.append("")
+        cp_lines.append(cp.rstrip())
+
+    text = "\n".join(head + text_lines).rstrip() + "\n"
+    cp_head = []
+    if title:
+        cp_head.append(f"{{title: {title}}}")
+    if key:
+        cp_head.append(f"{{key: {key}}}")
+    if bpm and bpm > 0:
+        cp_head.append(f"{{tempo: {bpm:.0f}}}")
+    if cp_head:
+        cp_head.append("")
+    chordpro = "\n".join(cp_head + cp_lines).rstrip() + "\n"
+    return text, chordpro
+
+
+def song_sheet(path, model="htdemucs", whisper_size="medium", language=None,
+               log=None):
+    """Komplettpipeline: Datei -> Stems (Gesang isolieren) -> Text (Whisper) +
+    Akkorde (Begleitung) -> Chord-Sheet. Rueckgabe-dict mit 'text', 'chordpro',
+    'key', 'bpm', 'lines', 'chords'. OFFLINE, kann einige Minuten dauern."""
+    _emit(log, "== Schritt 1/4: Gesang per KI heraustrennen ==")
+    stems, sr = separate_stems(path, model, log=log)
+    vocals = stems.get("vocals")
+    if vocals is None:
+        raise RuntimeError("Kein Gesang-Stem erhalten (Modell ohne 'vocals'?).")
+    # Begleitung = Summe aller Nicht-Gesang-Stems (fuer die Akkorde)
+    acc = None
+    for name, a in stems.items():
+        if name == "vocals":
+            continue
+        a = np.asarray(a, dtype=np.float32)
+        if acc is None:
+            acc = a.copy()
+        else:
+            n = min(len(acc), len(a))
+            acc = acc[:n] + a[:n]
+    if acc is None:
+        acc = np.asarray(vocals, dtype=np.float32)   # Notnagel
+
+    _emit(log, "== Schritt 2/4: Gesangstext transkribieren ==")
+    lines = transcribe_segments(vocals, sr, size=whisper_size,
+                                language=language, log=log)
+
+    _emit(log, "== Schritt 3/4: Tonart + Akkorde bestimmen ==")
+    acc_mono = acc.mean(axis=1) if acc.ndim == 2 else acc
+    try:
+        key = estimate_key(acc_mono, sr)
+    except Exception:
+        key = ""
+    try:
+        bpm = float(estimate_tempo(acc_mono, sr) or 0.0)
+    except Exception:
+        bpm = 0.0
+    chords = chord_sequence(acc_mono, sr, key=key, log=log)
+
+    _emit(log, "== Schritt 4/4: Chord-Sheet zusammensetzen ==")
+    title = os.path.splitext(os.path.basename(path))[0]
+    text, chordpro = build_chord_sheet(lines, chords, title=title,
+                                       key=key, bpm=bpm)
+    _emit(log, "Fertig – Chord-Sheet steht.")
+    return {"text": text, "chordpro": chordpro, "key": key, "bpm": bpm,
+            "lines": lines, "chords": chords, "title": title}
+
+
 class StemPlayer:
     """Spielt mehrere Stem-Spuren gemischt ab -- Pegel je Spur live regelbar,
     eigener sounddevice-OutputStream (unabhaengig vom DJ-Modus). Fuer den
@@ -4571,6 +4908,42 @@ def run_stems_export(path, out_dir=None):
     print("Fertig.")
 
 
+def run_song_sheet(path, out_dir=None, language=None, whisper_size="medium"):
+    """Konsole: Gesang heraustrennen + transkribieren, Akkorde bestimmen und ein
+    Chord-Sheet schreiben (Text + ChordPro). Offline, kann einige Minuten dauern.
+    language: 'de'/'en'/... erzwingt die Sprache (bei Gesang empfohlen)."""
+    if not os.path.exists(path):
+        sys.exit(f"Datei nicht gefunden: {path}")
+    if not demucs_available():
+        sys.exit("Song-Sheet braucht 'demucs'. Installiere mit: pip install demucs")
+    if not whisper_available():
+        sys.exit("Song-Sheet braucht 'faster-whisper'. "
+                 "Installiere mit: pip install faster-whisper")
+    out_dir = out_dir or os.path.dirname(os.path.abspath(path)) or os.getcwd()
+    if not os.path.isdir(out_dir):
+        sys.exit(f"Zielordner nicht gefunden: {out_dir}")
+    print(f"\nErzeuge Song-Sheet (lokal & offline) aus:\n  {path}")
+    print(f"  Sprache: {language or 'automatisch'}  ·  Modell: {whisper_size}")
+    try:
+        res = song_sheet(path, model="htdemucs", whisper_size=whisper_size,
+                         language=language, log=lambda m: print("  " + m))
+    except Exception as e:
+        sys.exit(f"Song-Sheet fehlgeschlagen: {e}")
+    base = sanitize_filename(res.get("title") or
+                             os.path.splitext(os.path.basename(path))[0])
+    txt_p = os.path.join(out_dir, base + ".txt")
+    cp_p = os.path.join(out_dir, base + ".chordpro")
+    with open(txt_p, "w", encoding="utf-8") as fh:
+        fh.write(res["text"])
+    with open(cp_p, "w", encoding="utf-8") as fh:
+        fh.write(res["chordpro"])
+    print("\n" + res["text"])
+    print("Geschrieben:")
+    print("  " + txt_p)
+    print("  " + cp_p)
+    print("Fertig.")
+
+
 def _console_stop_and_save(shared):
     """Konsole: laufende Aufnahme stoppen, in Stuecke zerlegen und als WAV
     speichern (gemeinsamer Zielordner, Namensvorschlag BPM+Tonart)."""
@@ -4644,6 +5017,15 @@ def main():
     stems_path = _arg_value('--stems')
     if stems_path:
         run_stems_export(stems_path, _arg_value('--out'))
+        return
+
+    # Song-Sheet: Gesangstext (Whisper) + Akkorde -> Text + ChordPro
+    #   --lang de|en (Sprache erzwingen, empfohlen)  --whisper small|medium|large-v3
+    sheet_path = _arg_value('--sheet')
+    if sheet_path:
+        run_song_sheet(sheet_path, _arg_value('--out'),
+                       language=_arg_value('--lang'),
+                       whisper_size=_arg_value('--whisper') or "medium")
         return
 
     winmm = None

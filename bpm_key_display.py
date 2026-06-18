@@ -201,6 +201,7 @@ class DisplayApp:
         self._stems_export_res = None         # (paths|None, err) vom Export-Thread
         self._rec_stems_res = None            # (stems|None, sr, err) Aufnahme->Stems
         self._stem_players = []               # offene StemPlayer (Aufnahme->Stems)
+        self._song_sheet_res = None           # (result|None, err) Song-Sheet-Thread
         self._load_options()                  # Optionen + BPM-Bereich anwenden
 
         # ---- Schriften (Groesse wird bei Resize angepasst) ----
@@ -510,6 +511,8 @@ class DisplayApp:
                            self.open_note_calib).pack(side="left", padx=(16, 0))
         self._small_button(bottom, "Stems exportieren …",
                            self.open_stems_export).pack(side="left", padx=(10, 0))
+        self._small_button(bottom, "Song-Sheet …",
+                           self.open_song_sheet).pack(side="left", padx=(10, 0))
         tk.Button(bottom, text="Start", command=self.on_setup_start,
                   font=self.f_btn, bg="#1D9E75", fg="#04342C",
                   activebackground=COL_OK, activeforeground="#04342C",
@@ -1817,6 +1820,169 @@ class DisplayApp:
             self._stem_log_error(log)
             self._stems_export_res = (None, str(e))
 
+    # ------------------------------------------------------------------
+    # Song-Sheet (Gesangstext + Akkorde -> Chord-Sheet)
+    # ------------------------------------------------------------------
+    def _ask_sheet_options(self):
+        """Kleiner Dialog: Sprache (Auto/Deutsch/English) + Modellgröße. Gibt
+        {'language','model'} zurueck oder None (Abbruch). Die Wahl wird gemerkt."""
+        cfg = load_config()
+        lang_map = [("Automatisch", "auto"), ("Deutsch", "de"), ("English", "en")]
+        model_map = [("Mittel – empfohlen", "medium"),
+                     ("Klein – schnell", "small"),
+                     ("Groß – beste Qualität (langsam)", "large-v3")]
+        cur_lang = cfg.get("sheet_lang", "auto")
+        cur_model = cfg.get("sheet_model", "medium")
+        win = tk.Toplevel(self.root)
+        win.title("Song-Sheet – Optionen")
+        win.configure(bg=COL_BG)
+        win.transient(self.root)
+        win.grab_set()
+        tk.Label(win, text="Song-Sheet erstellen", font=self.f_h1, bg=COL_BG,
+                 fg=COL_FG).pack(pady=(12, 2))
+        tk.Label(win, text="Sprache des Gesangs und Modellgröße wählen.",
+                 font=self.f_tiny, bg=COL_BG, fg=COL_MUTED).pack(pady=(0, 10))
+        body = tk.Frame(win, bg=COL_BG)
+        body.pack(padx=20, pady=4)
+
+        def _menu(row, label, options, current):
+            tk.Label(body, text=label, font=self.f_small, bg=COL_BG,
+                     fg=COL_ACCENT).grid(row=row, column=0, sticky="w",
+                                         pady=4, padx=(0, 12))
+            var = tk.StringVar(value=next((lbl for lbl, v in options
+                                           if v == current), options[0][0]))
+            om = tk.OptionMenu(body, var, *[lbl for lbl, _ in options])
+            om.config(bg=COL_SURFACE, fg=COL_FG, activebackground=COL_SURF_HI,
+                      activeforeground=COL_FG, bd=0, highlightthickness=0,
+                      font=self.f_small, cursor="hand2")
+            om["menu"].config(bg=COL_SURFACE, fg=COL_FG)
+            om.grid(row=row, column=1, sticky="we")
+            return var
+
+        lvar = _menu(0, "Sprache", lang_map, cur_lang)
+        mvar = _menu(1, "Modell", model_map, cur_model)
+        tk.Label(win, text="Tipp: Bei bekannter Sprache fest wählen – die\n"
+                 "automatische Erkennung liegt bei Gesang oft daneben.",
+                 font=self.f_tiny, bg=COL_BG, fg=COL_MUTED,
+                 justify="left").pack(pady=(8, 0), padx=20)
+        result = {}
+
+        def _ok():
+            lang = next(v for lbl, v in lang_map if lbl == lvar.get())
+            model = next(v for lbl, v in model_map if lbl == mvar.get())
+            save_config({**load_config(), "sheet_lang": lang, "sheet_model": model})
+            result["language"] = None if lang == "auto" else lang
+            result["model"] = model
+            win.destroy()
+
+        ctl = tk.Frame(win, bg=COL_BG)
+        ctl.pack(pady=12)
+        tk.Button(ctl, text="Sheet erstellen", command=_ok, font=self.f_btn,
+                  bg="#1D9E75", fg="#04342C", activebackground=COL_OK,
+                  activeforeground="#04342C", bd=0, padx=20, pady=6,
+                  highlightthickness=0, cursor="hand2").pack(side="left", padx=6)
+        self._small_button(ctl, "Abbrechen", win.destroy).pack(side="left", padx=6)
+        win.wait_window()
+        return result or None
+
+    def open_song_sheet(self):
+        """Datei waehlen, Gesang per KI heraustrennen + transkribieren, Akkorde
+        bestimmen und ein Chord-Sheet (Akkorde ueber dem Text) erzeugen."""
+        if not core.demucs_available():
+            self.err_label.config(
+                text="Song-Sheet braucht 'demucs' (pip install demucs).")
+            return
+        if not core.whisper_available():
+            self.err_label.config(
+                text="Song-Sheet braucht 'faster-whisper' (pip install faster-whisper).")
+            return
+        opts = self._ask_sheet_options()
+        if not opts:
+            return
+        path = filedialog.askopenfilename(
+            title="Datei für das Song-Sheet",
+            filetypes=[("Audio", "*.wav *.flac *.mp3 *.ogg *.m4a *.aif *.aiff"),
+                       ("Alle Dateien", "*.*")])
+        if not path:
+            return
+        self.err_label.config(text="Erzeuge Song-Sheet (KI, lokal) … siehe Fortschrittsfenster.")
+        log = self._stem_log_open("Song-Sheet")
+        self._stem_log(log, f"Datei: {path}")
+        self._stem_log(log, f"Sprache: {opts['language'] or 'automatisch'}  ·  "
+                            f"Modell: {opts['model']}")
+        threading.Thread(target=self._song_sheet_thread,
+                         args=(path, opts, log), daemon=True).start()
+
+    def _song_sheet_thread(self, path, opts, log):
+        try:
+            res = core.song_sheet(path, model="htdemucs",
+                                  whisper_size=opts["model"],
+                                  language=opts["language"],
+                                  log=lambda m: self._stem_log(log, m))
+            self._song_sheet_res = (res, None)
+        except Exception as e:
+            self._stem_log_error(log)
+            self._song_sheet_res = (None, str(e))
+
+    def _open_sheet_window(self, res):
+        """Zeigt das fertige Chord-Sheet (Monospace) und bietet Speichern als
+        Textdatei bzw. ChordPro."""
+        win = tk.Toplevel(self.root)
+        title = res.get("title") or "Song-Sheet"
+        win.title(f"Song-Sheet – {title}")
+        win.configure(bg=COL_BG)
+        win.geometry("780x560")
+        meta = []
+        if res.get("key"):
+            meta.append(res["key"])
+        if res.get("bpm"):
+            meta.append(f"{res['bpm']:.0f} BPM")
+        tk.Label(win, text=title, font=self.f_h1, bg=COL_BG, fg=COL_FG).pack(pady=(12, 2))
+        if meta:
+            tk.Label(win, text="  ·  ".join(meta), font=self.f_tiny, bg=COL_BG,
+                     fg=COL_MUTED).pack(pady=(0, 6))
+        frame = tk.Frame(win, bg=COL_BG)
+        frame.pack(fill="both", expand=True, padx=14, pady=4)
+        sb = tk.Scrollbar(frame)
+        sb.pack(side="right", fill="y")
+        txt = tk.Text(frame, wrap="none", bg=COL_SURFACE, fg=COL_FG,
+                      insertbackground=COL_FG, bd=0, highlightthickness=0,
+                      font=("Courier", 11), yscrollcommand=sb.set)
+        txt.pack(side="left", fill="both", expand=True)
+        sb.config(command=txt.yview)
+        txt.insert("1.0", res.get("text", ""))
+        txt.config(state="disabled")
+
+        def _save(kind):
+            if kind == "chordpro":
+                content = res.get("chordpro", "")
+                fname = core.sanitize_filename(title) + ".chordpro"
+                types = [("ChordPro", "*.chordpro *.cho *.pro"), ("Alle", "*.*")]
+            else:
+                content = res.get("text", "")
+                fname = core.sanitize_filename(title) + ".txt"
+                types = [("Textdatei", "*.txt"), ("Alle", "*.*")]
+            cfg = load_config()
+            p = filedialog.asksaveasfilename(
+                title="Song-Sheet speichern", initialfile=fname,
+                initialdir=cfg.get("last_save_dir") or "", filetypes=types)
+            if not p:
+                return
+            try:
+                with open(p, "w", encoding="utf-8") as fh:
+                    fh.write(content)
+                save_config({**cfg, "last_save_dir": os.path.dirname(p)})
+            except Exception as e:
+                messagebox.showerror("Speichern", f"Konnte nicht speichern:\n{e}")
+
+        ctl = tk.Frame(win, bg=COL_BG)
+        ctl.pack(pady=8)
+        self._small_button(ctl, "Als Text speichern …",
+                           lambda: _save("text")).pack(side="left", padx=6)
+        self._small_button(ctl, "Als ChordPro speichern …",
+                           lambda: _save("chordpro")).pack(side="left", padx=6)
+        self._small_button(ctl, "Schließen", win.destroy).pack(side="left", padx=6)
+
     def on_setup_start(self):
         sel = self.lb_in.curselection()
         if not sel or not self.sources:
@@ -2061,6 +2227,15 @@ class DisplayApp:
             elif paths:
                 self.err_label.config(
                     text=f"{len(paths)} Stems gespeichert in {os.path.dirname(paths[0])}")
+        # Song-Sheet fertig? -> Sheet-Fenster oeffnen
+        if self._song_sheet_res is not None:
+            res, err = self._song_sheet_res
+            self._song_sheet_res = None
+            if err:
+                self.err_label.config(text=f"Song-Sheet fehlgeschlagen: {err}")
+            elif res:
+                self.err_label.config(text="Song-Sheet fertig.")
+                self._open_sheet_window(res)
         # Datei-Modus: verzoegerter Start (Analyse-Thread -> Main-Thread, Tk-only)
         if self._file_begin_args is not None:
             kind, gen, payload = self._file_begin_args

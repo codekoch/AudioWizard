@@ -103,6 +103,28 @@ Eingänge; unter macOS leistet das ein virtuelles Ausgabegerät wie
   es zum Laden) oder die `demucs.api` fehlt – ist die installierte Demucs-/
   PyTorch-Version unvollständig, weicht das Programm automatisch auf einen anderen
   Weg aus.
+- **Song-Sheet (Text + Akkorde)** (optional) – aus einer Datei entsteht ein
+  **Chord-Sheet wie bei Ultimate Guitar**: die Akkorde stehen über den jeweiligen
+  Wörtern des gesungenen Textes. Ablauf komplett **lokal/offline**: Demucs trennt
+  zuerst den **Gesang** heraus (das verbessert die Transkription deutlich), eine
+  lokale **Whisper-KI** transkribiert den Gesang mit Wort-Zeitstempeln, und die
+  **Begleitung** (alles außer Gesang) geht in die vorhandene **Akkord-Erkennung**
+  (über je zwei Beats ein Akkord, auf die gängigen Typen Dur/Moll/7/m7 beschränkt
+  und leitereigene Akkorde der erkannten Tonart leicht bevorzugt – das hält das
+  Sheet ruhig). Im Einstellungsbildschirm „Song-Sheet …" (ein kleiner Dialog
+  fragt **Sprache** und **Modellgröße** ab) bzw. `--sheet DATEI [--out ORDNER]
+  [--lang de|en] [--whisper small|medium|large-v3]` in der Konsole. Das Ergebnis
+  wird in einem Fenster angezeigt und lässt sich als **Textdatei** und als
+  **ChordPro** (`.chordpro`, transponier-/druckbar) speichern.
+  Braucht zusätzlich **`faster-whisper`** (`pip install faster-whisper`; lädt beim
+  ersten Mal ein Sprachmodell) sowie `demucs`; ohne bleibt das Feature aus. Es
+  wird ein **mehrsprachiges** Modell genutzt (Deutsch und Englisch gleichermaßen),
+  Standard ist „medium". **Tipp:** Bei bekanntem Gesang die Sprache fest wählen –
+  die automatische Spracherkennung liegt bei Musik gern daneben (ein deutsches
+  Lied wird sonst als Englisch „übersetzt"). Hinweise: gesungener Text wird „gut,
+  aber nicht fehlerfrei" erkannt, die Akkorde sind eine Approximation (kein
+  Profi-Transkriptor), und der Lauf kann je nach CPU einige Minuten dauern (eher
+  ein PC- als ein Pi-Feature).
 - **Zwei Oberflächen** – Konsolen-Version (`realtime_bpm_key_midiclock.py`)
   und Touch-taugliche Kiosk-GUI (`bpm_key_display.py`) für ein 7-Zoll-Display
   am Raspberry Pi; unter Windows und macOS läuft sie im Fenster.
