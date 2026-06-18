@@ -7,7 +7,8 @@
 
 **Hört Musik mit und zeigt live Tempo, Tonart und Akkorde an – und liefert
 dazu eine stabile MIDI-Clock, die Drumcomputer, Sequenzer, Arpeggiatoren und
-Delays synchron zum laufenden Song taktet.**
+Delays synchron zum laufenden Song taktet. Zusätzlich gibt es noch zahlreiche
+andere Features wie z.B. die Erstellung von Songsheets oder Stems aus Audiodateien.**
 
 ![Hauptanzeige](docs/screenshot_display.png)
 
