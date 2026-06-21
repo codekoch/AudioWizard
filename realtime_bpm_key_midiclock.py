@@ -3098,6 +3098,9 @@ def _get_whisper(size="small", log=None):
     import importlib.util as _u
     if _whisper_model is not None and getattr(_whisper_model, "_a2m_size", None) == size:
         return _whisper_model, _whisper_kind
+    # Windows: HuggingFace warnt sonst lautstark ueber fehlende Symlink-Rechte
+    # (Cache funktioniert trotzdem) -- diese Warnung abschalten.
+    os.environ.setdefault("HF_HUB_DISABLE_SYMLINKS_WARNING", "1")
     if _u.find_spec("faster_whisper") is not None:
         _emit(log, f"Lade Whisper-Modell '{size}' (faster-whisper) … "
                    "beim ersten Mal wird es heruntergeladen.")
@@ -3227,7 +3230,7 @@ def _merge_short_chords(seq, min_dur):
 
 
 def chord_sequence(y, sr, key=None, beat_times=None, win_beats=2,
-                   min_dur=1.2, simple=True, log=None):
+                   min_dur=1.2, simple=True, key_bias=0.12, log=None):
     """Offline-Akkordfolge eines ganzen Stuecks (ueber die vorhandene Erkennung
     chroma_pcp + chord_scores). Fuer ein lesbares Sheet stabilisiert:
       * je 'win_beats' Beats EIN Akkord (Chroma ueber das Fenster gemittelt),
@@ -3263,28 +3266,32 @@ def chord_sequence(y, sr, key=None, beat_times=None, win_beats=2,
     _emit(log, f"Bestimme Akkorde ({max(0, len(edges) - 1)} Fenster) …")
     raw, prev = [], None
     minlen = int(0.05 * sr)
-    for i in range(len(edges) - 1):
-        a, b = int(edges[i] * sr), int(edges[i + 1] * sr)
-        if b - a < minlen:
-            continue
-        res = chroma_pcp(yh[a:b], sr, y_harm=yh[a:b])
-        ch = prev or "—"
-        if res:
-            pcp, bass = res[0], res[1]
-            scores = chord_scores(pcp, bass)
-            if scores is not None:
-                if prev is not None:
-                    k = _CHORD_IDX.get(prev)
-                    if k is not None:
-                        scores[k] += CHORD_STICKY
-                if diatonic is not None:
-                    scores = scores + KEY_CHORD_PRIOR * diatonic
-                if allowed is not None:
-                    scores = np.where(allowed, scores, -1e9)
-                ch = CHORD_NAMES[int(np.argmax(scores))]
-        raw.append({"start": float(edges[i]), "end": float(edges[i + 1]),
-                    "chord": ch})
-        prev = ch
+    # Kurze Akkordfenster lassen die CQT "n_fft zu gross"-Warnungen fluten
+    # (harmlos, nur Zero-Padding) -- hier lokal unterdruecken.
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore")
+        for i in range(len(edges) - 1):
+            a, b = int(edges[i] * sr), int(edges[i + 1] * sr)
+            if b - a < minlen:
+                continue
+            res = chroma_pcp(yh[a:b], sr, y_harm=yh[a:b])
+            ch = prev or "—"
+            if res:
+                pcp, bass = res[0], res[1]
+                scores = chord_scores(pcp, bass)
+                if scores is not None:
+                    if prev is not None:
+                        k = _CHORD_IDX.get(prev)
+                        if k is not None:
+                            scores[k] += CHORD_STICKY
+                    if diatonic is not None:
+                        scores = scores + key_bias * diatonic
+                    if allowed is not None:
+                        scores = np.where(allowed, scores, -1e9)
+                    ch = CHORD_NAMES[int(np.argmax(scores))]
+            raw.append({"start": float(edges[i]), "end": float(edges[i + 1]),
+                        "chord": ch})
+            prev = ch
     seq = _merge_equal_chords(raw)
     seq = _merge_short_chords(seq, min_dur)
     _emit(log, f"{len(seq)} Akkord-Abschnitte.")
@@ -3302,13 +3309,43 @@ def _chord_at(chords, t):
     return last
 
 
-def build_chord_sheet(lines, chords, title="", key="", bpm=0.0):
+def _chords_in_range(chords, t0, t1):
+    """Akkorde im Zeitfenster [t0, t1) als Folge von Labels (aufeinanderfolgende
+    Wiederholungen zusammengefasst) -- fuer Instrumental-/Intro-Zeilen."""
+    out = []
+    for c in chords:
+        if c["end"] > t0 and c["start"] < t1:
+            if not out or out[-1] != c["chord"]:
+                out.append(c["chord"])
+    return out
+
+
+def _wrap_words(words, width):
+    """Woerter (mit Zeitstempeln) auf Teilzeilen <= width Zeichen umbrechen
+    (an Wortgrenzen). Rueckgabe: Liste von Wortlisten."""
+    subs, cur, ln = [], [], 0
+    for w in words:
+        wlen = len(w["word"]) + 1
+        if cur and ln + wlen > width:
+            subs.append(cur)
+            cur, ln = [], 0
+        cur.append(w)
+        ln += wlen
+    if cur:
+        subs.append(cur)
+    return subs
+
+
+def build_chord_sheet(lines, chords, title="", key="", bpm=0.0, width=84,
+                      gap_instr=4.0):
     """Baut aus Text-Zeilen (mit Wort-Zeitstempeln) und der Akkordfolge ein
-    Chord-Sheet. Rueckgabe (text, chordpro):
-      * text: Akkordzeile ueber der Textzeile (Monospace, Ultimate-Guitar-Stil),
-      * chordpro: dasselbe im ChordPro-Format ([C]Wort), transponier-/druckbar.
-    Ein Akkord wird ueber das Wort geschrieben, ueber dem er (gegenueber dem
-    zuletzt gesetzten) wechselt; fuehrende Akkorde stehen ueber dem ersten Wort."""
+    Chord-Sheet im Ultimate-Guitar-Stil. Rueckgabe (text, chordpro):
+      * text: Akkordzeile ueber der Textzeile (Monospace),
+      * chordpro: ChordPro ([C]Wort), transponier-/druckbar.
+    Eigenschaften: lange Gesangszeilen werden umbrochen (width); zu Beginn jeder
+    Zeile steht der gerade klingende Akkord, danach nur die Wechsel; Intro-,
+    Zwischen- und Schluss-Instrumentalteile bekommen eine eigene Akkordzeile
+    (nur, wenn die Pause >= gap_instr Sekunden ist)."""
     valid = [c for c in chords if c["chord"] and c["chord"] != "—"]
     head = []
     if title:
@@ -3324,29 +3361,55 @@ def build_chord_sheet(lines, chords, title="", key="", bpm=0.0):
         head.append("")
 
     text_lines, cp_lines = [], []
-    running = None
+
+    def _emit_instr(t0, t1):
+        seq = _chords_in_range(valid, t0, t1)
+        if seq:
+            text_lines.append(" ".join(seq))
+            text_lines.append("")
+            cp_lines.append(" ".join(f"[{c}]" for c in seq))
+
+    first_t = next((ln["words"][0]["start"] for ln in lines if ln["words"]), None)
+    if first_t is not None and first_t > gap_instr:
+        _emit_instr(0.0, first_t)            # Intro
+
+    prev_end = None
     for ln in lines:
-        lyric, chordline, cp = "", "", ""
-        for w in ln["words"]:
-            active = _chord_at(valid, w["start"])
-            label = active if (active and active != running) else None
-            col = len(lyric)
-            if label:
-                # mindestens ein Leerzeichen zum vorigen Akkord -> Text ggf.
-                # nachruecken, damit Labels nie aneinanderkleben ("Gsus4C")
-                if chordline and col <= len(chordline):
-                    pad = len(chordline) - col + 1
-                    lyric += " " * pad
+        words = ln["words"]
+        if not words:
+            continue
+        if prev_end is not None and words[0]["start"] - prev_end >= gap_instr:
+            _emit_instr(prev_end, words[0]["start"])   # Instrumental-Zwischenteil
+        cp = ""
+        cp_running = None
+        for sub in _wrap_words(words, width):
+            lyric, chordline = "", ""
+            line_running = None              # Akkord am Anfang JEDER Zeile zeigen
+            for w in sub:
+                active = _chord_at(valid, w["start"])
+                if active and active != line_running:
                     col = len(lyric)
-                chordline = chordline.ljust(col) + label
-                cp += f"[{label}]"
-                running = active
-            cp += w["word"] + " "
-            lyric += w["word"] + " "
-        text_lines.append(chordline.rstrip())
-        text_lines.append(lyric.rstrip())
-        text_lines.append("")
+                    if chordline and col <= len(chordline):
+                        pad = len(chordline) - col + 1
+                        lyric += " " * pad
+                        col = len(lyric)
+                    chordline = chordline.ljust(col) + active
+                    line_running = active
+                if active and active != cp_running:
+                    cp += f"[{active}]"
+                    cp_running = active
+                lyric += w["word"] + " "
+                cp += w["word"] + " "
+            text_lines.append(chordline.rstrip())
+            text_lines.append(lyric.rstrip())
+            text_lines.append("")
         cp_lines.append(cp.rstrip())
+        prev_end = words[-1]["end"]
+
+    if valid and prev_end is not None:       # Outro
+        last_t = max(c["end"] for c in valid)
+        if last_t - prev_end >= gap_instr:
+            _emit_instr(prev_end, last_t)
 
     text = "\n".join(head + text_lines).rstrip() + "\n"
     cp_head = []
