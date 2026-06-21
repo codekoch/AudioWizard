@@ -198,10 +198,9 @@ class DisplayApp:
         self.dj_w = [{}, {}]                  # Widget-Referenzen je Deck
         self._dj_load_res = None              # (idx, audio, sr, info, key, name)
         self._dj_stems_res = None             # (idx, stems, sr, err) vom Trenn-Thread
-        self._stems_export_res = None         # (paths|None, err) vom Export-Thread
-        self._rec_stems_res = None            # (stems|None, sr, err) Aufnahme->Stems
-        self._stem_players = []               # offene StemPlayer (Aufnahme->Stems)
-        self._song_sheet_res = None           # (result|None, err) Song-Sheet-Thread
+        self._stem_players = []               # offene StemPlayer
+        self._material_res = None             # (out|None, err) vom Verarbeitungs-Thread
+        self._material_clock = None           # Datei-Pfad: Clock NACH Verarbeitung
         self._load_options()                  # Optionen + BPM-Bereich anwenden
 
         # ---- Schriften (Groesse wird bei Resize angepasst) ----
@@ -509,10 +508,6 @@ class DisplayApp:
                  bg=COL_BG, fg="#55544E").pack(anchor="w", pady=(2, 0))
         self._small_button(bottom, "Noten-Kalibrierung …",
                            self.open_note_calib).pack(side="left", padx=(16, 0))
-        self._small_button(bottom, "Stems exportieren …",
-                           self.open_stems_export).pack(side="left", padx=(10, 0))
-        self._small_button(bottom, "Song-Sheet …",
-                           self.open_song_sheet).pack(side="left", padx=(10, 0))
         tk.Button(bottom, text="Start", command=self.on_setup_start,
                   font=self.f_btn, bg="#1D9E75", fg="#04342C",
                   activebackground=COL_OK, activeforeground="#04342C",
@@ -734,15 +729,24 @@ class DisplayApp:
         return f"{s // 60}:{s % 60:02d}"
 
     def on_load_file(self):
-        """Audiodatei waehlen, vorab zu einer Beat-Map analysieren und mit
-        driftfreier MIDI-Clock abspielen (mirror der WebApp). Beendet eine
-        laufende Live-Sitzung."""
+        """Audiodatei waehlen und fragen, was damit passieren soll: MIDI-Clock
+        abspielen, Stems exportieren/abspielen und/oder ein Song-Sheet erzeugen
+        (beliebig kombinierbar; die Stem-Trennung laeuft dann nur einmal)."""
         path = filedialog.askopenfilename(
             title="Audiodatei waehlen",
             filetypes=[("Audio", "*.wav *.flac *.mp3 *.ogg *.m4a *.aif *.aiff"),
                        ("Alle Dateien", "*.*")])
         if not path:
             return
+        actions = self._ask_actions(os.path.basename(path), allow_clock=True)
+        if not actions:
+            return
+        title = os.path.splitext(os.path.basename(path))[0]
+        self._run_material(path, actions, title)
+
+    def _begin_file_clock(self, path):
+        """Datei vorab zu einer Beat-Map analysieren und mit driftfreier
+        MIDI-Clock abspielen (mirror der WebApp). Beendet eine laufende Sitzung."""
         self.stop_session()                   # Live-Sitzung beenden (zaehlt gen hoch)
         self.show_main()
         self.file_mode = True
@@ -979,8 +983,8 @@ class DisplayApp:
             padx=18, pady=6, highlightthickness=0, cursor="hand2",
             state="disabled")
         self._rec_all_btn.pack(side="left")
-        self._small_button(bf, "In Stems trennen & abspielen",
-                           self._rec_to_stems).pack(side="left", padx=(10, 0))
+        self._small_button(bf, "Weiter (Stems / Song-Sheet) …",
+                           self._rec_actions).pack(side="left", padx=(10, 0))
         self._small_button(bf, "Schließen", win.destroy).pack(side="right")
         threading.Thread(target=self._segment_rec_thread, daemon=True).start()
         win.after(250, self._poll_rec_segs)
@@ -1052,34 +1056,17 @@ class DisplayApp:
         self._stem_log(log, "── FEHLER ──")
         self._stem_log(log, traceback.format_exc().rstrip())
 
-    def _rec_to_stems(self):
-        """Aufnahme direkt per KI in Stems trennen und in einem Stem-Player
-        abspielbar machen (Drums/Bass/Vocals/Rest, einzeln/parallel)."""
+    def _rec_actions(self):
+        """Aufnahme weiterverarbeiten: fragt, was passieren soll (Stems
+        exportieren/abspielen, Song-Sheet) – ohne die Aufnahme erst speichern zu
+        muessen. Die Stem-Trennung laeuft danach nur einmal fuer alle Aktionen."""
         if self._rec_audio is None:
             return
-        if not core.demucs_available():
-            messagebox.showinfo(
-                "Stem-Trennung nicht verfügbar",
-                "Dafür wird das lokale KI-Modell 'demucs' benötigt.\n\n"
-                "Installieren mit:\n    pip install demucs\n\n"
-                "(zieht PyTorch nach). Danach erneut versuchen.")
+        actions = self._ask_actions("Aufnahme", allow_clock=False)
+        if not actions:
             return
-        self._rec_info.config(
-            text="Trenne Aufnahme in Stems (KI, lokal) … siehe Fortschrittsfenster.")
-        rec, sr = self._rec_audio, self._rec_sr
-        log = self._stem_log_open("Aufnahme → Stems")
-        threading.Thread(target=self._rec_stems_thread, args=(rec, sr, log),
-                         daemon=True).start()
-
-    def _rec_stems_thread(self, rec, sr, log):
-        try:
-            stems, ssr = core.separate_stems_array(
-                rec, sr, model="htdemucs",
-                log=lambda m: self._stem_log(log, m))
-            self._rec_stems_res = (stems, ssr, None)
-        except Exception as e:
-            self._stem_log_error(log)
-            self._rec_stems_res = (None, 0, str(e))
+        self._run_material(("array", self._rec_audio, self._rec_sr),
+                           actions, "Aufnahme")
 
     def _open_stem_player(self, stems_dict, sr):
         """Fenster mit Pegel-Fadern je Stem + Play/Pause; spielt die getrennten
@@ -1781,148 +1768,165 @@ class DisplayApp:
             v.set(self._CALIB_DEFAULTS[k])
 
     # ------------------------------------------------------------------
-    # Stems exportieren (KI-Trennung -> einzelne WAVs)
+    # Zentraler "Was tun?"-Dialog (nach Datei-Import / Aufnahme)
     # ------------------------------------------------------------------
-    def open_stems_export(self):
-        """Datei wählen, lokal per Demucs in Stems trennen und als WAVs ablegen.
-        Läuft im Hintergrund (kann je nach CPU einige Minuten dauern)."""
-        if not core.demucs_available():
-            self.err_label.config(
-                text="Stem-Trennung braucht das Paket 'demucs' (pip install demucs).")
-            return
-        path = filedialog.askopenfilename(
-            title="Datei für die Stem-Trennung",
-            filetypes=[("Audio", "*.wav *.flac *.mp3 *.ogg *.m4a *.aif *.aiff"),
-                       ("Alle Dateien", "*.*")])
-        if not path:
-            return
-        cfg = load_config()
-        out_dir = filedialog.askdirectory(
-            title="Zielordner für die Stems",
-            initialdir=cfg.get("last_save_dir") or os.path.dirname(path))
-        if not out_dir:
-            out_dir = os.path.dirname(path)
-        save_config({**cfg, "last_save_dir": out_dir})
-        self.err_label.config(text="Trenne Stems (KI, lokal) … siehe Fortschrittsfenster.")
-        log = self._stem_log_open("Stem-Export")
-        self._stem_log(log, f"Datei: {path}")
-        self._stem_log(log, f"Zielordner: {out_dir}")
-        threading.Thread(target=self._stems_export_thread,
-                         args=(path, out_dir, log), daemon=True).start()
-
-    def _stems_export_thread(self, path, out_dir, log):
-        try:
-            paths = core.separate_stems_to_files(
-                path, out_dir, model="htdemucs",
-                log=lambda m: self._stem_log(log, m))
-            self._stems_export_res = (paths, None)
-        except Exception as e:
-            self._stem_log_error(log)
-            self._stems_export_res = (None, str(e))
-
-    # ------------------------------------------------------------------
-    # Song-Sheet (Gesangstext + Akkorde -> Chord-Sheet)
-    # ------------------------------------------------------------------
-    def _ask_sheet_options(self):
-        """Kleiner Dialog: Sprache (Auto/Deutsch/English) + Modellgröße. Gibt
-        {'language','model'} zurueck oder None (Abbruch). Die Wahl wird gemerkt."""
+    def _ask_actions(self, subtitle, allow_clock=True):
+        """Fragt nach dem Import einer Datei / nach einer Aufnahme, was damit
+        passieren soll. Mehrfachauswahl moeglich; die teure Stem-Trennung laeuft
+        anschliessend nur EINMAL fuer alle Stem-Aktionen. Rueckgabe dict
+        {clock, export, sheet, play, out_dir, language, model} oder None."""
+        demucs_ok = core.demucs_available()
+        whisper_ok = core.whisper_available()
         cfg = load_config()
         lang_map = [("Automatisch", "auto"), ("Deutsch", "de"), ("English", "en")]
         model_map = [("Mittel – empfohlen", "medium"),
                      ("Klein – schnell", "small"),
                      ("Groß – beste Qualität (langsam)", "large-v3")]
-        cur_lang = cfg.get("sheet_lang", "auto")
-        cur_model = cfg.get("sheet_model", "medium")
         win = tk.Toplevel(self.root)
-        win.title("Song-Sheet – Optionen")
+        win.title("Was soll passieren?")
         win.configure(bg=COL_BG)
         win.transient(self.root)
         win.grab_set()
-        tk.Label(win, text="Song-Sheet erstellen", font=self.f_h1, bg=COL_BG,
+        tk.Label(win, text="Was soll passieren?", font=self.f_h1, bg=COL_BG,
                  fg=COL_FG).pack(pady=(12, 2))
-        tk.Label(win, text="Sprache des Gesangs und Modellgröße wählen.",
-                 font=self.f_tiny, bg=COL_BG, fg=COL_MUTED).pack(pady=(0, 10))
+        tk.Label(win, text=subtitle, font=self.f_tiny, bg=COL_BG,
+                 fg=COL_MUTED).pack(pady=(0, 10))
         body = tk.Frame(win, bg=COL_BG)
-        body.pack(padx=20, pady=4)
+        body.pack(padx=24, pady=4, anchor="w", fill="x")
+        v_clock = tk.BooleanVar(value=allow_clock)
+        v_export = tk.BooleanVar(value=False)
+        v_sheet = tk.BooleanVar(value=False)
+        v_play = tk.BooleanVar(value=False)
+
+        def _cb(text, var, enabled=True, note=""):
+            cb = tk.Checkbutton(
+                body, text=text, variable=var, font=self.f_small, bg=COL_BG,
+                fg=COL_FG if enabled else COL_MUTED, selectcolor=COL_SURFACE,
+                activebackground=COL_BG, activeforeground=COL_FG, bd=0,
+                highlightthickness=0, anchor="w")
+            if not enabled:
+                var.set(False)
+                cb.config(state="disabled")
+            cb.pack(anchor="w", pady=2)
+            if note:
+                tk.Label(body, text="      " + note, font=self.f_tiny, bg=COL_BG,
+                         fg=COL_MUTED).pack(anchor="w")
+            return cb
+
+        if allow_clock:
+            _cb("MIDI-Clock-Ausgabe (Datei abspielen, driftfreie Clock)", v_clock)
+        _cb("Stems exportieren (einzelne WAVs speichern)", v_export, demucs_ok,
+            "" if demucs_ok else "braucht: pip install demucs")
+        _cb("Stems anschließend abspielen (zusammen/getrennt)", v_play, demucs_ok)
+        _cb("Song-Sheet erstellen (Text + Akkorde)", v_sheet,
+            demucs_ok and whisper_ok,
+            "" if (demucs_ok and whisper_ok) else "braucht: pip install faster-whisper")
+
+        # Sprache/Modell (nur fuer das Song-Sheet relevant)
+        optf = tk.Frame(body, bg=COL_BG)
+        optf.pack(anchor="w", pady=(8, 0), fill="x")
 
         def _menu(row, label, options, current):
-            tk.Label(body, text=label, font=self.f_small, bg=COL_BG,
-                     fg=COL_ACCENT).grid(row=row, column=0, sticky="w",
-                                         pady=4, padx=(0, 12))
+            tk.Label(optf, text=label, font=self.f_tiny, bg=COL_BG,
+                     fg=COL_ACCENT).grid(row=row, column=0, sticky="w", padx=(0, 10))
             var = tk.StringVar(value=next((lbl for lbl, v in options
                                            if v == current), options[0][0]))
-            om = tk.OptionMenu(body, var, *[lbl for lbl, _ in options])
+            om = tk.OptionMenu(optf, var, *[lbl for lbl, _ in options])
             om.config(bg=COL_SURFACE, fg=COL_FG, activebackground=COL_SURF_HI,
                       activeforeground=COL_FG, bd=0, highlightthickness=0,
-                      font=self.f_small, cursor="hand2")
+                      font=self.f_tiny, cursor="hand2")
             om["menu"].config(bg=COL_SURFACE, fg=COL_FG)
             om.grid(row=row, column=1, sticky="we")
             return var
 
-        lvar = _menu(0, "Sprache", lang_map, cur_lang)
-        mvar = _menu(1, "Modell", model_map, cur_model)
-        tk.Label(win, text="Tipp: Bei bekannter Sprache fest wählen – die\n"
+        lvar = _menu(0, "Sheet-Sprache", lang_map, cfg.get("sheet_lang", "auto"))
+        mvar = _menu(1, "Sheet-Modell", model_map, cfg.get("sheet_model", "medium"))
+        tk.Label(body, text="Tipp: Beim Song-Sheet die Sprache fest wählen – die\n"
                  "automatische Erkennung liegt bei Gesang oft daneben.",
                  font=self.f_tiny, bg=COL_BG, fg=COL_MUTED,
-                 justify="left").pack(pady=(8, 0), padx=20)
+                 justify="left").pack(anchor="w", pady=(8, 0))
         result = {}
 
         def _ok():
+            if not (v_clock.get() or v_export.get() or v_sheet.get() or v_play.get()):
+                return                       # nichts gewaehlt -> Dialog offen lassen
+            out_dir = None
+            if v_export.get():
+                out_dir = filedialog.askdirectory(
+                    title="Zielordner für die Stems",
+                    initialdir=cfg.get("last_save_dir") or "")
+                if not out_dir:
+                    return                   # Abbruch der Ordnerwahl -> zurueck
             lang = next(v for lbl, v in lang_map if lbl == lvar.get())
             model = next(v for lbl, v in model_map if lbl == mvar.get())
-            save_config({**load_config(), "sheet_lang": lang, "sheet_model": model})
-            result["language"] = None if lang == "auto" else lang
-            result["model"] = model
+            new_cfg = {**load_config(), "sheet_lang": lang, "sheet_model": model}
+            if out_dir:
+                new_cfg["last_save_dir"] = out_dir
+            save_config(new_cfg)
+            result.update(clock=bool(v_clock.get()) if allow_clock else False,
+                          export=bool(v_export.get()), sheet=bool(v_sheet.get()),
+                          play=bool(v_play.get()), out_dir=out_dir,
+                          language=None if lang == "auto" else lang, model=model)
             win.destroy()
 
         ctl = tk.Frame(win, bg=COL_BG)
         ctl.pack(pady=12)
-        tk.Button(ctl, text="Sheet erstellen", command=_ok, font=self.f_btn,
-                  bg="#1D9E75", fg="#04342C", activebackground=COL_OK,
-                  activeforeground="#04342C", bd=0, padx=20, pady=6,
-                  highlightthickness=0, cursor="hand2").pack(side="left", padx=6)
+        tk.Button(ctl, text="Los", command=_ok, font=self.f_btn, bg="#1D9E75",
+                  fg="#04342C", activebackground=COL_OK, activeforeground="#04342C",
+                  bd=0, padx=24, pady=6, highlightthickness=0,
+                  cursor="hand2").pack(side="left", padx=6)
         self._small_button(ctl, "Abbrechen", win.destroy).pack(side="left", padx=6)
         win.wait_window()
         return result or None
 
-    def open_song_sheet(self):
-        """Datei waehlen, Gesang per KI heraustrennen + transkribieren, Akkorde
-        bestimmen und ein Chord-Sheet (Akkorde ueber dem Text) erzeugen."""
-        if not core.demucs_available():
-            self.err_label.config(
-                text="Song-Sheet braucht 'demucs' (pip install demucs).")
+    def _run_material(self, source, actions, title):
+        """Verarbeitet importierte Musik (Datei-Pfad ODER ('array', rec, sr)) gemaess
+        der gewaehlten Aktionen. Stem-Trennung laeuft nur einmal fuer alle Aktionen.
+        Reiner Clock-Fall (Datei) geht direkt ohne Trenn-Aufwand in den Datei-Modus."""
+        needs_stems = actions["export"] or actions["sheet"] or actions["play"]
+        if not needs_stems:
+            if actions.get("clock") and not isinstance(source, tuple):
+                self._begin_file_clock(source)
             return
-        if not core.whisper_available():
-            self.err_label.config(
-                text="Song-Sheet braucht 'faster-whisper' (pip install faster-whisper).")
-            return
-        opts = self._ask_sheet_options()
-        if not opts:
-            return
-        path = filedialog.askopenfilename(
-            title="Datei für das Song-Sheet",
-            filetypes=[("Audio", "*.wav *.flac *.mp3 *.ogg *.m4a *.aif *.aiff"),
-                       ("Alle Dateien", "*.*")])
-        if not path:
-            return
-        self.err_label.config(text="Erzeuge Song-Sheet (KI, lokal) … siehe Fortschrittsfenster.")
-        log = self._stem_log_open("Song-Sheet")
-        self._stem_log(log, f"Datei: {path}")
-        self._stem_log(log, f"Sprache: {opts['language'] or 'automatisch'}  ·  "
-                            f"Modell: {opts['model']}")
-        threading.Thread(target=self._song_sheet_thread,
-                         args=(path, opts, log), daemon=True).start()
+        # Clock (falls gewaehlt, nur fuer Dateien) erst NACH der Verarbeitung starten
+        self._material_clock = source if (actions.get("clock")
+                                          and not isinstance(source, tuple)) else None
+        log = self._stem_log_open("Verarbeitung")
+        self._stem_log(log, title)
+        bits = [n for n, on in (("Export", actions["export"]),
+                                ("Song-Sheet", actions["sheet"]),
+                                ("Abspielen", actions["play"]),
+                                ("MIDI-Clock", actions.get("clock"))) if on]
+        self._stem_log(log, "Gewählt: " + ", ".join(bits))
+        threading.Thread(target=self._material_worker,
+                         args=(source, actions, title, log), daemon=True).start()
 
-    def _song_sheet_thread(self, path, opts, log):
+    def _material_worker(self, source, actions, title, log):
         try:
-            res = core.song_sheet(path, model="htdemucs",
-                                  whisper_size=opts["model"],
-                                  language=opts["language"],
-                                  log=lambda m: self._stem_log(log, m))
-            self._song_sheet_res = (res, None)
+            cb = lambda m: self._stem_log(log, m)
+            out = {"actions": actions, "title": title, "sheet": None,
+                   "stems": None, "stem_sr": None, "export_paths": None}
+            self._stem_log(log, "== Stems trennen (einmalig) ==")
+            if isinstance(source, tuple):            # ('array', rec, sr)
+                _tag, rec, srr = source
+                stems, ssr = core.separate_stems_array(rec, srr, log=cb)
+            else:
+                stems, ssr = core.separate_stems(source, log=cb)
+            if actions["export"]:
+                self._stem_log(log, "== Stems exportieren ==")
+                out["export_paths"] = core.write_stems_to_files(
+                    stems, ssr, actions["out_dir"], base=title, log=cb)
+            if actions["sheet"]:
+                self._stem_log(log, "== Song-Sheet erstellen ==")
+                out["sheet"] = core.song_sheet_from_stems(
+                    stems, ssr, title=title, whisper_size=actions["model"],
+                    language=actions["language"], log=cb)
+            if actions["play"]:
+                out["stems"], out["stem_sr"] = stems, ssr
+            self._material_res = (out, None)
         except Exception as e:
             self._stem_log_error(log)
-            self._song_sheet_res = (None, str(e))
+            self._material_res = (None, str(e))
 
     def _open_sheet_window(self, res):
         """Zeigt das fertige Chord-Sheet (Monospace) und bietet Speichern als
@@ -2206,36 +2210,30 @@ class DisplayApp:
     # Anzeige-Aktualisierung (~6x pro Sekunde)
     # ------------------------------------------------------------------
     def _tick(self):
-        # Aufnahme->Stems fertig? -> Stem-Player oeffnen
-        if self._rec_stems_res is not None:
-            stems, ssr, err = self._rec_stems_res
-            self._rec_stems_res = None
+        # Verarbeitung (Export/Sheet/Abspielen) fertig? -> Ergebnisse oeffnen
+        if self._material_res is not None:
+            out, err = self._material_res
+            self._material_res = None
             if err:
-                messagebox.showerror("Stem-Trennung fehlgeschlagen", str(err))
-            elif stems:
-                try:
-                    self._rec_info.config(text="Stems bereit – im Stem-Player abspielbar.")
-                except Exception:
-                    pass
-                self._open_stem_player(stems, ssr)
-        # Stems-Export fertig? (Hintergrund-Thread -> Anzeige im Setup)
-        if self._stems_export_res is not None:
-            paths, err = self._stems_export_res
-            self._stems_export_res = None
-            if err:
-                self.err_label.config(text=f"Stem-Trennung fehlgeschlagen: {err}")
-            elif paths:
-                self.err_label.config(
-                    text=f"{len(paths)} Stems gespeichert in {os.path.dirname(paths[0])}")
-        # Song-Sheet fertig? -> Sheet-Fenster oeffnen
-        if self._song_sheet_res is not None:
-            res, err = self._song_sheet_res
-            self._song_sheet_res = None
-            if err:
-                self.err_label.config(text=f"Song-Sheet fehlgeschlagen: {err}")
-            elif res:
-                self.err_label.config(text="Song-Sheet fertig.")
-                self._open_sheet_window(res)
+                self.err_label.config(text=f"Verarbeitung fehlgeschlagen: {err}")
+                self._material_clock = None
+            elif out:
+                msgs = []
+                if out.get("export_paths"):
+                    msgs.append(f"{len(out['export_paths'])} Stems gespeichert")
+                if out.get("sheet"):
+                    self._open_sheet_window(out["sheet"])
+                    msgs.append("Song-Sheet erstellt")
+                if out.get("stems"):
+                    self._open_stem_player(out["stems"], out["stem_sr"])
+                    msgs.append("Stem-Player offen")
+                if msgs:
+                    self.err_label.config(text="Fertig: " + ", ".join(msgs))
+                # MIDI-Clock (nur Datei) erst jetzt starten, nach der Verarbeitung
+                if self._material_clock is not None:
+                    src = self._material_clock
+                    self._material_clock = None
+                    self._begin_file_clock(src)
         # Datei-Modus: verzoegerter Start (Analyse-Thread -> Main-Thread, Tk-only)
         if self._file_begin_args is not None:
             kind, gen, payload = self._file_begin_args

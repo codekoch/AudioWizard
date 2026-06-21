@@ -88,11 +88,14 @@ Eingänge; unter macOS leistet das ein virtuelles Ausgabegerät wie
   zerlegen. Im **DJ-Modus** trennt die Schaltfläche „Stems" je Deck und öffnet
   einen Stem-Mischer (Pegel je Instrument, **in Echtzeit** mischbar – echte
   Instrument-Isolation statt bloßer Frequenzfilterung; lässt sich mit dem
-  Tempo-Sync kombinieren). Auch eine **Aufnahme** lässt sich direkt zerlegen:
-  im Speichern-Fenster „In Stems trennen & abspielen" öffnet einen kleinen
-  **Stem-Player** (Pegel-Fader je Spur, Play/Pause). Zum reinen **Export** gibt es
-  „Stems exportieren …" im Einstellungsbildschirm bzw. `--stems DATEI [--out ORDNER]`
-  in der Konsole (speichert die Spuren als einzelne WAVs). Braucht das zusätzliche Paket **`demucs`**
+  Tempo-Sync kombinieren). Außerhalb des DJ-Modus läuft alles über **einen
+  gemeinsamen Dialog „Was soll passieren?"**: nach dem **Laden einer Datei** oder
+  nach einer **Aufnahme** lassen sich **MIDI-Clock-Ausgabe, Stem-Export, Stems
+  abspielen** (zusammen/getrennt, im **Stem-Player** mit Pegel-Fadern je Spur) und
+  **Song-Sheet** beliebig **kombinieren** – die teure KI-Trennung läuft dabei nur
+  **einmal** für alle gewählten Aktionen, und eine Aufnahme muss nicht erst als
+  Datei gespeichert werden. In der Konsole exportiert `--stems DATEI [--out ORDNER]`
+  die Spuren als einzelne WAVs. Braucht das zusätzliche Paket **`demucs`**
   (`pip install demucs`, zieht PyTorch); ohne bleibt das Feature einfach aus. Die
   KI-Trennung läuft offline und kann je nach CPU einige Minuten je Stück dauern.
   Während der Trennung öffnet sich ein eigenes **Fortschritts-/Log-Fenster**: es
@@ -112,8 +115,9 @@ Eingänge; unter macOS leistet das ein virtuelles Ausgabegerät wie
   **Begleitung** (alles außer Gesang) geht in die vorhandene **Akkord-Erkennung**
   (über je zwei Beats ein Akkord, auf die gängigen Typen Dur/Moll/7/m7 beschränkt
   und leitereigene Akkorde der erkannten Tonart leicht bevorzugt – das hält das
-  Sheet ruhig). Im Einstellungsbildschirm „Song-Sheet …" (ein kleiner Dialog
-  fragt **Sprache** und **Modellgröße** ab) bzw. `--sheet DATEI [--out ORDNER]
+  Sheet ruhig). Aufgerufen über den **„Was soll passieren?"-Dialog** beim Laden
+  einer Datei bzw. nach einer Aufnahme (er fragt auch **Sprache** und
+  **Modellgröße** ab) bzw. `--sheet DATEI [--out ORDNER]
   [--lang de|en] [--whisper small|medium|large-v3]` in der Konsole. Das Ergebnis
   wird in einem Fenster angezeigt und lässt sich als **Textdatei** und als
   **ChordPro** (`.chordpro`, transponier-/druckbar) speichern.

@@ -3027,32 +3027,36 @@ def separate_stems(path, model="htdemucs", log=None):
     raise RuntimeError("Stem-Trennung fehlgeschlagen – " + "; ".join(errors))
 
 
-def separate_stems_to_files(path, out_dir, model="htdemucs", base=None, log=None):
-    """Trennt eine Datei und speichert die Spuren als einzelne WAVs.
-    Rueckgabe: Liste der geschriebenen Pfade."""
+def write_stems_to_files(stems, sr, out_dir, base="stems", log=None):
+    """Schreibt BEREITS getrennte Stems als einzelne WAVs (PCM_16) in out_dir.
+    Rueckgabe: Liste der geschriebenen Pfade. So muss bei kombinierten Aktionen
+    (Export + Sheet + Abspielen) die Trennung nur einmal laufen."""
     if sf is None:
         raise RuntimeError("soundfile nicht verfuegbar (pip install soundfile)")
-    stems, sr = separate_stems(path, model, log=log)
-    base = sanitize_filename(base or os.path.splitext(os.path.basename(path))[0])
+    base = sanitize_filename(base or "stems")
     _emit(log, f"Speichere Stems nach {out_dir} …")
+    # bekannte Stems zuerst, dann evtl. zusaetzliche (6s-Modell: guitar/piano)
+    order = list(STEM_NAMES) + [n for n in stems if n not in STEM_NAMES]
     written = []
-    for name in STEM_NAMES:
+    for name in order:
         if name not in stems:
             continue
         p = os.path.join(out_dir, f"{base}_{name}.wav")
         sf.write(p, stems[name], sr, subtype='PCM_16')
         written.append(p)
         _emit(log, "  ✓ " + os.path.basename(p))
-    # evtl. zusaetzliche Stems (6s-Modell: guitar/piano) ebenfalls schreiben
-    for name, audio in stems.items():
-        if name in STEM_NAMES:
-            continue
-        p = os.path.join(out_dir, f"{base}_{name}.wav")
-        sf.write(p, audio, sr, subtype='PCM_16')
-        written.append(p)
-        _emit(log, "  ✓ " + os.path.basename(p))
     _emit(log, f"Fertig – {len(written)} Datei(en) gespeichert.")
     return written
+
+
+def separate_stems_to_files(path, out_dir, model="htdemucs", base=None, log=None):
+    """Trennt eine Datei und speichert die Spuren als einzelne WAVs.
+    Rueckgabe: Liste der geschriebenen Pfade."""
+    if sf is None:
+        raise RuntimeError("soundfile nicht verfuegbar (pip install soundfile)")
+    stems, sr = separate_stems(path, model, log=log)
+    base = base or os.path.splitext(os.path.basename(path))[0]
+    return write_stems_to_files(stems, sr, out_dir, base=base, log=log)
 
 
 def separate_stems_array(audio, sr, model="htdemucs", log=None):
@@ -3425,17 +3429,8 @@ def build_chord_sheet(lines, chords, title="", key="", bpm=0.0, width=84,
     return text, chordpro
 
 
-def song_sheet(path, model="htdemucs", whisper_size="medium", language=None,
-               log=None):
-    """Komplettpipeline: Datei -> Stems (Gesang isolieren) -> Text (Whisper) +
-    Akkorde (Begleitung) -> Chord-Sheet. Rueckgabe-dict mit 'text', 'chordpro',
-    'key', 'bpm', 'lines', 'chords'. OFFLINE, kann einige Minuten dauern."""
-    _emit(log, "== Schritt 1/4: Gesang per KI heraustrennen ==")
-    stems, sr = separate_stems(path, model, log=log)
-    vocals = stems.get("vocals")
-    if vocals is None:
-        raise RuntimeError("Kein Gesang-Stem erhalten (Modell ohne 'vocals'?).")
-    # Begleitung = Summe aller Nicht-Gesang-Stems (fuer die Akkorde)
+def accompaniment_from_stems(stems):
+    """Begleitung = Summe aller Nicht-Gesang-Stems (fuer die Akkorde)."""
     acc = None
     for name, a in stems.items():
         if name == "vocals":
@@ -3446,14 +3441,26 @@ def song_sheet(path, model="htdemucs", whisper_size="medium", language=None,
         else:
             n = min(len(acc), len(a))
             acc = acc[:n] + a[:n]
+    return acc
+
+
+def song_sheet_from_stems(stems, sr, title="", whisper_size="medium",
+                          language=None, log=None):
+    """Chord-Sheet aus BEREITS getrennten Stems bauen (Schritte 2-4). So muss
+    die teure Stem-Trennung nur einmal laufen, wenn neben dem Sheet z. B. auch
+    der Stem-Export gewuenscht ist. Rueckgabe wie song_sheet()."""
+    vocals = stems.get("vocals")
+    if vocals is None:
+        raise RuntimeError("Kein Gesang-Stem erhalten (Modell ohne 'vocals'?).")
+    acc = accompaniment_from_stems(stems)
     if acc is None:
         acc = np.asarray(vocals, dtype=np.float32)   # Notnagel
 
-    _emit(log, "== Schritt 2/4: Gesangstext transkribieren ==")
+    _emit(log, "== Gesangstext transkribieren ==")
     lines = transcribe_segments(vocals, sr, size=whisper_size,
                                 language=language, log=log)
 
-    _emit(log, "== Schritt 3/4: Tonart + Akkorde bestimmen ==")
+    _emit(log, "== Tonart + Akkorde bestimmen ==")
     acc_mono = acc.mean(axis=1) if acc.ndim == 2 else acc
     try:
         key = estimate_key(acc_mono, sr)
@@ -3465,13 +3472,25 @@ def song_sheet(path, model="htdemucs", whisper_size="medium", language=None,
         bpm = 0.0
     chords = chord_sequence(acc_mono, sr, key=key, log=log)
 
-    _emit(log, "== Schritt 4/4: Chord-Sheet zusammensetzen ==")
-    title = os.path.splitext(os.path.basename(path))[0]
+    _emit(log, "== Chord-Sheet zusammensetzen ==")
     text, chordpro = build_chord_sheet(lines, chords, title=title,
                                        key=key, bpm=bpm)
     _emit(log, "Fertig – Chord-Sheet steht.")
     return {"text": text, "chordpro": chordpro, "key": key, "bpm": bpm,
             "lines": lines, "chords": chords, "title": title}
+
+
+def song_sheet(path, model="htdemucs", whisper_size="medium", language=None,
+               log=None):
+    """Komplettpipeline: Datei -> Stems (Gesang isolieren) -> Text (Whisper) +
+    Akkorde (Begleitung) -> Chord-Sheet. Rueckgabe-dict mit 'text', 'chordpro',
+    'key', 'bpm', 'lines', 'chords'. OFFLINE, kann einige Minuten dauern."""
+    _emit(log, "== Gesang per KI heraustrennen ==")
+    stems, sr = separate_stems(path, model, log=log)
+    title = os.path.splitext(os.path.basename(path))[0]
+    return song_sheet_from_stems(stems, sr, title=title,
+                                 whisper_size=whisper_size,
+                                 language=language, log=log)
 
 
 class StemPlayer:
