@@ -962,23 +962,26 @@ def chord_tail_sec(onset_env, fr, bpm):
                          offs + CHORD_TAIL_BEATS * 60.0 / bpm)))
 
 
-def chord_scores(pcp, bass=None):
+def chord_scores(pcp, bass=None, bass_weight=None):
     """Rohe Template-Scores fuer ALLE Akkorde auf einem Chroma-Profil:
     Pearson-Korrelation je Schablone plus Bass-Bonus. None, wenn das
     Profil leer/unbrauchbar ist.
 
     Der Bass-Bonus entscheidet zwischen tonverwandten Deutungen (C-Dur
     und Am7 teilen drei Toene): Grundton (und schwaecher: Quinte) im
-    Bass spricht fuer den Akkord auf diesem Grundton."""
+    Bass spricht fuer den Akkord auf diesem Grundton. bass_weight ueber-
+    schreibt CHORD_BASS_WEIGHT (z. B. hoeher, wenn der Bass aus einem
+    SAUBEREN Bass-Stem statt aus dem Tiefband eines Mixes kommt)."""
     if pcp is None or not np.any(pcp):
         return None
     p = pcp - pcp.mean()
     n = float(np.linalg.norm(p))
     if n <= 1e-9:
         return None
+    bw = CHORD_BASS_WEIGHT if bass_weight is None else bass_weight
     scores = _CHORD_MAT @ (p / n)          # Pearson je Schablone
     if bass is not None and np.any(bass):
-        root_bonus = CHORD_BASS_WEIGHT * (bass + 0.5 * np.roll(bass, -7))
+        root_bonus = bw * (bass + 0.5 * np.roll(bass, -7))
         scores = scores + np.repeat(root_bonus, len(CHORD_TYPES))
     return scores
 
@@ -3201,6 +3204,10 @@ def _suffix_mask(allowed):
 
 
 _SHEET_MASK = _suffix_mask(_SHEET_SUFFIXES)
+# Noch strenger: nur Dur-/Moll-DREIKLAENGE. Auf der gesangslosen Begleitung sind
+# Septakkorde (Em7/Am7 ...) kaum sauseinanderzuhalten und verwaschen das Sheet --
+# fuer ein Ultimate-Guitar-Sheet sind saubere Dreiklaenge meist das Richtige.
+_TRIAD_MASK = _suffix_mask(("", "m"))
 
 
 def _merge_equal_chords(seq):
@@ -3233,13 +3240,17 @@ def _merge_short_chords(seq, min_dur):
     return seq
 
 
-def chord_sequence(y, sr, key=None, beat_times=None, win_beats=2,
-                   min_dur=1.2, simple=True, key_bias=0.12, log=None):
+def chord_sequence(y, sr, key=None, bass_audio=None, beat_times=None,
+                   win_beats=2, min_dur=1.2, triads_only=True, simple=True,
+                   key_bias=0.12, bass_weight=None, log=None):
     """Offline-Akkordfolge eines ganzen Stuecks (ueber die vorhandene Erkennung
     chroma_pcp + chord_scores). Fuer ein lesbares Sheet stabilisiert:
       * je 'win_beats' Beats EIN Akkord (Chroma ueber das Fenster gemittelt),
-      * 'simple': nur Dur/Moll/7/m7 (kein dim/maj7/sus4-Flackern),
+      * 'triads_only': nur Dur-/Moll-Dreiklaenge (sonst 'simple': +7/m7),
       * 'min_dur': zu kurze Abschnitte gehen im Nachbarn auf.
+    'bass_audio' (z. B. der getrennte Bass-Stem) liefert einen SAUBEREN Grundton
+    -- das entscheidet zwischen tonverwandten Akkorden (C vs. Am, G vs. Em) und
+    behebt die haeufigste Fehlerkennung. 'bass_weight' steuert dessen Gewicht.
     Mit bekannter Tonart 'key' werden leitereigene Akkorde leicht bevorzugt.
     Rueckgabe: Liste {'start','end','chord'} (Sekunden)."""
     y = np.asarray(y, dtype=np.float32)
@@ -3265,8 +3276,24 @@ def chord_sequence(y, sr, key=None, beat_times=None, win_beats=2,
         yh = librosa.effects.harmonic(y, margin=4.0)
     except Exception:
         yh = y
+    # Sauberes Bass-Chromagramm aus dem Bass-Stem (falls vorhanden)
+    bass_cg = None
+    if bass_audio is not None:
+        ba = np.asarray(bass_audio, dtype=np.float32)
+        if ba.ndim == 2:
+            ba = ba.mean(axis=1)
+        try:
+            with warnings.catch_warnings():
+                warnings.simplefilter("ignore")
+                bass_cg = librosa.feature.chroma_cqt(
+                    y=ba, sr=sr, fmin=librosa.note_to_hz('C1'),
+                    n_octaves=4, hop_length=CHROMA_HOP)
+        except Exception:
+            bass_cg = None
+    if bass_weight is None:
+        bass_weight = 0.9 if bass_cg is not None else None
     diatonic = _diatonic_mask(key) if key else None
-    allowed = _SHEET_MASK if simple else None
+    allowed = _TRIAD_MASK if triads_only else (_SHEET_MASK if simple else None)
     _emit(log, f"Bestimme Akkorde ({max(0, len(edges) - 1)} Fenster) …")
     raw, prev = [], None
     minlen = int(0.05 * sr)
@@ -3282,7 +3309,13 @@ def chord_sequence(y, sr, key=None, beat_times=None, win_beats=2,
             ch = prev or "—"
             if res:
                 pcp, bass = res[0], res[1]
-                scores = chord_scores(pcp, bass)
+                if bass_cg is not None:                # sauberer Stem-Bass
+                    f0 = int(edges[i] * sr / CHROMA_HOP)
+                    f1 = max(f0 + 1, int(edges[i + 1] * sr / CHROMA_HOP))
+                    bv = bass_cg[:, f0:min(f1, bass_cg.shape[1])].mean(axis=1)
+                    bs = bv.sum()
+                    bass = bv / bs if bs > 0 else bass
+                scores = chord_scores(pcp, bass, bass_weight=bass_weight)
                 if scores is not None:
                     if prev is not None:
                         k = _CHORD_IDX.get(prev)
@@ -3462,6 +3495,11 @@ def song_sheet_from_stems(stems, sr, title="", whisper_size="medium",
 
     _emit(log, "== Tonart + Akkorde bestimmen ==")
     acc_mono = acc.mean(axis=1) if acc.ndim == 2 else acc
+    bass_stem = stems.get("bass")
+    bass_mono = None
+    if bass_stem is not None:
+        b = np.asarray(bass_stem, dtype=np.float32)
+        bass_mono = b.mean(axis=1) if b.ndim == 2 else b
     try:
         key = estimate_key(acc_mono, sr)
     except Exception:
@@ -3470,7 +3508,7 @@ def song_sheet_from_stems(stems, sr, title="", whisper_size="medium",
         bpm = float(estimate_tempo(acc_mono, sr) or 0.0)
     except Exception:
         bpm = 0.0
-    chords = chord_sequence(acc_mono, sr, key=key, log=log)
+    chords = chord_sequence(acc_mono, sr, key=key, bass_audio=bass_mono, log=log)
 
     _emit(log, "== Chord-Sheet zusammensetzen ==")
     text, chordpro = build_chord_sheet(lines, chords, title=title,

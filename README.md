@@ -112,10 +112,13 @@ Eingänge; unter macOS leistet das ein virtuelles Ausgabegerät wie
   Wörtern des gesungenen Textes. Ablauf komplett **lokal/offline**: Demucs trennt
   zuerst den **Gesang** heraus (das verbessert die Transkription deutlich), eine
   lokale **Whisper-KI** transkribiert den Gesang mit Wort-Zeitstempeln, und die
-  **Begleitung** (alles außer Gesang) geht in die vorhandene **Akkord-Erkennung**
-  (über je zwei Beats ein Akkord, auf die gängigen Typen Dur/Moll/7/m7 beschränkt
-  und leitereigene Akkorde der erkannten Tonart leicht bevorzugt – das hält das
-  Sheet ruhig). Aufgerufen über den **„Was soll passieren?"-Dialog** beim Laden
+  **Begleitung** (alles außer Gesang) geht in die **Akkord-Erkennung** (über je
+  zwei Beats ein Akkord). Den **Grundton** liefert dabei der **getrennte
+  Bass-Stem** – ein sauberes Bass-Signal, das tonverwandte Akkorde sicher
+  unterscheidet (C vs. Am, G vs. Em) und so die häufigste Fehlerkennung behebt;
+  fürs Sheet werden bewusst **nur Dur-/Moll-Dreiklänge** zugelassen (Septakkorde
+  flackern auf der gesangslosen Begleitung) und leitereigene Akkorde der
+  erkannten Tonart leicht bevorzugt. Aufgerufen über den **„Was soll passieren?"-Dialog** beim Laden
   einer Datei bzw. nach einer Aufnahme (er fragt auch **Sprache** und
   **Modellgröße** ab) bzw. `--sheet DATEI [--out ORDNER]
   [--lang de|en] [--whisper small|medium|large-v3]` in der Konsole. Das Ergebnis
