@@ -389,7 +389,7 @@ class DisplayApp:
         self._small_button(row1, "Einstellungen",
                            self.on_settings).pack(side="right", padx=(0, 8))
 
-        self.file_btn = _ctl(row2, "Datei …", self.on_load_file)
+        self.file_btn = _ctl(row2, "Datei (Audio/MIDI) …", self.on_load_file)
         self.file_btn.pack(side="left")
         self.rec_btn = _ctl(row2, "● Aufnahme", self.toggle_record)
         self.rec_btn.pack(side="left", padx=(8, 0))
@@ -413,7 +413,10 @@ class DisplayApp:
         self.setup_frame = f
 
         tk.Label(f, text="Einstellungen", font=self.f_h1,
-                 bg=COL_BG, fg=COL_FG).pack(pady=(20, 12))
+                 bg=COL_BG, fg=COL_FG).pack(pady=(20, 2))
+        tk.Label(f, text="Quelle + MIDI-Ausgang wählen, dann „Start“ – oder direkt "
+                 "eine Datei (Audio/MIDI) laden.", font=self.f_small, bg=COL_BG,
+                 fg=COL_MUTED).pack(pady=(0, 12))
 
         body = tk.Frame(f, bg=COL_BG)
         body.columnconfigure(0, weight=1)
@@ -531,7 +534,7 @@ class DisplayApp:
                   cursor="hand2").pack(side="right", padx=(0, 10))
         # Datei -> MIDI-Clock (driftfrei): braucht keine Live-Quelle, daher
         # auch direkt aus dem Setup erreichbar.
-        tk.Button(bottom, text="Datei laden …", command=self.on_load_file,
+        tk.Button(bottom, text="Datei (Audio/MIDI) …", command=self.on_load_file,
                   font=self.f_btn, bg=COL_SURFACE, fg=COL_FG,
                   activebackground=COL_SURF_HI, activeforeground=COL_FG,
                   bd=0, padx=16, pady=8, highlightthickness=0,
@@ -1322,20 +1325,24 @@ class DisplayApp:
                     om.grid(row=r, column=2, sticky="w")
                 win._a2m_midi_vars = midi_vars   # Tk-Variablen vor GC schuetzen
 
-                crow = len(order) + 2
+                # duenne Trennlinie zwischen Spuren und Dichte/Export
+                sep = tk.Frame(midf, bg=COL_SURFACE, height=1)
+                sep.grid(row=len(order) + 2, column=0, columnspan=3, sticky="we",
+                         padx=6, pady=(6, 4))
+                crow = len(order) + 3
                 minms = tk.IntVar(value=int(cfg.get("bass_min_ms", 130)))
                 win._a2m_minms = minms
-                mslbl = tk.Label(midf, text=f"Mindestnote {minms.get()} ms",
+                mslbl = tk.Label(midf, text=f"Dichte: Mindestnote {minms.get()} ms",
                                  font=self.f_tiny, bg=COL_BG, fg=COL_FG)
                 tk.Scale(midf, from_=60, to=500, resolution=10, orient="horizontal",
                          variable=minms, showvalue=False, length=140,
                          command=lambda v: mslbl.config(
-                             text=f"Mindestnote {int(float(v))} ms"),
+                             text=f"Dichte: Mindestnote {int(float(v))} ms"),
                          bg=COL_BG, fg=COL_FG, troughcolor=COL_SURFACE,
                          highlightthickness=0, bd=0, sliderrelief="flat",
                          activebackground=COL_OK, width=12).grid(
                              row=crow, column=0, columnspan=2, sticky="w",
-                             padx=6, pady=(6, 2))
+                             padx=6, pady=(2, 2))
                 mslbl.grid(row=crow, column=2, sticky="w")
                 mstat = tk.Label(midf, text="", font=self.f_tiny, bg=COL_BG,
                                  fg=COL_MUTED)
@@ -2212,12 +2219,16 @@ class DisplayApp:
         v_play = tk.BooleanVar(value=False)
         v_stemmidi = tk.BooleanVar(value=False)
 
-        def _cb(text, var, enabled=True, note=""):
+        def _section(text):
+            tk.Label(body, text=text, font=self.f_tiny, bg=COL_BG, fg=COL_ACCENT,
+                     anchor="w").pack(anchor="w", pady=(10, 2))
+
+        def _cb(text, var, enabled=True, note="", command=None):
             cb = tk.Checkbutton(
-                body, text=text, variable=var, font=self.f_small, bg=COL_BG,
-                fg=COL_FG if enabled else COL_MUTED, selectcolor=COL_SURFACE,
-                activebackground=COL_BG, activeforeground=COL_FG, bd=0,
-                highlightthickness=0, anchor="w")
+                body, text=text, variable=var, command=command, font=self.f_small,
+                bg=COL_BG, fg=COL_FG if enabled else COL_MUTED,
+                selectcolor=COL_SURFACE, activebackground=COL_BG,
+                activeforeground=COL_FG, bd=0, highlightthickness=0, anchor="w")
             if not enabled:
                 var.set(False)
                 cb.config(state="disabled")
@@ -2227,6 +2238,21 @@ class DisplayApp:
                          fg=COL_MUTED).pack(anchor="w")
             return cb
 
+        def _menu(parent, row, label, options, current):
+            tk.Label(parent, text=label, font=self.f_tiny, bg=COL_BG,
+                     fg=COL_ACCENT).grid(row=row, column=0, sticky="w", padx=(0, 10))
+            var = tk.StringVar(value=next((lbl for lbl, v in options
+                                           if v == current), options[0][0]))
+            om = tk.OptionMenu(parent, var, *[lbl for lbl, _ in options])
+            om.config(bg=COL_SURFACE, fg=COL_FG, activebackground=COL_SURF_HI,
+                      activeforeground=COL_FG, bd=0, highlightthickness=0,
+                      font=self.f_tiny, cursor="hand2")
+            om["menu"].config(bg=COL_SURFACE, fg=COL_FG)
+            om.grid(row=row, column=1, sticky="we")
+            return var
+
+        # ---- Aktionen ----
+        _section("Aktionen (beliebig kombinierbar)")
         if allow_clock:
             _cb("MIDI-Clock-Ausgabe (Datei abspielen, driftfreie Clock)", v_clock)
         _cb("Stems exportieren (einzelne WAVs speichern)", v_export, demucs_ok,
@@ -2238,36 +2264,40 @@ class DisplayApp:
                      if not midi_ok else "")
         _cb("Stems → MIDI senden (Basic Pitch: Bass/Rest/Gesang, je Kanal)",
             v_stemmidi, demucs_ok and bass_ok and midi_ok, midi_note)
-        _cb("Song-Sheet erstellen (Text + Akkorde)", v_sheet,
-            demucs_ok and whisper_ok,
-            "" if (demucs_ok and whisper_ok) else "braucht: pip install faster-whisper")
 
-        # Sprache/Modell (nur fuer das Song-Sheet relevant)
+        # Song-Sheet + (nur dann sichtbare) Sheet-Optionen Sprache/Modell
+        sheetf = tk.Frame(body, bg=COL_BG)
+        lvar = _menu(sheetf, 0, "Sheet-Sprache", lang_map,
+                     cfg.get("sheet_lang", "auto"))
+        mvar = _menu(sheetf, 1, "Sheet-Modell", model_map,
+                     cfg.get("sheet_model", "medium"))
+        tk.Label(sheetf, text="Tipp: Sprache fest wählen – die Auto-Erkennung liegt "
+                 "bei Gesang oft daneben.", font=self.f_tiny, bg=COL_BG,
+                 fg=COL_MUTED, justify="left").grid(row=2, column=0, columnspan=2,
+                                                    sticky="w", pady=(4, 0))
+
+        def _toggle_sheetopts():
+            if v_sheet.get():
+                sheetf.pack(after=sheet_cb, anchor="w", fill="x", pady=(2, 6))
+            else:
+                sheetf.pack_forget()
+
+        sheet_cb = _cb("Song-Sheet erstellen (Text + Akkorde)", v_sheet,
+                       demucs_ok and whisper_ok,
+                       "" if (demucs_ok and whisper_ok)
+                       else "braucht: pip install faster-whisper",
+                       command=_toggle_sheetopts)
+
+        # ---- Optionen ----
+        _section("Optionen")
         optf = tk.Frame(body, bg=COL_BG)
-        optf.pack(anchor="w", pady=(8, 0), fill="x")
-
-        def _menu(row, label, options, current):
-            tk.Label(optf, text=label, font=self.f_tiny, bg=COL_BG,
-                     fg=COL_ACCENT).grid(row=row, column=0, sticky="w", padx=(0, 10))
-            var = tk.StringVar(value=next((lbl for lbl, v in options
-                                           if v == current), options[0][0]))
-            om = tk.OptionMenu(optf, var, *[lbl for lbl, _ in options])
-            om.config(bg=COL_SURFACE, fg=COL_FG, activebackground=COL_SURF_HI,
-                      activeforeground=COL_FG, bd=0, highlightthickness=0,
-                      font=self.f_tiny, cursor="hand2")
-            om["menu"].config(bg=COL_SURFACE, fg=COL_FG)
-            om.grid(row=row, column=1, sticky="we")
-            return var
-
-        lvar = _menu(0, "Sheet-Sprache", lang_map, cfg.get("sheet_lang", "auto"))
-        mvar = _menu(1, "Sheet-Modell", model_map, cfg.get("sheet_model", "medium"))
-        qvar = _menu(2, "Stem-Qualität", qual_map, cfg.get("stem_quality", "auto"))
-        tk.Label(body, text="Tipp: Beim Song-Sheet die Sprache fest wählen – die\n"
-                 "automatische Erkennung liegt bei Gesang oft daneben.\n"
-                 "Stem-Qualität Automatisch = hoch bei Export/Abspielen/Stems-MIDI,\n"
-                 "sonst schnell (fürs Song-Sheet reicht das).",
+        optf.pack(anchor="w", fill="x")
+        qvar = _menu(optf, 0, "Stem-Qualität", qual_map,
+                     cfg.get("stem_quality", "auto"))
+        tk.Label(body, text="Stem-Qualität „Automatisch“ = hoch bei Export/"
+                 "Abspielen/Stems-MIDI, sonst schnell (fürs Song-Sheet reicht das).",
                  font=self.f_tiny, bg=COL_BG, fg=COL_MUTED,
-                 justify="left").pack(anchor="w", pady=(8, 0))
+                 justify="left").pack(anchor="w", pady=(4, 0))
         result = {}
 
         def _ok():

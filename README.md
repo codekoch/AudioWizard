@@ -19,7 +19,48 @@ PipeWire/Pulse-„Monitor“-Quellen dieselbe Rolle und erscheinen als normale
 Eingänge; unter macOS leistet das ein virtuelles Ausgabegerät wie
 [BlackHole](https://existential.audio/blackhole/).
 
-## Funktionen
+## Inhalt
+
+- [Überblick](#überblick) · [Typische Abläufe](#typische-abläufe)
+- [Funktionen im Detail](#funktionen-im-detail)
+- [Schnellstart (Windows)](#schnellstart-windows) · [macOS](#macos) ·
+  [Raspberry Pi](#raspberry-pi-kiosk-betrieb) · [Webversion](#webversion-browser)
+- [Wie es funktioniert](#wie-es-funktioniert) ·
+  [Abhängigkeiten](#abhängigkeiten) · [Lizenz](#lizenz)
+
+## Überblick
+
+| Bereich | Was es tut |
+|---|---|
+| **Live-Analyse** | Tempo (BPM), Tonart und Akkorde aus Mikrofon/Line-In oder der laufenden Wiedergabe (Loopback). |
+| **MIDI-Clock** | Driftfreie 24-PPQN-Clock zum Song; optional beat-synchron. |
+| **Noten/Akkorde → MIDI** | Erkannte Tonhöhen live als MIDI senden (mono/poly/Akkord). |
+| **Datei → MIDI-Clock** | Audiodatei mit driftfreier Clock abspielen, mit ▶ Start / ■ Stopp. |
+| **Stems** | Gesang/Bass/Drums/Rest lokal trennen (Demucs) – exportieren oder abspielen. |
+| **Song-Sheet** | Gesangstext + Akkorde im Ultimate-Guitar-Stil (lokal, Whisper + Forced Alignment). |
+| **Stems → MIDI** | Bass/Rest/Gesang via Basic Pitch nach MIDI, je Kanal; optional MIDI-Clock mitsenden; als `.mid` speichern. |
+| **MIDI-Datei laden** | Eine `.mid` spurweise (an/aus + Kanal) über den MIDI-Ausgang abspielen. |
+| **DJ-Modus** | Zwei Decks, Equal-Power-Crossfade; die Clock folgt dem Ziel-Deck. |
+| **Aufnahme** | Live-Signal mitschneiden und als Datei(en) speichern. |
+
+Eine Web-Variante (Browser, Web Audio + Web MIDI) deckt die Kernfunktionen ab –
+siehe [Webversion](#webversion-browser).
+
+## Typische Abläufe
+
+- **Live mitspielen (Clock):** Quelle + MIDI-Ausgang wählen → **Start**. Die Clock
+  startet mit der ersten Tempo-Schätzung und taktet Drumcomputer/Sequenzer mit.
+- **Song-Sheet erstellen:** **Datei (Audio/MIDI) …** → Audiodatei → im Dialog
+  **Song-Sheet** anhaken (Sprache fest wählen) → **Los**; Ergebnis als `.txt`/`.chordpro`.
+- **Stems exportieren:** **Datei …** → **Stems exportieren**, Stem-Qualität **Hoch**
+  → Zielordner.
+- **Spuren → MIDI aufnehmen:** MIDI-Ausgang einstellen → **Datei …** →
+  **Stems → MIDI** → im Stem-Player Spuren/Kanäle wählen, **MIDI-Clock mitsenden**
+  an → **▶**; die DAW nimmt taktsynchron auf. Alternativ **MIDI speichern…** (`.mid`).
+- **Datei als MIDI-Clock:** **Datei …** → nur **MIDI-Clock-Ausgabe** → **▶ Start / ■ Stopp**.
+- **MIDI-Ausgang prüfen:** Einstellungen → **▶ MIDI-Ausgang testen** (Dreiklang hörbar?).
+
+## Funktionen im Detail
 
 - **Tempo (BPM)** – aus dem perkussiven Anteil des Signals (HPSS-Trennung),
   per Autokorrelation mit Kammfilter-Stützung und Oktav-Prior; Median über
