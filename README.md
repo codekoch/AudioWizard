@@ -140,7 +140,12 @@ Eingänge; unter macOS leistet das ein virtuelles Ausgabegerät wie
   **ChordPro** (`.chordpro`, transponier-/druckbar) speichern. Da Whisper die
   gesungenen Wortanfänge je nach Lauf mal etwas früh/spät markiert, lässt sich der
   **Akkord-Versatz im Fenster live nachregeln** („◀ Akkorde früher / später ▶") –
-  so sitzen die Akkorde exakt über den richtigen Silben. Das Sheet-Fenster hat
+  so sitzen die Akkorde exakt über den richtigen Silben. Standardmäßig werden die
+  Akkorde **um etwa einen Beat nach vorne** gezogen (tempoabhängig): die Erkennung
+  arbeitet auf einem 2-Beat-Raster und verortet den Akkord am Fensteranfang,
+  wodurch er ohne Korrektur rund einen Beat zu spät über der Silbe stünde – gemessen
+  (wortgenau gegen handkorrigierte Sheets) hebt dieser beat-relative Vorlauf die
+  Trefferquote deutlich (z. B. ~40 % → ~80 %). Das Sheet-Fenster hat
   außerdem eine eigene **Start/Stopp-Wiedergabe** (▶/⏸, ⏮ Anfang) und markiert beim
   Abspielen die aktuelle Stelle **wortgenau** (Karaoke-Mitlauf): die laufende Zeile
   wird hervorgehoben und mitgescrollt, das gerade gesungene Wort zusätzlich betont –

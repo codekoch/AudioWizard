@@ -3333,11 +3333,25 @@ def snap_words_to_onsets(lines, vocals, sr, tol=0.25, log=None):
     return lines
 
 
-# Akkorde fuers Sheet um diesen Betrag (Sekunden) nach vorne ziehen -- gleicht den
-# leichten, systematischen Versatz aus, mit dem Whisper gesungene Wortanfaenge oft
-# etwas zu spaet markiert. Der Rest schwankt je Lauf/Song -> im Sheet-Fenster live
-# nachregelbar ("Akkorde frueher/spaeter").
-CHORD_LEAD = 0.15
+# Akkorde fuers Sheet um diesen Betrag (Sekunden) nach vorne ziehen -- gleicht
+# einen SYSTEMATISCHEN Versatz aus: die Akkorde werden auf einem 2-Beat-Raster
+# bestimmt und am Fensteranfang verortet; gemessen (Wort-genau gegen handkorrigierte
+# Sheets, 2 Songs) liegen sie dadurch rund EINEN BEAT zu spaet ueber den Silben.
+# Daher tonart-/tempoabhaengig ~1 Beat Vorlauf (chord_lead_for_bpm), nicht ein fester
+# Sekundenwert. CHORD_LEAD ist der Rueckfall, wenn kein Tempo bekannt ist.
+# Im Sheet-Fenster bleibt der Vorlauf live nachregelbar ("Akkorde frueher/spaeter").
+CHORD_LEAD = 0.5
+CHORD_LEAD_BEATS = 1.0      # Vorlauf in Beats (wird aus dem Tempo in s umgerechnet)
+
+
+def chord_lead_for_bpm(bpm):
+    """Akkord-Vorlauf in Sekunden = ~CHORD_LEAD_BEATS Beats (aus dem Tempo),
+    begrenzt auf einen sinnvollen Bereich. Ohne Tempo -> fester CHORD_LEAD.
+    Hintergrund: der Raster-bedingte Versatz skaliert mit der Beatdauer, daher
+    beat-relativ statt fester Sekundenwert (an 72 + 81 BPM gemessen)."""
+    if not bpm or bpm <= 0:
+        return CHORD_LEAD
+    return float(min(1.0, max(0.3, 60.0 / bpm * CHORD_LEAD_BEATS)))
 
 # Fuer ein lesbares Chord-Sheet nur die gaengigen Akkordtypen zulassen --
 # dim/maj7/sus4 flackern auf der gesangslosen Begleitung pro Beat zu stark.
@@ -3391,6 +3405,75 @@ def _merge_short_chords(seq, min_dur):
                 break
         seq = _merge_equal_chords(seq)
     return seq
+
+
+def _chord_emissions(y, sr, bass_audio=None, beat_times=None, win_beats=2,
+                     bass_weight=None, log=None):
+    """Extrahiert die ROHEN Akkord-Scores je Beat-Fenster (Template-Korrelation +
+    Bass-Bonus, OHNE Sticky/Tonart-Bias/Maske/Decoder). Rueckgabe (wins, E):
+    wins = Liste (start_s, end_s), E = np.ndarray (n_fenster, n_akkorde).
+    Dies ist die teure Stelle (Chroma/CQT) -- einmal berechnen, dann koennen
+    verschiedene Decoder (greedy/Viterbi/Prior) sofort darauf arbeiten."""
+    y = np.asarray(y, dtype=np.float32)
+    if y.ndim == 2:
+        y = y.mean(axis=1)
+    dur = len(y) / float(sr)
+    if beat_times is None:
+        try:
+            _tempo, frames = librosa.beat.beat_track(y=y, sr=sr)
+            beat_times = librosa.frames_to_time(frames, sr=sr)
+        except Exception:
+            beat_times = None
+    bt = np.asarray(beat_times, dtype=float) if beat_times is not None else None
+    if bt is None or bt.size < 2:
+        bt = np.arange(0.0, dur, 0.5)
+    edges = list(bt[::max(1, int(win_beats))])
+    if edges[-1] < bt[-1]:
+        edges.append(float(bt[-1]))
+    try:
+        yh = librosa.effects.harmonic(y, margin=4.0)
+    except Exception:
+        yh = y
+    bass_cg = None
+    if bass_audio is not None:
+        ba = np.asarray(bass_audio, dtype=np.float32)
+        if ba.ndim == 2:
+            ba = ba.mean(axis=1)
+        try:
+            with warnings.catch_warnings():
+                warnings.simplefilter("ignore")
+                bass_cg = librosa.feature.chroma_cqt(
+                    y=ba, sr=sr, fmin=librosa.note_to_hz('C1'),
+                    n_octaves=4, hop_length=CHROMA_HOP)
+        except Exception:
+            bass_cg = None
+    if bass_weight is None:
+        bass_weight = 0.9 if bass_cg is not None else None
+    minlen = int(0.05 * sr)
+    wins, rows = [], []
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore")
+        for i in range(len(edges) - 1):
+            a, b = int(edges[i] * sr), int(edges[i + 1] * sr)
+            if b - a < minlen:
+                continue
+            res = chroma_pcp(yh[a:b], sr, y_harm=yh[a:b])
+            if not res:
+                continue
+            pcp, bass = res[0], res[1]
+            if bass_cg is not None:
+                f0 = int(edges[i] * sr / CHROMA_HOP)
+                f1 = max(f0 + 1, int(edges[i + 1] * sr / CHROMA_HOP))
+                bv = bass_cg[:, f0:min(f1, bass_cg.shape[1])].mean(axis=1)
+                bs = bv.sum()
+                bass = bv / bs if bs > 0 else bass
+            scores = chord_scores(pcp, bass, bass_weight=bass_weight)
+            if scores is None:
+                continue
+            wins.append((float(edges[i]), float(edges[i + 1])))
+            rows.append(scores)
+    E = np.array(rows) if rows else np.zeros((0, len(CHORD_NAMES)))
+    return wins, E
 
 
 def chord_sequence(y, sr, key=None, bass_audio=None, beat_times=None,
@@ -3717,11 +3800,12 @@ def song_sheet_from_stems(stems, sr, title="", whisper_size="medium",
     chords = chord_sequence(acc_mono, sr, key=key, bass_audio=bass_mono, log=log)
 
     _emit(log, "== Chord-Sheet zusammensetzen ==")
+    lead = chord_lead_for_bpm(bpm)             # ~1 Beat Vorlauf (tempoabhaengig)
     text, chordpro = build_chord_sheet(lines, chords, title=title,
-                                       key=key, bpm=bpm)
+                                       key=key, bpm=bpm, chord_lead=lead)
     _emit(log, "Fertig – Chord-Sheet steht.")
     return {"text": text, "chordpro": chordpro, "key": key, "bpm": bpm,
-            "lines": lines, "chords": chords, "title": title}
+            "lines": lines, "chords": chords, "title": title, "chord_lead": lead}
 
 
 def song_sheet(path, model="htdemucs", whisper_size="medium", language=None,

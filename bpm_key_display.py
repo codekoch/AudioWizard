@@ -2108,7 +2108,12 @@ class DisplayApp:
         txt.tag_configure("word", background="#2f8f6b", foreground="#06231a")
 
         can_adjust = res.get("lines") is not None and res.get("chords") is not None
-        state = {"lead": float(getattr(core, "CHORD_LEAD", 0.0)),
+        # Startwert des Akkord-Vorlaufs: der beim Bauen verwendete (beat-relative)
+        # Wert -- sonst der tempoabhaengige Default, sonst der feste Rueckfall.
+        init_lead = res.get("chord_lead")
+        if init_lead is None:
+            init_lead = core.chord_lead_for_bpm(res.get("bpm", 0.0))
+        state = {"lead": float(init_lead),
                  "text": res.get("text", ""), "chordpro": res.get("chordpro", ""),
                  "map": [], "cur": None}
 
