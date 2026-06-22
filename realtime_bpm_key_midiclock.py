@@ -3840,6 +3840,131 @@ class StemPlayer:
                 pass
 
 
+def basic_pitch_available():
+    """basic-pitch (Audio->MIDI) installiert? Wird fuers Bass->MIDI gebraucht.
+    Auf Win/Py3.12 ohne TensorFlow nutzbar (ONNX): siehe README/requirements."""
+    import importlib.util as _u
+    return _u.find_spec("basic_pitch") is not None
+
+
+def bass_to_midi_notes(bass_audio, sr, max_freq=600.0, min_freq=30.0,
+                       min_note_ms=130.0, onset_thresh=0.5, log=None):
+    """Wandelt den (sauberen) Bass-Stem per basic-pitch in eine Notenliste.
+    Auf Bass getunt: tiefe Frequenzgrenzen + laengere Mindestnote (weniger
+    Geister-/Kurznoten). Rueckgabe: Liste (start_s, end_s, pitch, velocity).
+    basic-pitch erwartet eine Datei -> der Stem wird mono in eine temporaere
+    WAV geschrieben. Nutzt automatisch das ONNX-Modell, wenn TensorFlow fehlt."""
+    import tempfile
+    from basic_pitch.inference import predict
+    from basic_pitch import ICASSP_2022_MODEL_PATH
+    y = np.asarray(bass_audio, dtype=np.float32)
+    if y.ndim == 2:
+        y = y.mean(axis=1)
+    tmp = tempfile.NamedTemporaryFile(suffix=".wav", delete=False)
+    tmp.close()
+    notes = []
+    try:
+        sf.write(tmp.name, y, int(sr), subtype="PCM_16")
+        _emit(log, "Bass -> MIDI (basic-pitch) … das kann einen Moment dauern.")
+        _model_out, _midi, events = predict(
+            tmp.name, ICASSP_2022_MODEL_PATH,
+            onset_threshold=onset_thresh, minimum_note_length=min_note_ms,
+            minimum_frequency=min_freq, maximum_frequency=max_freq,
+            melodia_trick=True)
+        for ev in events:
+            start, end, pitch = float(ev[0]), float(ev[1]), int(ev[2])
+            amp = float(ev[3]) if len(ev) > 3 else 0.7
+            vel = int(min(127, max(1, round(amp * 127))))
+            notes.append((start, end, pitch, vel))
+    finally:
+        try:
+            os.remove(tmp.name)
+        except OSError:
+            pass
+    notes.sort(key=lambda n: n[0])
+    _emit(log, f"{len(notes)} Bass-Noten erkannt.")
+    return notes
+
+
+class MidiNotePlayer:
+    """Sendet eine Notenliste (start, end, pitch, velocity) zeitsynchron ueber
+    einen mido-Ausgang. Die aktuelle Abspielzeit liefert position_fn() (z. B. der
+    StemPlayer) -- so laufen die Bass-MIDI-Noten exakt zur Stem-Wiedergabe mit;
+    pausiert die Wiedergabe (is_playing_fn -> False), schweigt auch das MIDI, und
+    ein Sprung in der Position (Seek) wird sauber neu synchronisiert. Start/Stop
+    ueber start()/stop(); stop() schickt fuer alle klingenden Noten ein note_off."""
+
+    def __init__(self, notes, midi_out, position_fn, is_playing_fn=None,
+                 channel=NOTE_CHANNEL):
+        self.notes = sorted(notes, key=lambda n: n[0])
+        self.out = midi_out
+        self.position_fn = position_fn
+        self.is_playing_fn = is_playing_fn
+        self.channel = int(channel)
+        self._stop = threading.Event()
+        self._thread = None
+        self._active = {}                      # pitch -> end_s der klingenden Note
+
+    def start(self):
+        if self._thread is not None and self._thread.is_alive():
+            return
+        self._stop.clear()
+        self._thread = threading.Thread(target=self._run, daemon=True)
+        self._thread.start()
+
+    def _send(self, kind, pitch, vel=0):
+        try:
+            self.out.send(mido.Message(kind, channel=self.channel,
+                                       note=int(pitch), velocity=int(vel)))
+        except Exception:
+            pass
+
+    def _all_off(self):
+        for pitch in list(self._active):
+            self._send('note_off', pitch, 0)
+        self._active.clear()
+
+    def _run(self):
+        # Zustandsbasiert: jede Runde bestimmen, WELCHE Noten zur Zeit t klingen
+        # sollen (start <= t < end), und die Differenz zum aktuellen Klang als
+        # note_on/note_off senden. Das behandelt normales Abspielen, Pause und
+        # Seek (vor/zurueck) einheitlich -- ohne fragile Sprung-Heuristik.
+        while not self._stop.is_set():
+            t = float(self.position_fn())
+            playing = self.is_playing_fn() if self.is_playing_fn else True
+            if not playing:
+                if self._active:
+                    self._all_off()
+                time.sleep(0.02)
+                continue
+            desired = {}                       # pitch -> (end, velocity)
+            for s, e, p, v in self.notes:
+                if s > t:
+                    break                      # Liste ist nach Startzeit sortiert
+                if e > t:
+                    desired[p] = (e, v)
+            for pitch in list(self._active):   # nicht mehr gewollte -> aus
+                if pitch not in desired:
+                    self._send('note_off', pitch, 0)
+                    del self._active[pitch]
+            for pitch, (end, vel) in desired.items():   # neue -> an
+                if pitch not in self._active:
+                    self._send('note_on', pitch, vel)
+                    self._active[pitch] = end
+            time.sleep(0.01)
+        self._all_off()
+
+    def stop(self):
+        self._stop.set()
+        th = self._thread
+        if th is not None:
+            th.join(timeout=0.5)
+        self._all_off()
+
+    def is_active(self):
+        return self._thread is not None and self._thread.is_alive()
+
+
 # ===========================================================================
 # DJ-Modus: zwei Decks, Equal-Power-Crossfade, Clock folgt dem Ziel-Deck
 # ===========================================================================

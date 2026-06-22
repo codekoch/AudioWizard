@@ -1068,9 +1068,12 @@ class DisplayApp:
         self._run_material(("array", self._rec_audio, self._rec_sr),
                            actions, "Aufnahme")
 
-    def _open_stem_player(self, stems_dict, sr):
+    def _open_stem_player(self, stems_dict, sr, bass_notes=None):
         """Fenster mit Pegel-Fadern je Stem + Play/Pause; spielt die getrennten
-        Spuren einzeln oder parallel (eigener StemPlayer)."""
+        Spuren einzeln oder parallel (eigener StemPlayer). Sind bass_notes
+        uebergeben (Basic-Pitch-Bass), gibt es zusaetzlich einen „♪ Bass-MIDI"-
+        Schalter, der die Noten synchron zur Wiedergabe ueber den eingestellten
+        MIDI-Ausgang sendet (Start/Stop der MIDI-Ausgabe)."""
         names = ([n for n in core.STEM_NAMES if n in stems_dict]
                  + [n for n in stems_dict if n not in core.STEM_NAMES])
         stem_list = [stems_dict[n] for n in names]
@@ -1125,6 +1128,42 @@ class DisplayApp:
         playbtn.config(command=lambda: playbtn.config(
             text="⏸" if player.toggle() else "▶"))
 
+        # --- Bass-MIDI (Basic Pitch): Noten synchron zur Wiedergabe senden ---
+        midi_player = {"obj": None, "port": None}
+        if bass_notes:
+            cfg = load_config()
+            try:
+                port = core.open_midi_output(cfg.get("midi_output") or None)
+                if port is None:
+                    raise RuntimeError("kein MIDI-Ausgang eingestellt")
+                mp = core.MidiNotePlayer(
+                    bass_notes, port,
+                    position_fn=lambda: player.position()[0],
+                    is_playing_fn=player.is_playing)
+                midi_player["obj"] = mp
+                midi_player["port"] = port
+                mp.start()                       # laeuft mit, sendet nur bei Play
+                mbtn = tk.Button(ctl, text="♪ Bass-MIDI: an", font=self.f_small,
+                                 bg=COL_SURFACE, fg=COL_OK,
+                                 activebackground=COL_SURF_HI, activeforeground=COL_FG,
+                                 bd=0, padx=14, pady=6, highlightthickness=0,
+                                 cursor="hand2")
+
+                def _toggle_midi():
+                    if midi_player["obj"] is not None and midi_player["obj"].is_active():
+                        midi_player["obj"].stop()
+                        mbtn.config(text="♪ Bass-MIDI: aus", fg=COL_MUTED)
+                    else:
+                        midi_player["obj"].start()
+                        mbtn.config(text="♪ Bass-MIDI: an", fg=COL_OK)
+
+                mbtn.config(command=_toggle_midi)
+                mbtn.pack(side="left", padx=(16, 0))
+            except Exception as e:
+                midi_player["obj"] = None
+                tk.Label(ctl, text=f"Bass-MIDI aus: {e}", font=self.f_tiny,
+                         bg=COL_BG, fg=COL_MUTED).pack(side="left", padx=(16, 0))
+
         def _upd():
             if not win.winfo_exists():
                 return
@@ -1134,6 +1173,16 @@ class DisplayApp:
             win.after(200, _upd)
 
         def _close():
+            if midi_player["obj"] is not None:
+                try:
+                    midi_player["obj"].stop()
+                except Exception:
+                    pass
+            if midi_player["port"] is not None:
+                try:
+                    midi_player["port"].close()
+                except Exception:
+                    pass
             try:
                 player.stop()
             except Exception:
@@ -1778,7 +1827,9 @@ class DisplayApp:
         {clock, export, sheet, play, out_dir, language, model} oder None."""
         demucs_ok = core.demucs_available()
         whisper_ok = core.whisper_available()
+        bass_ok = core.basic_pitch_available()
         cfg = load_config()
+        midi_ok = bool(cfg.get("midi_output"))
         lang_map = [("Automatisch", "auto"), ("Deutsch", "de"), ("English", "en")]
         model_map = [("Mittel – empfohlen", "medium"),
                      ("Klein – schnell", "small"),
@@ -1798,6 +1849,7 @@ class DisplayApp:
         v_export = tk.BooleanVar(value=False)
         v_sheet = tk.BooleanVar(value=False)
         v_play = tk.BooleanVar(value=False)
+        v_bassmidi = tk.BooleanVar(value=False)
 
         def _cb(text, var, enabled=True, note=""):
             cb = tk.Checkbutton(
@@ -1819,6 +1871,12 @@ class DisplayApp:
         _cb("Stems exportieren (einzelne WAVs speichern)", v_export, demucs_ok,
             "" if demucs_ok else "braucht: pip install demucs")
         _cb("Stems anschließend abspielen (zusammen/getrennt)", v_play, demucs_ok)
+        bass_note = ("" if (demucs_ok and bass_ok and midi_ok)
+                     else "braucht: pip install basic-pitch" if not bass_ok
+                     else "braucht einen MIDI-Ausgang (in den Einstellungen wählen)"
+                     if not midi_ok else "")
+        _cb("Bass → MIDI senden (Basic Pitch, spielt zu den Stems mit)",
+            v_bassmidi, demucs_ok and bass_ok and midi_ok, bass_note)
         _cb("Song-Sheet erstellen (Text + Akkorde)", v_sheet,
             demucs_ok and whisper_ok,
             "" if (demucs_ok and whisper_ok) else "braucht: pip install faster-whisper")
@@ -1849,7 +1907,8 @@ class DisplayApp:
         result = {}
 
         def _ok():
-            if not (v_clock.get() or v_export.get() or v_sheet.get() or v_play.get()):
+            if not (v_clock.get() or v_export.get() or v_sheet.get()
+                    or v_play.get() or v_bassmidi.get()):
                 return                       # nichts gewaehlt -> Dialog offen lassen
             out_dir = None
             if v_export.get():
@@ -1866,7 +1925,8 @@ class DisplayApp:
             save_config(new_cfg)
             result.update(clock=bool(v_clock.get()) if allow_clock else False,
                           export=bool(v_export.get()), sheet=bool(v_sheet.get()),
-                          play=bool(v_play.get()), out_dir=out_dir,
+                          play=bool(v_play.get()), bassmidi=bool(v_bassmidi.get()),
+                          out_dir=out_dir,
                           language=None if lang == "auto" else lang, model=model)
             win.destroy()
 
@@ -1884,7 +1944,8 @@ class DisplayApp:
         """Verarbeitet importierte Musik (Datei-Pfad ODER ('array', rec, sr)) gemaess
         der gewaehlten Aktionen. Stem-Trennung laeuft nur einmal fuer alle Aktionen.
         Reiner Clock-Fall (Datei) geht direkt ohne Trenn-Aufwand in den Datei-Modus."""
-        needs_stems = actions["export"] or actions["sheet"] or actions["play"]
+        needs_stems = (actions["export"] or actions["sheet"] or actions["play"]
+                       or actions.get("bassmidi"))
         if not needs_stems:
             if actions.get("clock") and not isinstance(source, tuple):
                 self._begin_file_clock(source)
@@ -1897,6 +1958,7 @@ class DisplayApp:
         bits = [n for n, on in (("Export", actions["export"]),
                                 ("Song-Sheet", actions["sheet"]),
                                 ("Abspielen", actions["play"]),
+                                ("Bass-MIDI", actions.get("bassmidi")),
                                 ("MIDI-Clock", actions.get("clock"))) if on]
         self._stem_log(log, "Gewählt: " + ", ".join(bits))
         threading.Thread(target=self._material_worker,
@@ -1906,7 +1968,8 @@ class DisplayApp:
         try:
             cb = lambda m: self._stem_log(log, m)
             out = {"actions": actions, "title": title, "sheet": None,
-                   "stems": None, "stem_sr": None, "export_paths": None}
+                   "stems": None, "stem_sr": None, "export_paths": None,
+                   "bass_notes": None}
             self._stem_log(log, "== Stems trennen (einmalig) ==")
             if isinstance(source, tuple):            # ('array', rec, sr)
                 _tag, rec, srr = source
@@ -1935,7 +1998,16 @@ class DisplayApp:
                             mix = mix[:m] + a[:m]
                     out["sheet"]["mix"] = mix
                     out["sheet"]["sr"] = ssr
-            if actions["play"]:
+            if actions.get("bassmidi"):
+                self._stem_log(log, "== Bass → MIDI (Basic Pitch) ==")
+                bass = stems.get("bass")
+                if bass is None:
+                    self._stem_log(log, "Kein Bass-Stem erhalten – übersprungen.")
+                else:
+                    out["bass_notes"] = core.bass_to_midi_notes(bass, ssr, log=cb)
+            # Stem-Player oeffnen, wenn Abspielen ODER Bass-MIDI gewaehlt ist
+            # (Bass-MIDI laeuft synchron zur Stem-Position mit).
+            if actions["play"] or actions.get("bassmidi"):
                 out["stems"], out["stem_sr"] = stems, ssr
             self._material_res = (out, None)
         except Exception as e:
@@ -2364,8 +2436,11 @@ class DisplayApp:
                 # Stem-Player zuerst -> seine Position kann das Sheet mitlaufen lassen
                 player = None
                 if out.get("stems"):
-                    player = self._open_stem_player(out["stems"], out["stem_sr"])
+                    player = self._open_stem_player(out["stems"], out["stem_sr"],
+                                                    bass_notes=out.get("bass_notes"))
                     msgs.append("Stem-Player offen")
+                    if out.get("bass_notes"):
+                        msgs.append(f"{len(out['bass_notes'])} Bass-Noten → MIDI")
                 if out.get("sheet"):
                     self._open_sheet_window(out["sheet"], player=player)
                     msgs.append("Song-Sheet erstellt")

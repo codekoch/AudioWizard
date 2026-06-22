@@ -91,7 +91,8 @@ Eingänge; unter macOS leistet das ein virtuelles Ausgabegerät wie
   Tempo-Sync kombinieren). Außerhalb des DJ-Modus läuft alles über **einen
   gemeinsamen Dialog „Was soll passieren?"**: nach dem **Laden einer Datei** oder
   nach einer **Aufnahme** lassen sich **MIDI-Clock-Ausgabe, Stem-Export, Stems
-  abspielen** (zusammen/getrennt, im **Stem-Player** mit Pegel-Fadern je Spur) und
+  abspielen** (zusammen/getrennt, im **Stem-Player** mit Pegel-Fadern je Spur),
+  **Bass → MIDI** (siehe unten) und
   **Song-Sheet** beliebig **kombinieren** – die teure KI-Trennung läuft dabei nur
   **einmal** für alle gewählten Aktionen, und eine Aufnahme muss nicht erst als
   Datei gespeichert werden. In der Konsole exportiert `--stems DATEI [--out ORDNER]`
@@ -107,6 +108,16 @@ Eingänge; unter macOS leistet das ein virtuelles Ausgabegerät wie
   es zum Laden) oder die `demucs.api` fehlt – ist die installierte Demucs-/
   PyTorch-Version unvollständig, weicht das Programm automatisch auf einen anderen
   Weg aus.
+- **Bass → MIDI (Basic Pitch)** (optional) – wird im Dialog „Was soll passieren?"
+  **Bass → MIDI** gewählt, wandelt **Basic Pitch** (Spotify) den getrennten
+  **Bass-Stem** in MIDI-Noten um. Im **Stem-Player** erscheint dann ein
+  **„♪ Bass-MIDI: an/aus"-Schalter** (Start/Stopp der MIDI-Ausgabe): die Noten
+  werden **synchron zur Wiedergabe** über den in den Einstellungen gewählten
+  **MIDI-Ausgang** gesendet – pausiert man die Stems, schweigt auch das MIDI, ein
+  Sprung in der Position synchronisiert sauber neu. Braucht `basic-pitch` **und**
+  einen eingestellten MIDI-Ausgang; auf Windows/Python 3.12 ohne TensorFlow
+  installieren (siehe `requirements.txt`: `--no-deps` + `onnxruntime`). Drums
+  werden bewusst **nicht** nach MIDI gewandelt (tonlos).
 - **Song-Sheet (Text + Akkorde)** (optional) – aus einer Datei entsteht ein
   **Chord-Sheet wie bei Ultimate Guitar**: die Akkorde stehen über den jeweiligen
   Wörtern des gesungenen Textes. Ablauf komplett **lokal/offline**: Demucs trennt

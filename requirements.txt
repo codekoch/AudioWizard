@@ -21,3 +21,10 @@ soundcard; sys_platform == 'win32'
 # (wav2vec2) -> praezise Wort-Zeitstempel, damit die Akkorde exakt ueber den
 # Silben sitzen. Ersetzt faster-whisper nicht, sondern nutzt es:
 #   pip install whisperx
+# Optional: Bass-Stem -> MIDI (Basic Pitch) beim Stem-Abspielen. ACHTUNG auf
+# Windows + Python 3.12: basic-pitch verlangt sonst ein altes TensorFlow ohne
+# 3.12-Wheel (Build-Fehler "pkgutil has no attribute ImpImporter"). Daher OHNE
+# Abhaengigkeiten + onnxruntime als Backend installieren (waehlt autom. das
+# ONNX-Modell):
+#   pip install --no-deps basic-pitch
+#   pip install onnxruntime pretty_midi mir_eval "resampy<0.4.3"
