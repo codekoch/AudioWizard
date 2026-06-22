@@ -3975,17 +3975,25 @@ def basic_pitch_available():
     return _u.find_spec("basic_pitch") is not None
 
 
-def bass_to_midi_notes(bass_audio, sr, max_freq=600.0, min_freq=30.0,
-                       min_note_ms=130.0, onset_thresh=0.5, log=None):
-    """Wandelt den (sauberen) Bass-Stem per basic-pitch in eine Notenliste.
-    Auf Bass getunt: tiefe Frequenzgrenzen + laengere Mindestnote (weniger
-    Geister-/Kurznoten). Rueckgabe: Liste (start_s, end_s, pitch, velocity).
-    basic-pitch erwartet eine Datei -> der Stem wird mono in eine temporaere
-    WAV geschrieben. Nutzt automatisch das ONNX-Modell, wenn TensorFlow fehlt."""
+# Sinnvolle Frequenzgrenzen je Spur fuer basic-pitch (Hz). Bass tief, Melodie/
+# Begleitung breit. Drums sind tonlos -> NICHT ueber basic-pitch (Tonmuell).
+STEM_MIDI_RANGE = {"bass": (30.0, 600.0), "vocals": (70.0, 1300.0),
+                   "other": (50.0, 2000.0)}
+# Welche Stems sinnvoll nach MIDI gewandelt werden (tonale Spuren).
+STEM_MIDI_NAMES = ("bass", "vocals", "other")
+
+
+def stem_to_midi_notes(audio, sr, min_freq=40.0, max_freq=2000.0,
+                       min_note_ms=130.0, onset_thresh=0.5, label="Stem", log=None):
+    """Wandelt einen (tonalen) Stem per basic-pitch in eine Notenliste
+    (start_s, end_s, pitch, velocity). Frequenzbereich je Spur waehlbar
+    (siehe STEM_MIDI_RANGE: Bass tief, Melodie/Begleitung breiter). basic-pitch
+    erwartet eine Datei -> der Stem wird mono in eine temporaere WAV geschrieben.
+    Nutzt automatisch das ONNX-Modell, wenn TensorFlow fehlt."""
     import tempfile
     from basic_pitch.inference import predict
     from basic_pitch import ICASSP_2022_MODEL_PATH
-    y = np.asarray(bass_audio, dtype=np.float32)
+    y = np.asarray(audio, dtype=np.float32)
     if y.ndim == 2:
         y = y.mean(axis=1)
     tmp = tempfile.NamedTemporaryFile(suffix=".wav", delete=False)
@@ -3993,7 +4001,7 @@ def bass_to_midi_notes(bass_audio, sr, max_freq=600.0, min_freq=30.0,
     notes = []
     try:
         sf.write(tmp.name, y, int(sr), subtype="PCM_16")
-        _emit(log, "Bass -> MIDI (basic-pitch) … das kann einen Moment dauern.")
+        _emit(log, f"{label} -> MIDI (basic-pitch) … das kann einen Moment dauern.")
         _model_out, _midi, events = predict(
             tmp.name, ICASSP_2022_MODEL_PATH,
             onset_threshold=onset_thresh, minimum_note_length=min_note_ms,
@@ -4010,36 +4018,110 @@ def bass_to_midi_notes(bass_audio, sr, max_freq=600.0, min_freq=30.0,
         except OSError:
             pass
     notes.sort(key=lambda n: n[0])
-    _emit(log, f"{len(notes)} Bass-Noten erkannt.")
+    _emit(log, f"{label}: {len(notes)} Noten erkannt.")
     return notes
 
 
-class MidiNotePlayer:
-    """Sendet eine Notenliste (start, end, pitch, velocity) zeitsynchron ueber
-    einen mido-Ausgang. Die aktuelle Abspielzeit liefert position_fn() (z. B. der
-    StemPlayer) -- so laufen die Bass-MIDI-Noten exakt zur Stem-Wiedergabe mit;
-    pausiert die Wiedergabe (is_playing_fn -> False), schweigt auch das MIDI, und
-    ein Sprung in der Position (Seek) wird sauber neu synchronisiert. Start/Stop
-    ueber start()/stop(); stop() schickt fuer alle klingenden Noten ein note_off."""
+def stems_to_midi_notes(stems, sr, names=STEM_MIDI_NAMES, min_note_ms=130.0,
+                        log=None):
+    """Wandelt mehrere (tonale) Stems nach MIDI. Rueckgabe dict {name: notes}.
+    Drums werden uebersprungen (tonlos). Pro Spur passender Frequenzbereich."""
+    out = {}
+    for nm in names:
+        a = stems.get(nm)
+        if a is None or nm == "drums":
+            continue
+        lo, hi = STEM_MIDI_RANGE.get(nm, (40.0, 2000.0))
+        out[nm] = stem_to_midi_notes(a, sr, min_freq=lo, max_freq=hi,
+                                     min_note_ms=min_note_ms,
+                                     label=STEM_LABELS.get(nm, nm), log=log)
+    return out
 
-    def __init__(self, notes, midi_out, position_fn, is_playing_fn=None,
-                 channel=NOTE_CHANNEL):
-        self.notes = sorted(notes, key=lambda n: n[0])
+
+def write_stems_midi_file(tracks, path, bpm=120.0, ppq=480):
+    """Schreibt eine MEHRSPURIGE MIDI-Datei. tracks = Liste (name, notes, channel)
+    mit notes=[(start_s, end_s, pitch, velocity), ...]; jede Spur bekommt ihren
+    eigenen MIDI-Kanal. Die Notenzeiten (Sekunden) werden mit 'bpm' in Ticks
+    umgerechnet -- die zeitliche Lage bleibt erhalten, bpm ist die Tempo-Angabe
+    der Datei. Rueckgabe: der geschriebene Pfad."""
+    bpm = float(bpm) if bpm and bpm > 0 else 120.0
+    spb = 60.0 / bpm                           # Sekunden je Beat
+    mf = mido.MidiFile(ticks_per_beat=ppq)
+    meta = mido.MidiTrack()
+    mf.tracks.append(meta)
+    meta.append(mido.MetaMessage('set_tempo', tempo=mido.bpm2tempo(bpm), time=0))
+
+    def ticks(sec):
+        return max(0, int(round(sec / spb * ppq)))
+
+    for name, notes, ch in tracks:
+        tr = mido.MidiTrack()
+        mf.tracks.append(tr)
+        tr.append(mido.MetaMessage('track_name', name=str(name), time=0))
+        evs = []
+        for s, e, p, v in notes:
+            evs.append((ticks(s), 1, int(p) % 128, int(v)))           # on
+            evs.append((ticks(max(e, s)), 0, int(p) % 128, 0))        # off
+        evs.sort(key=lambda x: (x[0], x[1]))   # bei gleichem Tick: off (0) vor on (1)
+        last = 0
+        for tick, kind, p, v in evs:
+            dt = tick - last
+            last = tick
+            tr.append(mido.Message('note_on' if kind else 'note_off',
+                                   channel=int(ch) % 16, note=p, velocity=v,
+                                   time=max(0, dt)))
+    mf.save(path)
+    return path
+
+
+class MultiStemMidiPlayer:
+    """Sendet MIDI-Noten MEHRERER Stems zeitsynchron zur Wiedergabe ueber EINEN
+    mido-Ausgang -- je Spur ein eigener MIDI-Kanal, einzeln an-/abschaltbar (auch
+    WAEHREND der Wiedergabe). position_fn()/is_playing_fn() liefern Zeit/Status
+    (z. B. der StemPlayer). Jeder Tick bestimmt je aktiver Spur, welche Noten zur
+    Zeit t klingen sollen, und sendet die Differenz; Pause, Seek, Kanalwechsel,
+    Ab-/Anschalten und Neuberechnung werden sauber behandelt (keine haengenden
+    Toene). Start/Stop ueber start()/stop()."""
+
+    def __init__(self, midi_out, position_fn, is_playing_fn=None):
         self.out = midi_out
         self.position_fn = position_fn
         self.is_playing_fn = is_playing_fn
-        self.channel = int(channel)
+        self.lock = threading.Lock()
+        self.tracks = {}        # name -> {"notes", "channel", "on", "dirty"}
+        self._active = {}       # name -> {pitch: (end_s, channel)}
         self._stop = threading.Event()
         self._thread = None
-        self._active = {}                      # pitch -> end_s der klingenden Note
-        self._resync = False                   # nach Notentausch einmal neu aufsetzen
 
-    def set_notes(self, notes):
-        """Notenliste im laufenden Scheduler austauschen (z. B. nach Neuberechnung
-        mit anderer Mindest-Notenlaenge). Beim naechsten Tick wird sauber neu
-        synchronisiert (klingende Noten gehen kurz aus, dann passend wieder an)."""
-        self.notes = sorted(notes, key=lambda n: n[0])
-        self._resync = True
+    def set_track(self, name, notes, channel=0, enabled=False):
+        with self.lock:
+            self.tracks[name] = {"notes": sorted(notes, key=lambda n: n[0]),
+                                 "channel": int(channel), "on": bool(enabled),
+                                 "dirty": True}
+
+    def set_enabled(self, name, on):
+        with self.lock:
+            if name in self.tracks:
+                self.tracks[name]["on"] = bool(on)
+                self.tracks[name]["dirty"] = True
+
+    def set_channel(self, name, ch):
+        with self.lock:
+            if name in self.tracks:
+                self.tracks[name]["channel"] = int(ch)
+                self.tracks[name]["dirty"] = True
+
+    def set_notes(self, name, notes):
+        with self.lock:
+            if name in self.tracks:
+                self.tracks[name]["notes"] = sorted(notes, key=lambda n: n[0])
+                self.tracks[name]["dirty"] = True
+
+    def enabled_tracks(self):
+        """Liste (name, notes, channel) der aktiven Spuren -- fuer den Export."""
+        with self.lock:
+            return [(n, list(d["notes"]), d["channel"])
+                    for n, d in self.tracks.items() if d["on"]]
 
     def start(self):
         if self._thread is not None and self._thread.is_alive():
@@ -4048,48 +4130,55 @@ class MidiNotePlayer:
         self._thread = threading.Thread(target=self._run, daemon=True)
         self._thread.start()
 
-    def _send(self, kind, pitch, vel=0):
+    def _send(self, kind, ch, pitch, vel=0):
         try:
-            self.out.send(mido.Message(kind, channel=self.channel,
+            self.out.send(mido.Message(kind, channel=int(ch) % 16,
                                        note=int(pitch), velocity=int(vel)))
         except Exception:
             pass
 
     def _all_off(self):
-        for pitch in list(self._active):
-            self._send('note_off', pitch, 0)
-        self._active.clear()
+        for act in self._active.values():
+            for pitch, (end, ch) in list(act.items()):
+                self._send('note_off', ch, pitch, 0)
+        self._active = {}
 
     def _run(self):
-        # Zustandsbasiert: jede Runde bestimmen, WELCHE Noten zur Zeit t klingen
-        # sollen (start <= t < end), und die Differenz zum aktuellen Klang als
-        # note_on/note_off senden. Das behandelt normales Abspielen, Pause und
-        # Seek (vor/zurueck) einheitlich -- ohne fragile Sprung-Heuristik.
         while not self._stop.is_set():
             t = float(self.position_fn())
             playing = self.is_playing_fn() if self.is_playing_fn else True
             if not playing:
-                if self._active:
+                if any(self._active.values()):
                     self._all_off()
                 time.sleep(0.02)
                 continue
-            if self._resync:                   # Noten wurden ausgetauscht
-                self._resync = False
-                self._all_off()
-            desired = {}                       # pitch -> (end, velocity)
-            for s, e, p, v in self.notes:
-                if s > t:
-                    break                      # Liste ist nach Startzeit sortiert
-                if e > t:
-                    desired[p] = (e, v)
-            for pitch in list(self._active):   # nicht mehr gewollte -> aus
-                if pitch not in desired:
-                    self._send('note_off', pitch, 0)
-                    del self._active[pitch]
-            for pitch, (end, vel) in desired.items():   # neue -> an
-                if pitch not in self._active:
-                    self._send('note_on', pitch, vel)
-                    self._active[pitch] = end
+            with self.lock:                    # Schnappschuss (kurz gesperrt)
+                snap = {n: (d["notes"], d["channel"], d["on"], d["dirty"])
+                        for n, d in self.tracks.items()}
+                for d in self.tracks.values():
+                    d["dirty"] = False
+            for name, (notes, ch, on, dirty) in snap.items():
+                act = self._active.setdefault(name, {})
+                if dirty and act:              # Kanalwechsel/Aus/Neuberechnung
+                    for pitch, (end, oldch) in list(act.items()):
+                        self._send('note_off', oldch, pitch, 0)
+                    act.clear()
+                if not on:
+                    continue
+                desired = {}
+                for s, e, p, v in notes:
+                    if s > t:
+                        break
+                    if e > t:
+                        desired[p] = (e, v)
+                for pitch in list(act):
+                    if pitch not in desired:
+                        self._send('note_off', act[pitch][1], pitch, 0)
+                        del act[pitch]
+                for pitch, (end, vel) in desired.items():
+                    if pitch not in act:
+                        self._send('note_on', ch, pitch, vel)
+                        act[pitch] = (end, ch)
             time.sleep(0.01)
         self._all_off()
 
@@ -4102,6 +4191,120 @@ class MidiNotePlayer:
 
     def is_active(self):
         return self._thread is not None and self._thread.is_alive()
+
+
+def read_midi_tracks(path):
+    """Liest eine MIDI-Datei und gibt ihre Spuren als Notenlisten zurueck -- zum
+    instrumentenweisen Abspielen ueber den MIDI-Ausgang (Gegenstueck zu
+    write_stems_midi_file). Spuren mit mehreren Kanaelen werden je Kanal aufgeteilt.
+    Rueckgabe (tracks, bpm, duration): tracks = Liste
+    {'name', 'channel', 'notes':[(start_s, end_s, pitch, vel), ...]} (nur Spuren mit
+    Noten), bpm aus dem Anfangstempo, duration in Sekunden."""
+    mf = mido.MidiFile(path)
+    tpb = mf.ticks_per_beat or 480
+    tempo_events = [(0, 500000)]               # (abs_tick, us/beat); Default 120 BPM
+    for tr in mf.tracks:
+        t = 0
+        for msg in tr:
+            t += msg.time
+            if msg.type == 'set_tempo':
+                tempo_events.append((t, msg.tempo))
+    tempo_events.sort(key=lambda e: e[0])
+
+    def tick_to_sec(tick):
+        sec, last, cur = 0.0, 0, 500000
+        for et, tempo in tempo_events:
+            if et >= tick:
+                break
+            sec += mido.tick2second(et - last, tpb, cur)
+            last, cur = et, tempo
+        return sec + mido.tick2second(tick - last, tpb, cur)
+
+    t0 = [tp for et, tp in tempo_events if et == 0]
+    bpm = float(mido.tempo2bpm(t0[-1])) if t0 else 120.0
+    tracks, dur = [], 0.0
+    for ti, tr in enumerate(mf.tracks):
+        t = 0
+        name = None
+        active = {}                            # (channel,pitch) -> (start_s, vel)
+        per_ch = {}                            # channel -> notes
+        for msg in tr:
+            t += msg.time
+            if msg.type == 'track_name' and name is None:
+                name = msg.name
+            elif msg.type == 'note_on' and msg.velocity > 0:
+                active[(msg.channel, msg.note)] = (tick_to_sec(t), msg.velocity)
+            elif msg.type == 'note_off' or (msg.type == 'note_on' and msg.velocity == 0):
+                k = (msg.channel, msg.note)
+                if k in active:
+                    st, vel = active.pop(k)
+                    per_ch.setdefault(msg.channel, []).append(
+                        (st, tick_to_sec(t), msg.note, vel))
+        for ch, notes in sorted(per_ch.items()):
+            if not notes:
+                continue
+            notes.sort(key=lambda n: n[0])
+            nm = name or f"Spur {ti}"
+            if len(per_ch) > 1:                # Spur mit mehreren Kanaelen aufteilen
+                nm = f"{nm} (Kanal {ch + 1})"
+            tracks.append({"name": nm, "channel": int(ch), "notes": notes})
+            dur = max(dur, max(e for _, e, _, _ in notes))
+    return tracks, bpm, float(dur)
+
+
+class MidiTransport:
+    """Einfache Abspiel-Uhr OHNE Audio (fuer das Abspielen einer MIDI-Datei):
+    liefert position()/is_playing() wie der StemPlayer, damit ein
+    MultiStemMidiPlayer die Spuren zeitsynchron senden kann. Die Zeit laeuft aus
+    der Wanduhr (perf_counter) ab dem Start."""
+
+    def __init__(self, duration):
+        self.duration = float(duration)
+        self._pos = 0.0
+        self._anchor = None                    # perf_counter beim Start, sonst None
+        self.lock = threading.Lock()
+
+    def _now(self):
+        if self._anchor is None:
+            return self._pos
+        return min(self.duration, self._pos + (time.perf_counter() - self._anchor))
+
+    def play(self):
+        with self.lock:
+            if self._anchor is None:
+                if self._pos >= self.duration:
+                    self._pos = 0.0
+                self._anchor = time.perf_counter()
+
+    def pause(self):
+        with self.lock:
+            if self._anchor is not None:
+                self._pos = self._now()
+                self._anchor = None
+
+    def toggle(self):
+        if self.is_playing():
+            self.pause()
+            return False
+        self.play()
+        return True
+
+    def seek(self, sec):
+        with self.lock:
+            self._pos = max(0.0, min(self.duration, float(sec)))
+            if self._anchor is not None:
+                self._anchor = time.perf_counter()
+
+    def position(self):
+        with self.lock:
+            p = self._now()
+            if self._anchor is not None and p >= self.duration:
+                self._pos, self._anchor = self.duration, None   # Ende -> Stopp
+            return p, self.duration
+
+    def is_playing(self):
+        with self.lock:
+            return self._anchor is not None and self._now() < self.duration
 
 
 # ===========================================================================

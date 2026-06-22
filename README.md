@@ -112,19 +112,27 @@ Eingänge; unter macOS leistet das ein virtuelles Ausgabegerät wie
   es zum Laden) oder die `demucs.api` fehlt – ist die installierte Demucs-/
   PyTorch-Version unvollständig, weicht das Programm automatisch auf einen anderen
   Weg aus.
-- **Bass → MIDI (Basic Pitch)** (optional) – wird im Dialog „Was soll passieren?"
-  **Bass → MIDI** gewählt, wandelt **Basic Pitch** (Spotify) den getrennten
-  **Bass-Stem** in MIDI-Noten um. Im **Stem-Player** erscheint dann ein
-  **„♪ Bass-MIDI: an/aus"-Schalter** (Start/Stopp der MIDI-Ausgabe): die Noten
-  werden **synchron zur Wiedergabe** über den in den Einstellungen gewählten
-  **MIDI-Ausgang** gesendet – pausiert man die Stems, schweigt auch das MIDI, ein
-  Sprung in der Position synchronisiert sauber neu. Über den Regler **„Bass-MIDI
-  Mindestnote (ms)"** lässt sich die **Dichte** der Noten live anpassen (höher =
-  weniger, längere Noten); „Anwenden" rechnet auf dem bereits getrennten
-  Bass-Stem neu (keine erneute KI-Trennung) und der Wert wird gemerkt. Braucht `basic-pitch` **und**
-  einen eingestellten MIDI-Ausgang; auf Windows/Python 3.12 ohne TensorFlow
-  installieren (siehe `requirements.txt`: `--no-deps` + `onnxruntime`). Drums
-  werden bewusst **nicht** nach MIDI gewandelt (tonlos).
+- **Stems → MIDI (Basic Pitch)** (optional) – wird im Dialog „Was soll passieren?"
+  **Stems → MIDI** gewählt, wandelt **Basic Pitch** (Spotify) die getrennten
+  **tonalen** Spuren (**Bass, „Rest", Gesang**) in MIDI-Noten um. Im **Stem-Player**
+  gibt es dann einen **MIDI-Bereich**: pro Spur **an/aus** und ein **frei wählbarer
+  MIDI-Kanal** (1–16), ein **Master-Schalter** (Start/Stopp der ganzen MIDI-Ausgabe,
+  auch während des Abspielens) sowie ein **Mindestnoten-Regler** (Dichte; „Anwenden"
+  rechnet auf den schon getrennten Stems neu, ohne erneute KI-Trennung). Die Noten
+  laufen **synchron zur Wiedergabe** über den in den Einstellungen gewählten
+  **MIDI-Ausgang** – pausiert man die Stems, schweigt auch das MIDI, ein Positions-
+  sprung synchronisiert sauber neu. Mit **„MIDI speichern…"** lässt sich eine
+  **mehrspurige MIDI-Datei** aller aktuell aktiven Spuren (je eigener Kanal)
+  exportieren, um später daran weiterzuarbeiten. Braucht `basic-pitch` **und** einen
+  eingestellten MIDI-Ausgang; auf Windows/Python 3.12 ohne TensorFlow installieren
+  (siehe `requirements.txt`: `--no-deps` + `onnxruntime`). **Drums** werden bewusst
+  **nicht** nach MIDI gewandelt (tonlos).
+- **MIDI-Datei laden & instrumentenweise abspielen** – über „Datei laden …" lässt
+  sich auch direkt eine **`.mid`-Datei** öffnen (z. B. eine zuvor exportierte). Sie
+  wird **spurweise** über den eingestellten MIDI-Ausgang abgespielt: Transport
+  (▶/⏸, ⏮ Anfang) plus **pro Spur an/aus und frei wählbarer Kanal** – so kann man
+  einzelne Instrumente stummschalten oder umrouten, ohne alles neu zu erzeugen.
+  Reine MIDI-Ausgabe (kein Audio); braucht nur einen eingestellten MIDI-Ausgang.
 - **Song-Sheet (Text + Akkorde)** (optional) – aus einer Datei entsteht ein
   **Chord-Sheet wie bei Ultimate Guitar**: die Akkorde stehen über den jeweiligen
   Wörtern des gesungenen Textes. Ablauf komplett **lokal/offline**: Demucs trennt
