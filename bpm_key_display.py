@@ -133,7 +133,12 @@ class DisplayApp:
         self.root = root
         root.title("AudioWizard")
         root.configure(bg=COL_BG)
-        root.geometry("800x600")
+        # Hauptfenster mittig auf dem Bildschirm platzieren (im Fenstermodus;
+        # bei Vollbild ueberschreibt set_fullscreen das ohnehin).
+        win_w, win_h = 800, 600
+        cx = max(0, (root.winfo_screenwidth() - win_w) // 2)
+        cy = max(0, (root.winfo_screenheight() - win_h) // 2)
+        root.geometry(f"{win_w}x{win_h}+{cx}+{cy}")
         root.minsize(480, 360)
         root.protocol("WM_DELETE_WINDOW", self.quit_app)
         root.bind("<F11>", lambda e: self.set_fullscreen(not self.fullscreen))
@@ -3228,22 +3233,27 @@ def _show_splash(root):
     try:
         root.withdraw()                       # Hauptfenster verdeckt aufbauen
         splash = tk.Toplevel(root)
-        splash.overrideredirect(True)         # randlos
+        splash.withdraw()                      # erst unsichtbar aufbauen (kein Aufblitzen 0,0)
+        splash.overrideredirect(True)          # randlos
         splash.configure(bg=COL_BG)
-        maxw, maxh = 520, 520                  # sehr grosse Bilder herunterskalieren
+        target_w = 480                         # feste Breite, Seitenverhaeltnis bleibt
         w, h = img.size
-        scale = min(1.0, maxw / w, maxh / h)
-        if scale < 1.0:
-            img = img.resize((int(w * scale), int(h * scale)), Image.LANCZOS)
+        scale = target_w / float(w)
+        img = img.resize((target_w, max(1, int(h * scale))), Image.LANCZOS)
         photo = ImageTk.PhotoImage(img)
         lbl = tk.Label(splash, image=photo, bd=0, bg=COL_BG)
         lbl.image = photo                      # Referenz halten (sonst GC)
         lbl.pack()
+        # kleine, aber deutliche Wortmarke unter dem Bild
+        tk.Label(splash, text="AudioWizard", font=("Segoe UI", 18, "bold"),
+                 fg=COL_ACCENT, bg=COL_BG).pack(pady=(8, 14))
         splash.update_idletasks()
-        sw, sh = splash.winfo_width(), splash.winfo_height()
-        x = (splash.winfo_screenwidth() - sw) // 2
-        y = (splash.winfo_screenheight() - sh) // 2
-        splash.geometry(f"+{x}+{y}")
+        # ANGEFORDERTE Groesse (gueltig auch vor dem Mappen) -> mittig zentrieren
+        ww, hh = splash.winfo_reqwidth(), splash.winfo_reqheight()
+        x = max(0, (splash.winfo_screenwidth() - ww) // 2)
+        y = max(0, (splash.winfo_screenheight() - hh) // 2)
+        splash.geometry(f"{ww}x{hh}+{x}+{y}")
+        splash.deiconify()                     # jetzt sichtbar an der richtigen Stelle
         splash.lift()
         splash.update()
         return splash
