@@ -1167,7 +1167,8 @@ class DisplayApp:
         self._run_material(("array", self._rec_audio, self._rec_sr),
                            actions, "Aufnahme")
 
-    def _open_stem_player(self, stems_dict, sr, midi_notes=None, bpm=0.0):
+    def _open_stem_player(self, stems_dict, sr, midi_notes=None, bpm=0.0,
+                          clock_default=False):
         """Fenster mit Pegel-Fadern je Stem + Play/Pause; spielt die getrennten
         Spuren einzeln oder parallel (eigener StemPlayer). Sind midi_notes
         uebergeben (dict {stem: notes} aus Basic Pitch), gibt es einen MIDI-Bereich:
@@ -1282,7 +1283,12 @@ class DisplayApp:
 
                 # MIDI-Clock mitsenden (24 PPQN, Start bei ▶) -- so kann ein
                 # externer Recorder die Noten taktgenau mitschneiden.
-                clkvar = tk.BooleanVar(value=False)
+                # Clock direkt an, wenn sie als Aktion gewaehlt war (sonst haette die
+                # separate Datei-Clock denselben Port ein zweites Mal geoeffnet).
+                want_clock = bool(clock_default and bpm > 0)
+                clkvar = tk.BooleanVar(value=want_clock)
+                if want_clock:
+                    mp.set_clock(True, bpm)
                 win._a2m_clkvar = clkvar
                 clk_txt = ("MIDI-Clock mitsenden (Start bei ▶)" if bpm > 0
                            else "MIDI-Clock – Tempo unbekannt")
@@ -2492,9 +2498,13 @@ class DisplayApp:
             if actions.get("clock") and not isinstance(source, tuple):
                 self._begin_file_clock(source)
             return
-        # Clock (falls gewaehlt, nur fuer Dateien) erst NACH der Verarbeitung starten
+        # Clock (falls gewaehlt, nur fuer Dateien) erst NACH der Verarbeitung starten.
+        # ABER nicht bei "Stems → MIDI": dort liefert der Stem-Player die Clock ueber
+        # DENSELBEN Port -- eine separate Datei-Clock wuerde den (unter Windows oft
+        # single-client) Port ein zweites Mal oeffnen und scheitern.
         self._material_clock = source if (actions.get("clock")
-                                          and not isinstance(source, tuple)) else None
+                                          and not isinstance(source, tuple)
+                                          and not actions.get("stemmidi")) else None
         log = self._stem_log_open("Verarbeitung")
         self._stem_log(log, title)
         bits = [n for n, on in (("Export", actions["export"]),
@@ -3016,9 +3026,10 @@ class DisplayApp:
                 player = None
                 if out.get("stems"):
                     mbpm = out.get("bpm") or (out.get("sheet") or {}).get("bpm", 0.0)
-                    player = self._open_stem_player(out["stems"], out["stem_sr"],
-                                                    midi_notes=out.get("midi_notes"),
-                                                    bpm=mbpm)
+                    player = self._open_stem_player(
+                        out["stems"], out["stem_sr"],
+                        midi_notes=out.get("midi_notes"), bpm=mbpm,
+                        clock_default=bool(out["actions"].get("clock")))
                     msgs.append("Stem-Player offen")
                     if out.get("midi_notes"):
                         tot = sum(len(v) for v in out["midi_notes"].values())
