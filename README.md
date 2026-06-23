@@ -336,7 +336,7 @@ sauberen MIDI-Akkord sendet, sowie einen **DJ-Modus** (zwei Decks nebeneinander,
 Audio-Crossfade, MIDI-Clock folgt dem überblendeten Track). Einfach im Browser
 öffnen – kein Server nötig.
 
-👉 **Online ausprobieren:** <a href="https://codekoch.github.io/audiowizard/webapp/">https://codekoch.github.io/audiowizard/webapp/</a>
+👉 **Online ausprobieren:** <a href="https://codekoch.github.io/AudioWizard/webapp/">https://codekoch.github.io/AudioWizard/webapp/</a>
 
 Details in [webapp/README.md](webapp/README.md).
 
