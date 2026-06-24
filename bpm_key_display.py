@@ -59,6 +59,7 @@ except ImportError:
 import mido
 
 import realtime_bpm_key_midiclock as core
+import deluge_export as deluge
 
 # Windows: Die Wiedergabe (z. B. Spotify) laesst sich per Loopback mithoeren.
 # Auf dem Raspberry Pi ist das ueberfluessig -- dort erscheinen die
@@ -1520,6 +1521,11 @@ class DisplayApp:
                     row=brow, column=0, sticky="w", padx=6, pady=(2, 6))
                 self._small_button(midf, "MIDI speichern…", _save_midi).grid(
                     row=brow, column=1, columnspan=2, sticky="w", pady=(2, 6))
+                self._small_button(
+                    midf, "Deluge-Song…",
+                    lambda: self._save_deluge(mp, bpm)).grid(
+                        row=brow + 1, column=0, columnspan=3, sticky="w",
+                        padx=6, pady=(0, 6))
             except Exception as e:
                 midi_player["obj"] = None
                 msg = str(e)
@@ -1565,6 +1571,82 @@ class DisplayApp:
         self._small_button(win, "Schließen", _close).pack(pady=8)
         _upd()
         return player
+
+    def _save_deluge(self, mp, bpm):
+        """Schreibt eine Synthstrom-Deluge-Songdatei (.XML) aus den AKTIVEN MIDI-
+        Spuren: tonale Stems -> interne Synths, Schlagzeug -> Kit. Variante (ganzer
+        Song / Takt-Loops) waehlbar. Braucht das 808-Factory-Kit auf der SD-Karte."""
+        tracks = mp.enabled_tracks()             # [(name, notes, channel)]
+        if not tracks:
+            messagebox.showinfo("Deluge-Song",
+                                "Keine aktive Spur – bitte Häkchen setzen.")
+            return
+        win = tk.Toplevel(self.root)
+        win.title("Deluge-Song erstellen")
+        win.configure(bg=COL_BG)
+        win.transient(self.root)
+        tk.Label(win, text="Deluge-Song erstellen", font=self.f_h1, bg=COL_BG,
+                 fg=COL_FG).pack(pady=(12, 2))
+        active = ", ".join(core.STEM_LABELS.get(n, n) for n, _x, _c in tracks)
+        tk.Label(win, text=f"Aktive Spuren: {active}", font=self.f_tiny, bg=COL_BG,
+                 fg=COL_MUTED).pack(pady=(0, 8))
+        mode = tk.StringVar(value="whole")
+        barsv = tk.StringVar(value="2")
+        fr = tk.Frame(win, bg=COL_BG)
+        fr.pack(padx=20, pady=2, anchor="w")
+
+        def _rb(parent, text, val):
+            return tk.Radiobutton(parent, text=text, variable=mode, value=val,
+                                  font=self.f_small, bg=COL_BG, fg=COL_FG,
+                                  selectcolor=COL_SURFACE, activebackground=COL_BG,
+                                  activeforeground=COL_FG, bd=0, highlightthickness=0,
+                                  anchor="w")
+        _rb(fr, "Ganzer Song – ein Clip je Spur", "whole").pack(anchor="w")
+        lr = tk.Frame(fr, bg=COL_BG)
+        lr.pack(anchor="w")
+        _rb(lr, "Takt-Loops –", "loops").pack(side="left")
+        tk.Entry(lr, textvariable=barsv, width=3, font=self.f_small, bg=COL_SURFACE,
+                 fg=COL_FG, insertbackground=COL_FG, bd=0, highlightthickness=0,
+                 justify="center").pack(side="left", padx=4)
+        tk.Label(lr, text="Takte je Clip (mehrere Clips zum Arrangieren)",
+                 font=self.f_tiny, bg=COL_BG, fg=COL_MUTED).pack(side="left")
+        status = tk.Label(win, text="", font=self.f_tiny, bg=COL_BG, fg=COL_MUTED)
+        status.pack(pady=(8, 2))
+
+        def _do():
+            label = {"bass": "Bass", "other": "Rest", "vocals": "Vocals"}
+            synth_tracks, drum_track = [], None
+            for n, notes, _c in tracks:
+                if n == "drums":
+                    drum_track = {"notes": list(notes)}
+                else:
+                    synth_tracks.append({"name": label.get(n, n), "notes": list(notes)})
+            bpc = 0
+            if mode.get() == "loops":
+                try:
+                    bpc = max(1, int(float(barsv.get().replace(",", "."))))
+                except ValueError:
+                    bpc = 2
+            cfg = load_config()
+            p = filedialog.asksaveasfilename(
+                title="Deluge-Song speichern", defaultextension=".XML",
+                initialfile="AudioWizard.XML",
+                initialdir=cfg.get("last_save_dir") or "",
+                filetypes=[("Deluge-Song", "*.XML"), ("Alle", "*.*")])
+            if not p:
+                return
+            try:
+                deluge.write_deluge_song(p, bpm or 120.0, synth_tracks=synth_tracks,
+                                         drum_track=drum_track, bars_per_clip=bpc)
+                save_config({**cfg, "last_save_dir": os.path.dirname(p)})
+                status.config(text=f"Gespeichert: {os.path.basename(p)} – in den "
+                                   "SONGS-Ordner der SD-Karte kopieren.")
+            except Exception as ex:
+                status.config(text=f"Fehler: {ex}")
+
+        self._small_button(win, "Speichern…", _do).pack(pady=(2, 2))
+        self._small_button(win, "Schließen", win.destroy).pack(pady=(0, 10))
+        win._a2m_deluge = (mode, barsv)          # Tk-Variablen vor GC schuetzen
 
     def _save_stems_dialog(self, parent_win, stems_dict, sr, bpm=0.0):
         """Dialog: welche Stems speichern (einzeln/alle) + optional „auf Takt

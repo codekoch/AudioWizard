@@ -41,6 +41,7 @@ Eingänge; unter macOS leistet das ein virtuelles Ausgabegerät wie
 | **Stems → MIDI** | Bass/Rest/Gesang via Basic Pitch nach MIDI, je Kanal; optional MIDI-Clock mitsenden; als `.mid` speichern. |
 | **Schlagzeug → MIDI** | Drums in Kick/Snare/HiHat (+ optional Tom/Crash) zerlegen, Note je Komponente frei wählbar; Standard GM-Drum-Map auf Kanal 10. |
 | **MIDI-Datei laden** | Eine `.mid` spurweise (an/aus + Kanal) über den MIDI-Ausgang abspielen. |
+| **Deluge-Song** | Aus den Stem-MIDI-Spuren eine Synthstrom-Deluge-Songdatei (`.XML`) erzeugen: Melodien als interne Synths, Drums als Kit; ganzer Song oder Takt-Loops. |
 | **DJ-Modus** | Zwei Decks, Equal-Power-Crossfade; die Clock folgt dem Ziel-Deck. |
 | **Aufnahme** | Live-Signal mitschneiden und als Datei(en) speichern. |
 
@@ -234,6 +235,18 @@ siehe [Webversion](#webversion-browser).
   Komponenten auch in einer **bereits gespeicherten** Datei noch umlegen (eine
   Neuerkennung aus Audio ist dann nicht mehr möglich, nur das Verschieben der
   Tonhöhen). Reine MIDI-Ausgabe (kein Audio); braucht nur einen MIDI-Ausgang.
+- **Deluge-Songdatei erzeugen** – im Stem-Player (bei „Stems → MIDI") gibt es
+  **„Deluge-Song…"**: daraus entsteht eine **Synthstrom-Deluge-Songdatei** (`.XML`,
+  Community-Firmware c1.2.x) – jede aktive Stem-Spur wird ein **Pattern**: die
+  **melodischen** Stems (Bass/Rest/Gesang) als **interne Synth-Spuren**, das
+  **Schlagzeug** als **Kit** (Standard-808-Slots Kick/Snare/HiHat …). Wählbar:
+  **ganzer Song** (ein Clip je Spur) oder **Takt-Loops** (kurze Pattern zum
+  Arrangieren). Tempo, Notenlängen, Velocity und die Takt-Lage werden übernommen
+  (96 Ticks/Viertel). Die fertige `.XML` in den **SONGS**-Ordner der SD-Karte legen.
+  Hinweis: Das Kit referenziert das **Factory-808-Kit** – diese Samples müssen auf
+  der SD-Karte liegen, sonst lädt der Song zwar, die Drums bleiben aber stumm.
+  (Format inkl. Noten-Encoding/Tempo wurde gegen eine echte c1.2.1-Datei verifiziert
+  und auf dem Gerät getestet.)
 - **Song-Sheet (Text + Akkorde)** (optional) – aus einer Datei entsteht ein
   **Chord-Sheet wie bei Ultimate Guitar**: die Akkorde stehen über den jeweiligen
   Wörtern des gesungenen Textes. Ablauf komplett **lokal/offline**: Demucs trennt
