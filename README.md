@@ -41,7 +41,7 @@ Eingänge; unter macOS leistet das ein virtuelles Ausgabegerät wie
 | **Stems → MIDI** | Bass/Rest/Gesang via Basic Pitch nach MIDI, je Kanal; optional MIDI-Clock mitsenden; als `.mid` speichern. |
 | **Schlagzeug → MIDI** | Drums in Kick/Snare/HiHat (+ optional Tom/Crash) zerlegen, Note je Komponente frei wählbar; Standard GM-Drum-Map auf Kanal 10. |
 | **MIDI-Datei laden** | Eine `.mid` spurweise (an/aus + Kanal) über den MIDI-Ausgang abspielen. |
-| **Deluge-Song** | Aus den Stem-MIDI-Spuren eine Synthstrom-Deluge-Songdatei (`.XML`) erzeugen: Melodien als interne Synths, Drums als Kit; ganzer Song oder Takt-Loops. |
+| **Deluge-Song (Bundle)** | Synthstrom-Deluge-Songdatei (`.XML`) aus **Stems + MIDI**: ausgerichtete Audio-Spuren parallel zu internen Synths/Kit, gemeinsam **aufs Taktraster gezogen** (driftfrei, Groove erhalten). |
 | **DJ-Modus** | Zwei Decks, Equal-Power-Crossfade; die Clock folgt dem Ziel-Deck. |
 | **Aufnahme** | Live-Signal mitschneiden und als Datei(en) speichern. |
 
@@ -62,6 +62,11 @@ siehe [Webversion](#webversion-browser).
 - **Schlagzeug → MIDI:** im Stem-Player **„Schlagzeug…"** → je Komponente Note wählen
   (Default GM-Drum-Map, Kanal 10), **Empfindlichkeit** justieren → **Anwenden**.
 - **Datei als MIDI-Clock:** **Datei …** → nur **MIDI-Clock-Ausgabe** → **▶ Start / ■ Stopp**.
+- **Deluge-Song (Bundle) bauen:** **Datei …** (oder nach einer **Aufnahme** → **Weiter**)
+  → **Deluge-Song erstellen** anhaken, **Instrumente** + **Vorlauf-Takte** wählen und beim
+  **Taktraster** z. B. **„Groove"** (driftfrei, lebendig) → Speicherort. Danach die `.XML`
+  in den **SONGS**-Ordner und die daneben erzeugten Stem-WAVs nach **`SAMPLES/AudioWizard/`**
+  auf die SD-Karte kopieren.
 - **MIDI-Ausgang prüfen:** Einstellungen → **▶ MIDI-Ausgang testen** (Dreiklang hörbar?).
 
 ## Funktionen im Detail
@@ -151,7 +156,11 @@ siehe [Webversion](#webversion-browser).
   **Bass → MIDI** (siehe unten) und
   **Song-Sheet** beliebig **kombinieren** – die teure KI-Trennung läuft dabei nur
   **einmal** für alle gewählten Aktionen, und eine Aufnahme muss nicht erst als
-  Datei gespeichert werden. Im Dialog lässt sich die **Stem-Qualität** wählen:
+  Datei gespeichert werden. Wurde der Dialog nach einer **Aufnahme mit mehreren
+  erkannten Stücken** geöffnet, werden die gewählten Aktionen **nacheinander auf
+  jedes Stück einzeln** angewendet (eigene Stems/Song-Sheet/Deluge-Song je Stück,
+  benannt nach dem Stück-Namen aus der Prüf-Liste) – nicht auf den ganzen
+  Mitschnitt am Stück. Im Dialog lässt sich die **Stem-Qualität** wählen:
   **Automatisch** (Standard) trennt schnell, wenn nur ein Song-Sheet entsteht
   (Text/Akkorde sind robust gegen kleine Trennartefakte), und in **voller
   Qualität**, sobald die Stems als **Audio exportiert/abgespielt** oder zu **MIDI**
@@ -248,7 +257,16 @@ siehe [Webversion](#webversion-browser).
   MIDI mit. **Stems und MIDI werden mit demselben Versatz ausgerichtet**, sodass der
   Groove-Downbeat exakt auf dem **1. Schlag von Takt (Vorlauf+1)** im Deluge-Raster
   liegt (Auftakte fallen in den Vorlauf); die Stems werden dazu auf **ganze Takte**
-  geschnitten, also ohne Stretch gridgenau. Tempo, Notenlängen, Velocity und die
+  geschnitten. Gegen das **Wegdriften** über die Songlänge (wenn das aufgenommene
+  Tempo schwankt oder leicht neben dem geschätzten BPM liegt) gibt es ein
+  **Taktraster** in mehreren Stufen, von **lebendig nach straff** – alle halten den
+  Deluge-Click dauerhaft synchron und dehnen die Stems **tonhöhen-erhaltend**
+  gemeinsam (MIDI wird mitgezogen; Drums klingen evtl. minimal weicher): **„Aus"**
+  übernimmt das Audio unverändert (kann driften); **„Takt auf Eins"** zieht je Takt
+  nur die **musikalische 1** aufs Raster und lässt die Schläge 2–4 voll lebendig;
+  **„Groove"** (empfohlen) zieht die Schläge 2–4 **zusätzlich zur Hälfte** Richtung
+  Raster – straffer, aber das Feeling bleibt; **„Pro Beat"** zieht **jeden Schlag**
+  exakt aufs Raster (am straffsten, kann steif klingen). Tempo, Notenlängen, Velocity und die
   Takt-Lage werden übernommen (96 Ticks/Viertel). Die fertige `.XML` in den
   **SONGS**-Ordner legen und die daneben erzeugten **Stem-WAVs** nach
   **`SAMPLES/AudioWizard/`** auf die SD-Karte kopieren (der Pfad steht fest in der

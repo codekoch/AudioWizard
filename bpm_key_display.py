@@ -216,6 +216,7 @@ class DisplayApp:
         self._midi_lock = threading.Lock()
         self._material_res = None             # (out|None, err) vom Verarbeitungs-Thread
         self._material_clock = None           # Datei-Pfad: Clock NACH Verarbeitung
+        self._material_queue = []             # weitere Stuecke nacheinander (Aufnahme)
         self._load_options()                  # Optionen + BPM-Bereich anwenden
 
         # ---- Schriften (Groesse wird bei Resize angepasst) ----
@@ -1248,16 +1249,68 @@ class DisplayApp:
         self._stem_log(log, traceback.format_exc().rstrip())
 
     def _rec_actions(self):
-        """Aufnahme weiterverarbeiten: fragt, was passieren soll (Stems
-        exportieren/abspielen, Song-Sheet) – ohne die Aufnahme erst speichern zu
-        muessen. Die Stem-Trennung laeuft danach nur einmal fuer alle Aktionen."""
+        """Aufnahme weiterverarbeiten: fragt EINMAL, was passieren soll (Stems
+        exportieren/abspielen, Song-Sheet, Deluge) – ohne die Aufnahme erst
+        speichern zu muessen. Die gewaehlten Aktionen laufen anschliessend
+        NACHEINANDER ueber JEDES erkannte Stueck (eigene Stems/Sheet/Deluge je
+        Stueck, mit dem Stueck-Namen als Datei-Basis). Pro Stueck laeuft die
+        Stem-Trennung einmal fuer alle Aktionen."""
         if self._rec_audio is None:
             return
         actions = self._ask_actions("Aufnahme", allow_clock=False)
         if not actions:
             return
-        self._run_material(("array", self._rec_audio, self._rec_sr),
-                           actions, "Aufnahme")
+        rec, sr = self._rec_audio, self._rec_sr
+        segs = self._rec_segs
+        if not segs:                              # noch nicht erkannt -> ganze Aufnahme
+            segs = [{"start": 0, "end": len(rec), "name": "Aufnahme"}]
+        jobs = []
+        for i, seg in enumerate(segs):
+            s, e = int(seg["start"]), int(seg["end"])
+            # vom User angepasster Name (aus der Liste), sonst Vorschlag
+            if i < len(self._rec_name_vars) and self._rec_name_vars[i].get().strip():
+                nm = core.sanitize_filename(self._rec_name_vars[i].get())
+            else:
+                nm = core.sanitize_filename(seg.get("name") or f"Aufnahme_{i + 1}")
+            jobs.append((("array", rec[s:e], sr),
+                         self._actions_for_piece(actions, nm, len(segs)), nm))
+        # Speichern-Fenster schliessen, damit es nicht ueber den Ergebnissen haengt
+        if self._rec_save_win is not None and self._rec_save_win.winfo_exists():
+            self._rec_save_win.destroy()
+        self._run_material_queue(jobs)
+
+    def _actions_for_piece(self, actions, name, count):
+        """Kopiert die Aktionen fuer EIN Stueck und macht die Ausgabepfade
+        eindeutig, damit sich mehrere Stuecke nicht gegenseitig ueberschreiben.
+        Export-WAVs werden ohnehin mit dem Stueck-Namen (= title) praefigiert;
+        nur der feste Deluge-XML-Pfad muss je Stueck variiert werden. Bei nur
+        einem Stueck bleibt alles unveraendert."""
+        if count <= 1:
+            return actions
+        a = dict(actions)
+        if a.get("deluge"):
+            d = dict(a["deluge"])
+            root, ext = os.path.splitext(d["path"])
+            d["path"] = f"{root}_{name}{ext or '.XML'}"
+            a["deluge"] = d
+        return a
+
+    def _run_material_queue(self, jobs):
+        """Verarbeitet mehrere Stuecke NACHEINANDER (ein Job = (source, actions,
+        title)). Sequenziell, weil es nur einen Ergebnis-Slot (_material_res) gibt
+        und sich Ergebnis-Fenster (Stem-Player, Sheet) sonst ueberlagern wuerden:
+        der naechste Job startet erst, wenn _tick den vorigen konsumiert hat."""
+        self._material_queue = list(jobs)
+        self._material_start_next()
+
+    def _material_start_next(self):
+        """Naechsten wartenden Job starten (No-op bei leerer Schlange). Jobs ohne
+        echte Verarbeitung (kein Stem-Bedarf) werden uebersprungen, damit die
+        Schlange nicht haengen bleibt."""
+        while self._material_queue:
+            source, actions, title = self._material_queue.pop(0)
+            if self._run_material(source, actions, title):
+                return                            # Worker laeuft -> _tick macht weiter
 
     def _open_stem_player(self, stems_dict, sr, midi_notes=None, bpm=0.0,
                           clock_default=False):
@@ -1622,6 +1675,29 @@ class DisplayApp:
                  justify="center").pack(side="left")
         tk.Label(lr, text="Takte vor dem Downbeat (Auftakt liegt im Vorlauf)",
                  font=self.f_tiny, bg=COL_BG, fg=COL_MUTED).pack(side="left", padx=4)
+        # Raster-Bindung: Aus / Takt auf Eins / Groove / Pro Beat
+        gr = tk.Frame(win, bg=COL_BG)
+        gr.pack(padx=20, pady=(4, 0), anchor="w")
+        _gl0 = load_config().get("deluge_gridlock", "off")
+        if _gl0 == "bar":                         # altes "Pro Takt" -> Takt auf Eins
+            _gl0 = "bar1"
+        gridv = tk.StringVar(value=_gl0 if _gl0 in
+                             ("off", "bar1", "groove", "beat") else "off")
+        tk.Label(gr, text="Taktraster:", font=self.f_tiny, bg=COL_BG,
+                 fg=COL_ACCENT).pack(side="left", padx=(0, 6))
+        for val, lbl in (("off", "Aus"), ("bar1", "Takt auf Eins"),
+                         ("groove", "Groove"), ("beat", "Pro Beat")):
+            tk.Radiobutton(gr, text=lbl, variable=gridv, value=val, font=self.f_small,
+                           bg=COL_BG, fg=COL_FG, selectcolor=COL_SURFACE,
+                           activebackground=COL_BG, activeforeground=COL_FG, bd=0,
+                           highlightthickness=0).pack(side="left", padx=(0, 4))
+        tk.Label(win, text="Gegen Driften (alle halten den Click synchron): „Takt auf "
+                 "Eins“ legt je Takt die 1 aufs Raster, Groove voll erhalten; „Groove“ "
+                 "zieht 2–4 zusätzlich halb Richtung Raster (straffer, Feeling bleibt, "
+                 "empfohlen); „Pro Beat“ jeden Schlag exakt (am straffsten). Stretch "
+                 "tonhöhen-erhaltend (Drums evtl. weicher). „Aus“ = Original.",
+                 font=self.f_tiny, bg=COL_BG, fg=COL_MUTED, justify="left",
+                 wraplength=440).pack(padx=20, anchor="w", pady=(2, 0))
         status = tk.Label(win, text="", font=self.f_tiny, bg=COL_BG, fg=COL_MUTED,
                           wraplength=440, justify="left")
         status.pack(pady=(8, 2))
@@ -1629,6 +1705,7 @@ class DisplayApp:
         def _do():
             midi = {n: list(notes) for n, notes, _c in tracks}
             instruments = list(midi.keys())
+            gmode = gridv.get()                       # off/beat/bar
             try:
                 lead = max(0, int(float(leadv.get().replace(",", "."))))
             except ValueError:
@@ -1645,14 +1722,33 @@ class DisplayApp:
 
             def _work():
                 try:
+                    wstems, wmidi = stems_dict, midi
+                    wbpm, wt_db = bpm or 120.0, dbv["t"]
+                    if gmode != "off":                 # Variante B: auf Raster ziehen
+                        self.root.after(0, lambda: status.config(
+                            text=f"ziehe Stems auf Taktraster ({gmode}) …"))
+                        wstems, ginfo = core.warp_stems_to_grid(
+                            stems_dict, sr, per=gmode)
+                        if ginfo is not None:
+                            wbpm = float(ginfo["bpm"])
+                            wmidi = {n: core.warp_notes(list(nt), ginfo)
+                                     for n, nt in midi.items()}
+                            # vom User gesetzten Downbeat in die gewarpte Zeit ziehen
+                            wt_db = float(np.interp(dbv["t"], ginfo["map_src"],
+                                                    ginfo["map_tgt"]))
+                            self.root.after(0, lambda: status.config(
+                                text="Raster fertig – schreibe Bundle …"))
                     xmlp, wavs = deluge.write_deluge_bundle(
-                        p, stems_dict, sr, midi, bpm or 120.0, dbv["t"],
+                        p, wstems, sr, wmidi, wbpm, wt_db,
                         lead_bars=lead, instruments=instruments)
                     save_config({**load_config(),
-                                 "last_save_dir": os.path.dirname(p)})
+                                 "last_save_dir": os.path.dirname(p),
+                                 "deluge_gridlock": gmode})
+                    vtxt = (f"Taktraster {gmode} ({wbpm:.1f} BPM)"
+                            if gmode != "off" else "Original-Audio")
                     msg = (f"Gespeichert: {os.path.basename(xmlp)} + {len(wavs)} "
-                           "Stems. XML → SONGS/, Stem-WAVs → SAMPLES/AudioWizard/ "
-                           "auf der SD-Karte.")
+                           f"Stems ({vtxt}). XML → SONGS/, Stem-WAVs → "
+                           "SAMPLES/AudioWizard/ auf der SD-Karte.")
                     self.root.after(0, lambda: status.config(text=msg))
                 except Exception as ex:
                     self.root.after(0, lambda e=ex: status.config(text=f"Fehler: {e}"))
@@ -1660,7 +1756,7 @@ class DisplayApp:
 
         self._small_button(win, "Bundle speichern…", _do).pack(pady=(2, 2))
         self._small_button(win, "Schließen", win.destroy).pack(pady=(0, 10))
-        win._a2m_deluge = (dblbl, leadv)          # Tk-Variablen vor GC schuetzen
+        win._a2m_deluge = (dblbl, leadv, gridv)   # Tk-Variablen vor GC schuetzen
 
     def _save_stems_dialog(self, parent_win, stems_dict, sr, bpm=0.0):
         """Dialog: welche Stems speichern (einzeln/alle) + optional „auf Takt
@@ -2785,6 +2881,11 @@ class DisplayApp:
         v_barcut = tk.BooleanVar(value=bool(cfg.get("stem_barcut", False)))
         v_deluge = tk.BooleanVar(value=False)
         dl_bars = tk.StringVar(value="2")          # Vorlauf-Takte (Lead-in)
+        _gl0 = cfg.get("deluge_gridlock", "off")          # off/bar1/groove/beat
+        if _gl0 == "bar":                                 # altes "Pro Takt" -> Takt auf Eins
+            _gl0 = "bar1"
+        dl_grid = tk.StringVar(value=_gl0 if _gl0 in
+                               ("off", "bar1", "groove", "beat") else "off")
         dl_instr = {n: tk.BooleanVar(value=True)
                     for n in ("bass", "drums", "other", "vocals")}
 
@@ -2878,10 +2979,28 @@ class DisplayApp:
                            bg=COL_BG, fg=COL_FG, selectcolor=COL_SURFACE,
                            activebackground=COL_BG, activeforeground=COL_FG, bd=0,
                            highlightthickness=0).pack(side="left", padx=(0, 4))
+        # Raster-Bindung: A) Original-Audio (kann driften) / B) auf Takt-Raster ziehen
+        dlr3 = tk.Frame(delf, bg=COL_BG)
+        dlr3.pack(anchor="w", pady=(2, 0))
+        tk.Label(dlr3, text="Taktraster:", font=self.f_tiny, bg=COL_BG,
+                 fg=COL_ACCENT).pack(side="left", padx=(0, 6))
+        for val, lbl in (("off", "Aus"), ("bar1", "Takt auf Eins"),
+                         ("groove", "Groove"), ("beat", "Pro Beat")):
+            tk.Radiobutton(dlr3, text=lbl, variable=dl_grid, value=val,
+                           font=self.f_small, bg=COL_BG, fg=COL_FG,
+                           selectcolor=COL_SURFACE, activebackground=COL_BG,
+                           activeforeground=COL_FG, bd=0, highlightthickness=0).pack(
+                               side="left", padx=(0, 4))
         tk.Label(delf, text="Bundle: ausgerichtete Stems (WAV) + MIDI, gemeinsamer "
                  "Downbeat auf Takt-1-Raster. Tonale Spuren brauchen basic-pitch; "
-                 "Drums = 808-Kit. Speicherort wird beim Start abgefragt; die Stem-"
-                 "WAVs danach in SAMPLES/AudioWizard/ auf die SD-Karte.",
+                 "Drums = 808-Kit. WAVs danach in SAMPLES/AudioWizard/ auf die SD.\n"
+                 "Taktraster gegen Driften (alle halten den Click synchron, dehnen "
+                 "das Audio tonhöhen-erhaltend; Drums evtl. etwas weicher): „Takt auf "
+                 "Eins“ legt je Takt die 1 aufs Raster, Groove dazwischen voll erhalten "
+                 "(lebendigste). „Groove“ zieht die Schläge 2–4 zusätzlich halb "
+                 "Richtung Raster (straffer, Feeling bleibt) – empfohlen. „Pro Beat“ "
+                 "jeden Schlag exakt aufs Raster (am straffsten, kann steif klingen). "
+                 "„Aus“ = Original (kann driften).",
                  font=self.f_tiny, bg=COL_BG, fg=COL_MUTED, justify="left",
                  wraplength=460).pack(anchor="w", pady=(2, 0))
 
@@ -2956,12 +3075,15 @@ class DisplayApp:
                     dlead = max(0, int(float(dl_bars.get().replace(",", "."))))
                 except ValueError:
                     dlead = 2
-                deluge_cfg = {"path": dlp, "lead": dlead, "instruments": instruments}
+                gmode = dl_grid.get()                 # off/beat/bar
+                deluge_cfg = {"path": dlp, "lead": dlead, "instruments": instruments,
+                              "gridlock": None if gmode == "off" else gmode}
             lang = next(v for lbl, v in lang_map if lbl == lvar.get())
             model = next(v for lbl, v in model_map if lbl == mvar.get())
             qual = next(v for lbl, v in qual_map if lbl == qvar.get())
             new_cfg = {**load_config(), "sheet_lang": lang, "sheet_model": model,
-                       "stem_quality": qual, "stem_barcut": bool(v_barcut.get())}
+                       "stem_quality": qual, "stem_barcut": bool(v_barcut.get()),
+                       "deluge_gridlock": dl_grid.get()}
             if out_dir:
                 new_cfg["last_save_dir"] = out_dir
             elif deluge_cfg:
@@ -3013,13 +3135,16 @@ class DisplayApp:
     def _run_material(self, source, actions, title):
         """Verarbeitet importierte Musik (Datei-Pfad ODER ('array', rec, sr)) gemaess
         der gewaehlten Aktionen. Stem-Trennung laeuft nur einmal fuer alle Aktionen.
-        Reiner Clock-Fall (Datei) geht direkt ohne Trenn-Aufwand in den Datei-Modus."""
+        Reiner Clock-Fall (Datei) geht direkt ohne Trenn-Aufwand in den Datei-Modus.
+        Rueckgabe: True, wenn ein Verarbeitungs-Thread gestartet wurde (dann meldet
+        sich spaeter _material_res); False sonst (Clock-/Leerfall) -- so weiss die
+        Stueck-Schlange, ob sie auf das Ergebnis warten oder gleich weitermachen muss."""
         needs_stems = (actions["export"] or actions["sheet"] or actions["play"]
                        or actions.get("stemmidi") or actions.get("deluge"))
         if not needs_stems:
             if actions.get("clock") and not isinstance(source, tuple):
                 self._begin_file_clock(source)
-            return
+            return False
         # Clock (falls gewaehlt, nur fuer Dateien) erst NACH der Verarbeitung starten.
         # ABER nicht bei "Stems → MIDI": dort liefert der Stem-Player die Clock ueber
         # DENSELBEN Port -- eine separate Datei-Clock wuerde den (unter Windows oft
@@ -3038,6 +3163,7 @@ class DisplayApp:
         self._stem_log(log, "Gewählt: " + ", ".join(bits))
         threading.Thread(target=self._material_worker,
                          args=(source, actions, title, log), daemon=True).start()
+        return True
 
     def _material_worker(self, source, actions, title, log):
         try:
@@ -3130,44 +3256,69 @@ class DisplayApp:
                             sensitivity=dsens, log=cb)
                     except Exception as ex:
                         self._stem_log(log, f"Schlagzeug→MIDI übersprungen: {ex}")
+                step += 1                          # Stems→MIDI fertig
             if actions.get("deluge"):
-                step += 1
+                # Fortschritt VOR der Arbeit melden (Warp+Bundle koennen dauern); der
+                # Schritt wird erst NACH dem Schreiben hochgezaehlt, sonst zeigt der
+                # Balken „Fertig", bevor das Bundle wirklich geschrieben ist.
                 self._stem_progress(log, step, total, "Deluge-Song")
                 self._stem_log(log, "== Deluge-Song erstellen ==")
                 dcfg = actions["deluge"]
-                dbpm = float((out.get("sheet") or {}).get("bpm", 0.0))
-                if dbpm <= 0:
+                gl = dcfg.get("gridlock")             # None | "bar1" | "groove" | "beat"
+                # Variante B: Stems VORHER auf ein konstantes Takt-Raster ziehen,
+                # damit der Deluge-Clip nicht wegdriftet. dstems/ginfo: bei Erfolg die
+                # gewarpten Stems + Zeit-Abbildung, sonst die unveraenderten (Var. A).
+                dstems, ginfo = stems, None
+                if gl:                                # off -> gl is None
+                    self._stem_log(log, f"== Auf Takt-Raster ziehen (Variante B, "
+                                   f"{gl}) ==")
                     try:
-                        ts = stems.get("drums")
-                        if ts is None:
-                            ts = core.accompaniment_from_stems(stems)
-                        ts = ts.mean(axis=1) if getattr(ts, "ndim", 1) == 2 else ts
-                        dbpm = float(core.estimate_tempo(ts, ssr) or 0.0)
-                    except Exception:
-                        dbpm = 0.0
-                midi = out.get("midi_notes") or {}
+                        dstems, ginfo = core.warp_stems_to_grid(
+                            stems, ssr, per=gl, log=cb)
+                    except Exception as ex:
+                        self._stem_log(log, f"Raster-Warp fehlgeschlagen – nutze "
+                                       f"Original-Audio: {ex}")
+                        dstems, ginfo = stems, None
+                # Tempo: bei Raster-Bindung das KONSTANTE Zieltempo, sonst messen.
+                if ginfo is not None:
+                    dbpm = float(ginfo["bpm"])
+                else:
+                    dbpm = float((out.get("sheet") or {}).get("bpm", 0.0))
+                    if dbpm <= 0:
+                        try:
+                            ts = dstems.get("drums")
+                            if ts is None:
+                                ts = core.accompaniment_from_stems(dstems)
+                            ts = ts.mean(axis=1) if getattr(ts, "ndim", 1) == 2 else ts
+                            dbpm = float(core.estimate_tempo(ts, ssr) or 0.0)
+                        except Exception:
+                            dbpm = 0.0
+                # MIDI: bei Raster-Bindung FRISCH aus den gewarpten Stems (die aus den
+                # Original-Stems wiederverwendete MIDI passt sonst nicht zum Audio).
+                midi = {} if ginfo is not None else (out.get("midi_notes") or {})
                 min_ms = float(load_config().get("bass_min_ms", 130))
                 for nm in dcfg["instruments"]:        # MIDI je gewaehltem Instrument
-                    if midi.get(nm) is not None or stems.get(nm) is None:
+                    if midi.get(nm) is not None or dstems.get(nm) is None:
                         continue
                     try:
                         if nm == "drums":
                             dmap, dsens = self._drum_settings()
                             midi[nm] = core.drums_to_midi_notes(
-                                stems["drums"], ssr, mapping=dmap,
+                                dstems["drums"], ssr, mapping=dmap,
                                 sensitivity=dsens, log=cb)
                         else:
                             lo, hi = core.STEM_MIDI_RANGE.get(nm, (40.0, 2000.0))
                             midi[nm] = core.stem_to_midi_notes(
-                                stems[nm], ssr, min_freq=lo, max_freq=hi,
+                                dstems[nm], ssr, min_freq=lo, max_freq=hi,
                                 min_note_ms=min_ms,
                                 label=core.STEM_LABELS.get(nm, nm), log=cb)
                     except Exception as ex:
                         self._stem_log(log, f"{nm}→MIDI übersprungen: {ex}")
-                out["midi_notes"] = midi
+                if ginfo is None:                     # nur bei Original-Audio teilen
+                    out["midi_notes"] = midi
                 # Downbeat (erster klarer Drum-Einsatz) -> gemeinsame Ausrichtung
                 try:
-                    dref = stems.get("drums")
+                    dref = dstems.get("drums")
                     t_db = (core.drums_downbeat_sec(dref, ssr)
                             if dref is not None else 0.0)
                 except Exception:
@@ -3175,14 +3326,17 @@ class DisplayApp:
                 lead = int(dcfg.get("lead", 2))
                 try:
                     p2, wavs = deluge.write_deluge_bundle(
-                        dcfg["path"], stems, ssr, midi, dbpm or 120.0, t_db,
+                        dcfg["path"], dstems, ssr, midi, dbpm or 120.0, t_db,
                         lead_bars=lead, instruments=dcfg["instruments"], log=cb)
                     out["deluge_path"] = p2
+                    vtxt = (f"auf Takt-Raster gezogen ({gl}, {dbpm:.1f} BPM)"
+                            if ginfo is not None else "Original-Audio")
                     self._stem_log(log, f"Deluge-Bundle: {os.path.basename(p2)} + "
-                                   f"{len(wavs)} Stems – Downbeat auf Takt {lead + 1}, "
-                                   f"Stems in SAMPLES/AudioWizard/ kopieren.")
+                                   f"{len(wavs)} Stems – {vtxt}, Downbeat auf Takt "
+                                   f"{lead + 1}, Stems in SAMPLES/AudioWizard/ kopieren.")
                 except Exception as ex:
                     self._stem_log(log, f"Deluge-Bundle fehlgeschlagen: {ex}")
+                step += 1                          # Deluge-Bundle fertig
             # Stem-Player oeffnen, wenn Abspielen ODER Stems-MIDI gewaehlt ist
             # (die MIDI-Spuren laufen synchron zur Stem-Position mit).
             if actions["play"] or actions.get("stemmidi"):
@@ -3658,6 +3812,9 @@ class DisplayApp:
                     src = self._material_clock
                     self._material_clock = None
                     self._begin_file_clock(src)
+            # Naechstes Stueck der Aufnahme-Schlange (leer = nichts) erst JETZT,
+            # nachdem das vorige Ergebnis konsumiert ist (ein Ergebnis-Slot).
+            self._material_start_next()
         # Datei-Modus: verzoegerter Start (Analyse-Thread -> Main-Thread, Tk-only)
         if self._file_begin_args is not None:
             kind, gen, payload = self._file_begin_args

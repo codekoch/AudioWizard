@@ -2463,7 +2463,7 @@ def file_bpm_at(beats, pos, fallback=0.0):
     return 60.0 / d if d > 0 else fallback
 
 
-def analyze_file_beatmap(y, sr, min_bpm=MIN_BPM, max_bpm=MAX_BPM):
+def analyze_file_beatmap(y, sr, min_bpm=MIN_BPM, max_bpm=MAX_BPM, raw_beats=False):
     """Offline-Beat-Map aus Mono-Audio y@sr. Rueckgabe-dict oder None:
         beats      np.ndarray  Beat-Zeiten (s)
         ticks      np.ndarray  Tick-Zeiten (s, 24 PPQN am Raster)
@@ -2471,7 +2471,10 @@ def analyze_file_beatmap(y, sr, min_bpm=MIN_BPM, max_bpm=MAX_BPM):
         bpm        float       (mittleres) Tempo
         bpm_min/max float      bei variablem Tempo die Spanne (10/90-Perzentil)
         duration   float       Laenge (s)
-    """
+    raw_beats=True: gibt IMMER die ECHTEN getrackten Beats zurueck (ueberspringt die
+    'konstant'-Idealisierung, die sonst ein perfekt gleichmaessiges Raster liefert).
+    Noetig fuers Aufs-Raster-Ziehen (warp_stems_to_grid): dort braucht man die realen,
+    evtl. driftenden Beat-Positionen, sonst waere der Warp ein No-op."""
     if y is None or len(y) < sr:                  # < 1 s -> keine sinnvolle Schaetzung
         return None
     duration = len(y) / float(sr)
@@ -2520,6 +2523,11 @@ def analyze_file_beatmap(y, sr, min_bpm=MIN_BPM, max_bpm=MAX_BPM):
 
     mh1, mh2 = med_half(0, mid + 1), med_half(mid, len(beats))
     drift = (abs(mh2 - mh1) / (0.5 * (mh1 + mh2))) if (mh1 > 0 and mh2 > 0) else 1.0
+
+    if raw_beats:                                 # echte Beats, KEINE Idealisierung
+        return {"beats": beats, "ticks": _build_tick_times(beats, duration),
+                "constant": bool(drift < FILE_CONST_DRIFT), "bpm": 60.0 / med_ivl,
+                "bpm_min": 0.0, "bpm_max": 0.0, "duration": duration}
 
     if med_ivl > 0 and drift < FILE_CONST_DRIFT:
         # konstantes Tempo: Periode per Phasenfaltung verfeinern, globales
@@ -3210,6 +3218,213 @@ def bar_aligned_stems(stems, sr, lead_bars=2, beats_per_bar=4, log=None):
     _emit(log, f"Takt-Schnitt: Downbeat ~{t_db:.2f}s, {bpm:.0f} BPM -> Start "
                f"{cut:+.2f}s ({lead_bars} Takte Vorlauf"
                + (", vorne mit Stille aufgefuellt)" if cut_n < 0 else ")") + ".")
+    return out
+
+
+def _pv_from_steps(D, time_steps, hop_length):
+    """Phase-Vocoder mit VORGEGEBENEN Eingangs-Frame-Positionen: time_steps[t] ist
+    die (fraktionale) Eingang-STFT-Frame-Position fuer den t-ten AUSGANG-Frame. Wie
+    librosa.phase_vocoder, aber mit VARIABLER statt konstanter Zeit-Abbildung -- so
+    laesst sich ein schwankendes Quelltempo auf ein gleichmaessiges Raster ziehen.
+    Tonhoehen-erhaltend (nur die Zeitachse wird gedehnt)."""
+    n_bins = D.shape[0]
+    phase_advance = np.linspace(0, np.pi * hop_length, n_bins)
+    ts = np.asarray(time_steps, dtype=np.float64)
+    out = np.zeros((n_bins, len(ts)), dtype=np.complex64)
+    Dp = np.pad(D, [(0, 0), (0, 2)], mode="constant")     # 2 Spalten Reserve fuer k+1
+    kmax = Dp.shape[1] - 2                                 # letzter zulaessiger k
+    phase_acc = np.angle(D[:, 0])
+    two_pi = 2.0 * np.pi
+    for t, step in enumerate(ts):
+        k = min(kmax, max(0, int(step)))
+        alpha = float(step) - k
+        c0, c1 = Dp[:, k], Dp[:, k + 1]
+        mag = (1.0 - alpha) * np.abs(c0) + alpha * np.abs(c1)
+        out[:, t] = mag * np.exp(1j * phase_acc)
+        dphase = np.angle(c1) - np.angle(c0) - phase_advance
+        dphase -= two_pi * np.round(dphase / two_pi)      # auf (-pi, pi] falten
+        phase_acc = phase_acc + phase_advance + dphase
+    return out
+
+
+GROOVE_STRENGTH = 0.5    # 'groove'-Modus: Anteil, mit dem die Beats 2-4 Richtung
+                         # Raster gezogen werden (0 = wie 'bar1' voller Groove;
+                         # 1 = wie 'beat' starr). 0.5 = straffer, aber lebendig.
+
+
+def _groove_targets(beats, phase, spb, strength):
+    """Zielzeiten fuer den 'groove'-Modus: jede Takt-Eins (jeder 4. Beat ab 'phase')
+    liegt EXAKT auf dem gleichmaessigen Raster (kein Drift), die Beats dazwischen
+    werden nur ANTEILIG ('strength', 0..1) vom natuerlichen Platz Richtung Raster
+    gezogen. So bleibt der Click synchron, das Groove-Feeling aber erhalten.
+    strength=0 -> wie 'bar1' (voller Groove), strength=1 -> wie 'beat' (starr)."""
+    n = len(beats)
+    db = list(range(int(phase) % 4, n, 4))     # Indizes der Takt-Einsen
+    if not db or db[0] != 0:
+        db = [0] + db                          # Songanfang als Anker
+    if db[-1] != n - 1:
+        db = db + [n - 1]                      # Songende als Anker
+    db = sorted(set(db))
+    t0 = float(beats[db[0]])
+    tgt = np.empty(n, dtype=np.float64)
+    for i in range(len(db) - 1):
+        k0, k1 = db[i], db[i + 1]
+        r0, r1 = float(beats[k0]), float(beats[k1])
+        g0 = t0 + (k0 - db[0]) * spb            # Raster-Zeit der umgebenden Einsen
+        g1 = t0 + (k1 - db[0]) * spb
+        span = (r1 - r0) if r1 > r0 else 1.0
+        for k in range(k0, k1 + 1):
+            interp = g0 + (float(beats[k]) - r0) / span * (g1 - g0)  # voller Groove
+            full = t0 + (k - db[0]) * spb                            # volles Raster
+            tgt[k] = (1.0 - strength) * interp + strength * full
+    return tgt
+
+
+def warp_stems_to_grid(stems, sr, per="beat", bpm=None, log=None):
+    """Zieht ALLE Stems auf ein GLEICHMAESSIGES Raster eines KONSTANTEN Tempos,
+    sodass ein Deluge-Audio-Clip (der mit konstantem Songtempo laeuft) dauerhaft im
+    Takt bleibt und NICHT mehr wegdriftet. Vorgehen:
+      * Echte Beat-Karte des Summen-Mix (analyze_file_beatmap) -- folgt dem realen,
+        evtl. schwankenden Tempo des Mitschnitts.
+      * Ziel-Tempo = bpm (oder gemessener Median). Anker-Modi (per):
+          'beat'  jeder Beat        -> straffste Bindung (kann steif klingen)
+          'bar1'  jeder 4. Beat ab dem erkannten DOWNBEAT -> die musikalische Eins
+                  liegt im Raster, Schlaege 2-4 bleiben lebendig
+          'groove' jede Takt-Eins voll aufs Raster (kein Drift), Beats 2-4 nur
+                  ANTEILIG (GROOVE_STRENGTH) -> Click synchron, Feeling bleibt
+        Jeder Anker b_k wird auf die gleichmaessige Rasterzeit gezogen; der erste
+        Anker bleibt an seiner Originalzeit (Intro/Outro bleiben 1:1 erhalten).
+      * Jeder Stem wird mit DERSELBEN, inhaltsunabhaengigen Zeit-Abbildung
+        (Phase-Vocoder, tonhoehen-erhaltend) verzerrt -> die Stems bleiben sample-
+        genau phasengleich zueinander.
+    Rueckgabe (warped_stems: dict, info: dict|None). info hat 'bpm' (konstantes
+    Zieltempo) und 'map_src'/'map_tgt' (Stuetzstellen in s) -- damit lassen sich die
+    MIDI-Noten mit warp_notes identisch mitziehen. Bei Problemen: unveraenderte
+    Stems + info=None (Aufrufer faellt dann auf Variante A zurueck)."""
+    import librosa
+    sr = int(sr)
+    sel = [n for n in stems if stems[n] is not None]
+    if not sel:
+        return dict(stems), None
+    # Referenz-Mix (mono, volle Laenge) fuer die Beat-Erkennung
+    maxn = max(len(np.asarray(stems[n])) for n in sel)
+    mix = np.zeros(maxn, dtype=np.float32)
+    for n in sel:
+        a = np.asarray(stems[n], dtype=np.float32)
+        if a.ndim == 2:
+            a = a.mean(axis=1)
+        mix[:len(a)] += a
+    try:
+        y_an = (librosa.resample(mix, orig_sr=sr, target_sr=ANALYSIS_SR)
+                if sr != ANALYSIS_SR else mix)
+        # WICHTIG: raw_beats=True -> die ECHTEN (evtl. driftenden) Beats. Ohne das
+        # liefert analyze_file_beatmap bei "konstantem" Tempo ein ideales Raster und
+        # der Warp waere ein No-op (Audio bliebe driftend).
+        bm = analyze_file_beatmap(y_an, ANALYSIS_SR, raw_beats=True)
+    except Exception as e:
+        _emit(log, f"Raster-Warp uebersprungen ({e}).")
+        return dict(stems), None
+    if not bm or len(np.asarray(bm.get("beats", []))) < 2:
+        _emit(log, "Raster-Warp uebersprungen (keine Beat-Karte).")
+        return dict(stems), None
+    beats = np.asarray(bm["beats"], dtype=np.float64)     # Beat-Zeiten (s)
+    dur_src = maxn / float(sr)
+
+    tgt_bpm = float(bpm) if (bpm and bpm > 0) else float(bm["bpm"])
+    if not (tgt_bpm and np.isfinite(tgt_bpm) and tgt_bpm > 0):
+        return dict(stems), None
+    spb = 60.0 / tgt_bpm                                   # Ziel-Sekunden je Beat
+
+    def _downbeat_phase():                                 # welcher Beat ist die 1
+        try:
+            dref = stems.get("drums")
+            t_db = (drums_downbeat_sec(dref, sr)
+                    if dref is not None else float(beats[0]))
+            return int(np.argmin(np.abs(beats - t_db))) % 4
+        except Exception:
+            return 0
+
+    # Anker + Zielzeiten je Modus. 'beat' = jeder Beat aufs Raster (straff);
+    # 'bar1' = nur jede Taktlinie, phasenausgerichtet auf die erkannte musikalische 1;
+    # 'groove' = jede Takt-1 voll aufs Raster (kein Drift), Beats 2-4 nur ANTEILIG
+    # (GROOVE_STRENGTH) -> Click synchron, Groove-Feeling bleibt. Erster Anker bleibt
+    # an seiner Originalzeit (Intro/Outro 1:1).
+    if per == "groove":
+        src_anchor = beats.copy()
+        tgt_anchor = _groove_targets(beats, _downbeat_phase(), spb, GROOVE_STRENGTH)
+    elif per == "bar1":                                   # jede musikalische 1 aufs Raster
+        phase = _downbeat_phase()
+        idx = np.arange(phase, len(beats), 4)
+        if len(idx) == 0 or idx[-1] != len(beats) - 1:
+            idx = np.append(idx, len(beats) - 1)
+        src_anchor = beats[idx]
+        tgt_anchor = src_anchor[0] + (idx - idx[0]) * spb
+    else:                                                 # per == "beat"
+        idx = np.arange(len(beats))
+        src_anchor = beats[idx]
+        tgt_anchor = src_anchor[0] + idx * spb
+
+    # Stuetzstellen in Sekunden, Intro (0..erster Anker) und Outro 1:1 erhalten
+    src_k = [0.0] + list(src_anchor) + [dur_src]
+    tgt_k = [tgt_anchor[0] - src_anchor[0]] + list(tgt_anchor) + \
+            [tgt_anchor[-1] + (dur_src - src_anchor[-1])]
+    # streng monoton steigend machen (np.interp braucht das)
+    ms, mt = [], []
+    for s, t in zip(src_k, tgt_k):
+        if not ms or (s > ms[-1] + 1e-9 and t > mt[-1] + 1e-9):
+            ms.append(float(s)); mt.append(float(t))
+    map_src = np.asarray(ms, dtype=np.float64)
+    map_tgt = np.asarray(mt, dtype=np.float64)
+    total_n = int(round(map_tgt[-1] * sr))
+    if total_n < 1:
+        return dict(stems), None
+
+    n_fft, hop = 2048, 512
+    out_frames = int(np.ceil(total_n / hop)) + 1
+    out_samp = np.arange(out_frames) * hop
+    # Ausgang-Sample -> Eingang-Sample (inverse Abbildung) -> Eingang-STFT-Frame
+    in_samp = np.interp(out_samp, map_tgt * sr, map_src * sr)
+    time_steps = in_samp / hop
+
+    warped = {}
+    for n in sel:
+        a = np.asarray(stems[n], dtype=np.float32)
+        twod = (a.ndim == 2)
+        if not twod:
+            a = a[:, None]
+        chans = []
+        for c in range(a.shape[1]):
+            D = librosa.stft(np.ascontiguousarray(a[:, c]), n_fft=n_fft,
+                             hop_length=hop)
+            Dw = _pv_from_steps(D, time_steps, hop)
+            yc = librosa.istft(Dw, hop_length=hop, length=total_n)
+            chans.append(yc.astype(np.float32))
+        warped[n] = (np.stack(chans, axis=1) if twod
+                     else np.ascontiguousarray(chans[0]))
+    for n in stems:                                       # None-Stems durchreichen
+        if n not in warped:
+            warped[n] = stems[n]
+    info = {"bpm": tgt_bpm, "per": per, "map_src": map_src, "map_tgt": map_tgt}
+    _emit(log, f"Raster-Warp ({per}): {len(src_anchor)} Anker, Zieltempo "
+               f"{tgt_bpm:.2f} BPM, Laenge {total_n / sr:.1f}s "
+               f"(Quelle {dur_src:.1f}s).")
+    return warped, info
+
+
+def warp_notes(notes, info):
+    """Zieht MIDI-Noten [(start,end,pitch,vel)] mit DERSELBEN Zeit-Abbildung wie die
+    Stems (warp_stems_to_grid) auf das Raster. So bleibt die MIDI-Spur synchron zum
+    gedehnten Audio. Rueckgabe neue Notenliste (Sekunden)."""
+    if not notes or not info:
+        return list(notes or [])
+    ms = np.asarray(info["map_src"], dtype=np.float64)
+    mt = np.asarray(info["map_tgt"], dtype=np.float64)
+    out = []
+    for (s, e, p, v) in notes:
+        s2 = float(np.interp(s, ms, mt))
+        e2 = float(np.interp(e, ms, mt))
+        if e2 > s2:
+            out.append((s2, e2, p, v))
     return out
 
 
