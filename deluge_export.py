@@ -110,8 +110,9 @@ def _kit_sound_source(name, sample_path, end_pos):
 
 
 def _synth_instrument(preset_name):
-    """Eine interne Synth-Spur (Default-Subtraktiv: 2 Saw-Oszillatoren)."""
-    return f"""<sound presetName="{preset_name}" presetFolder="SYNTHS" defaultVelocity="64" isArmedForRecording="0" activeModFunction="1" colour="0" polyphonic="poly" voicePriority="1" mode="subtractive" modFXType="none" lpfMode="24dB" hpfMode="HPLadder" filterRoute="H2L" maxVoices="8">
+    """Eine interne Synth-Spur (Default-Subtraktiv: 2 Saw-Oszillatoren). Spur-Farbe =
+    Stem-Grundfarbe (z.B. Vocals roetlich)."""
+    return f"""<sound presetName="{preset_name}" presetFolder="SYNTHS" defaultVelocity="64" isArmedForRecording="0" activeModFunction="1" colour="{_stem_hue(preset_name)}" polyphonic="poly" voicePriority="1" mode="subtractive" modFXType="none" lpfMode="24dB" hpfMode="HPLadder" filterRoute="H2L" maxVoices="8">
 <osc1 type="saw" transpose="0" cents="0" retrigPhase="0" />
 <osc2 type="saw" transpose="0" cents="0" retrigPhase="-1" />
 <lfo1 type="triangle" syncLevel="0" syncType="0" /><lfo2 type="triangle" syncLevel="0" syncType="0" />
@@ -126,55 +127,102 @@ _SONG_PARAMS = """<songParams reverbAmount="0x80000000" volume="0x3504F334" pan=
 _KIT_PARAMS = """<kitParams reverbAmount="0x80000000" volume="0x3504F334" pan="0x00000000" sidechainCompressorShape="0xDC28F5B2" modFXDepth="0x00000000" modFXRate="0xE0000000" stutterRate="0x00000000" sampleRateReduction="0x80000000" bitCrush="0x80000000" modFXOffset="0x00000000" modFXFeedback="0x80000000" compressorThreshold="0x00000000" lpfMorph="0x80000000" hpfMorph="0x80000000" tempo="0x00000000"><delay rate="0x00000000" feedback="0x80000000" /><lpf frequency="0x7FFFFFFF" resonance="0x80000000" /><hpf frequency="0x80000000" resonance="0xC0000000" /><equalizer bass="0x00000000" treble="0x00000000" bassFrequency="0x00000000" trebleFrequency="0x00000000" /></kitParams>"""
 
 
-def _drum_clip_xml(slots, notes_by_slot, length, section):
-    """Ein Kit-Clip: je Slot eine noteRow. notes_by_slot: {slot_pitch:[(pos,len,vel)]}."""
+def _drum_clip_xml(slots, notes_by_slot, length, section, colour=0, label=""):
+    """Ein Kit-Clip: je Slot eine noteRow. notes_by_slot: {slot_pitch:[(pos,len,vel)]}.
+    colour = kleine Part-VARIATION (Stem-Grundfarbe wird addiert); label -> in den
+    Clip-Namen (z.B. 'Drums 1a')."""
     rows = []
     for idx, slot_pitch in enumerate(slots):
         ns = notes_by_slot.get(slot_pitch, [])
         data = f' noteDataWithLift="{_enc_notes(ns)}"' if ns else ""
         rows.append(f'<noteRow colourOffset="{(idx * 17) % 72}" drumIndex="{idx}"'
                     f'{data}>{_DRUM_SOUNDPARAMS}</noteRow>')
-    return (f'<instrumentClip clipName="Drums" inKeyMode="0" yScroll="0" '
+    co = (_stem_hue("drums") + int(colour)) % 72
+    cn = f"Drums {label}".strip()[:20]
+    return (f'<instrumentClip clipName="{cn}" inKeyMode="0" yScroll="0" '
             f'instrumentPresetName="AudioWizard Drums" instrumentPresetFolder="KITS" '
             f'isPlaying="1" isSoloing="0" isArmedForRecording="0" length="{length}" '
-            f'colourOffset="70" section="{section}">{_KIT_PARAMS}'
+            f'colourOffset="{co}" section="{section}">{_KIT_PARAMS}'
             f'<noteRows>{"".join(rows)}</noteRows></instrumentClip>')
 
 
-def _synth_clip_xml(name, ti, notes_by_pitch, length, section):
-    """Ein Synth-Clip: je Tonhoehe eine noteRow."""
+def _synth_clip_xml(name, ti, notes_by_pitch, length, section, colour=0, label=""):
+    """Ein Synth-Clip: je Tonhoehe eine noteRow. colour = kleine Part-VARIATION (die
+    Stem-Grundfarbe von 'name' wird addiert -> Vocals roetlich usw.); label -> in den
+    Clip-Namen (z.B. 'Vocals 1a')."""
     rows = [f'<noteRow y="{pitch}" noteDataWithLift="{_enc_notes(notes_by_pitch[pitch])}" />'
             for pitch in sorted(notes_by_pitch)]
-    return (f'<instrumentClip clipName="{name[:20]}" inKeyMode="0" yScroll="{40 + ti}" '
+    co = (_stem_hue(name) + int(colour)) % 72
+    cn = f"{name} {label}".strip()[:20]
+    return (f'<instrumentClip clipName="{cn}" inKeyMode="0" yScroll="{40 + ti}" '
             f'instrumentPresetName="{name[:30]}" instrumentPresetFolder="SYNTHS" '
             f'isPlaying="1" isSoloing="0" isArmedForRecording="0" length="{length}" '
-            f'colourOffset="{(ti * 23) % 72}" section="{section}">{_SYNTH_SOUNDPARAMS}'
+            f'colourOffset="{co}" section="{section}">{_SYNTH_SOUNDPARAMS}'
             f'<noteRows>{"".join(rows)}</noteRows></instrumentClip>')
 
 
 _AUDIO_PARAMS = """<params reverbAmount="0x80000000" volume="0xE0000000" pan="0x00000000" sidechainCompressorShape="0xDC28F5B2" modFXDepth="0x00000000" modFXRate="0xE0000000" stutterRate="0x00000000" sampleRateReduction="0x80000000" bitCrush="0x80000000" modFXOffset="0x00000000" modFXFeedback="0x80000000" compressorThreshold="0x00000000" lpfMorph="0x80000000" hpfMorph="0x80000000" tempo="0x00000000"><delay rate="0x00000000" feedback="0x80000000" /><lpf frequency="0x7FFFFFFF" resonance="0x80000000" /><hpf frequency="0x80000000" resonance="0x80000000" /><equalizer bass="0x00000000" treble="0x00000000" bassFrequency="0x00000000" trebleFrequency="0x00000000" /></params>"""
 
 
-def _audio_clip_xml(track_name, file_path, end_sample_pos, length, section, colour=11):
+_AUDIO_DISP = {"bass": "Bass", "other": "Rest", "vocals": "Vocals", "drums": "Drums"}
+
+
+def _audio_clip_xml(track_name, file_path, end_sample_pos, length, section, colour=0,
+                    label=""):
     """Ein <audioClip>: spielt einen Stem-Sample taktgenau ab (Laenge = ganze Takte
     -> Deluge legt ihn aufs Raster, kein Versatz). pitchSpeedIndependent=1 wie im
-    Beispiel; da die WAV exakt 'length' Takte am Songtempo lang ist, wird nicht
-    gestretcht."""
-    return (f'<audioClip trackName="{track_name}" filePath="{file_path}" '
+    Beispiel. colour = kleine Part-VARIATION (Stem-Grundfarbe aus track_name addiert ->
+    z.B. Vocals-Clips roetlich). label -> in den Clip-Namen (z.B. 'Drums 1a')."""
+    co = (_stem_hue(track_name) + int(colour)) % 72
+    stem = track_name[6:] if str(track_name).startswith("AUDIO_") else str(track_name)
+    disp = _AUDIO_DISP.get(_STEM_ALIAS.get(stem, stem), stem)
+    cn = f"{disp} {label}".strip()[:20]
+    return (f'<audioClip clipName="{cn}" trackName="{track_name}" filePath="{file_path}" '
             f'startSamplePos="0" endSamplePos="{int(end_sample_pos)}" '
             f'pitchSpeedIndependent="1" attack="-2147483648" priority="1" '
             f'isPlaying="0" isSoloing="0" isArmedForRecording="0" '
-            f'length="{int(length)}" colourOffset="{colour}" '
+            f'length="{int(length)}" colourOffset="{co}" '
             f'section="{int(section)}">{_AUDIO_PARAMS}</audioClip>')
 
 
-def _audio_track_xml(name, colour=0):
+_STEM_HUE = {"bass": 36, "other": 54, "vocals": 0, "drums": 18}   # Farbrad 0-71 je Stem
+_STEM_ALIAS = {"Bass": "bass", "Rest": "other", "Vocals": "vocals", "Drums": "drums"}
+
+
+def _stem_hue(name):
+    """Grundfarbe (colourOffset 0-71) eines Stems/einer Spur -> Stem-Identitaet (z.B.
+    Vocals roetlich). Nimmt 'bass'/'other'/'vocals'/'drums', die Synth-Namen
+    (Bass/Rest/Vocals/Drums) oder 'AUDIO_<stem>'."""
+    s = str(name)
+    if s.startswith("AUDIO_"):
+        s = s[6:]
+    s = _STEM_ALIAS.get(s, s)
+    return int(_STEM_HUE.get(s, 0))
+
+
+def _part_colour(label):
+    """Kleine Farb-VARIATION (relativ zur Stem-Grundfarbe) je Part: Typ (fuehrende Zahl
+    im Label, z.B. 1 in '1a') + Instanz-Buchstabe geben einen kleinen Versatz -> Strophe
+    vs. Refrain innerhalb der Stem-Farbe leicht unterscheidbar, die Stem-Identitaet
+    bleibt dominant. Rueckgabe 0..~10."""
+    import re
+    m = re.match(r"(\d+)([a-z]*)", str(label).strip())
+    if not m:
+        return 0
+    num = int(m.group(1))
+    li = (ord(m.group(2)[-1]) - ord("a")) if m.group(2) else 0
+    return ((num - 1) * 3 + li) % 12
+
+
+def _audio_track_xml(name, colour=None):
     """<audioTrack>-Instrument zu einem Stem-audioClip. Die Bindung erfolgt ueber
     'name' == audioClip-trackName; ohne diesen Track meldet die Deluge „File
-    corrupted". Kind-Bloecke 1:1 aus dem c1.2.1-Beispiel."""
+    corrupted". Kind-Bloecke 1:1 aus dem c1.2.1-Beispiel. colour = Spur-Grundfarbe
+    (Default: Stem-Farbe, z.B. Vocals roetlich)."""
+    col = _stem_hue(name) if colour is None else int(colour)
     return (f'<audioTrack name="{name}" inputChannel="left" '
             f'outputRecordingIndex="0" isArmedForRecording="0" '
-            f'activeModFunction="0" colour="{int(colour)}" '
+            f'activeModFunction="0" colour="{col}" '
             f'modFXCurrentParam="feedback" currentFilterType="lpf" '
             f'modFXType="none" lpfMode="24dB" hpfMode="HPLadder" '
             f'filterRoute="H2L">{_DELAY}{_SIDECHAIN}{_AUDIOCOMP}</audioTrack>')
@@ -182,7 +230,7 @@ def _audio_track_xml(name, colour=0):
 
 def write_deluge_song(path, bpm, synth_tracks=None, drum_track=None,
                       bars_per_clip=0, audio_clips=None, audio_tracks=None,
-                      force_song_bars=0):
+                      force_song_bars=0, section_ranges=None):
     """Schreibt eine Deluge-Songdatei (.XML).
     synth_tracks: Liste {name, notes=[(start_s,end_s,pitch,vel),...]} -> je eine
                   interne Synth-Spur (ein Clip).
@@ -190,6 +238,9 @@ def write_deluge_song(path, bpm, synth_tracks=None, drum_track=None,
                   (36/38/42 ...) -> ein Kit-Clip.
     bars_per_clip: 0 = ein Clip ueber den ganzen Song; >0 = in N-Takt-Loops
                    zerlegen (mehrere Clips je Spur, Sektionen 0..).
+    section_ranges: optional Liste (lo_tick, hi_tick, length_tick, section) -> je
+                   Bereich MIDI-Clips (Noten relativ zum Bereich); fuer „Parts"
+                   (erkannte Abschnitte variabler Laenge). Hat Vorrang vor bars_per_clip.
     """
     synth_tracks = synth_tracks or []
     tpt, tfrac = _tempo_params(bpm)
@@ -206,7 +257,7 @@ def write_deluge_song(path, bpm, synth_tracks=None, drum_track=None,
             used = [36, 38, 42]
         srcs = "\n".join(_kit_sound_source(*DELUGE_DRUM_MAP[p]) for p in used)
         instr.append(f'<kit presetName="AudioWizard Drums" presetFolder="KITS" '
-                     f'defaultVelocity="64" colour="0" modFXType="none" '
+                     f'defaultVelocity="64" colour="{_stem_hue("drums")}" modFXType="none" '
                      f'lpfMode="24dB" hpfMode="HPLadder" filterRoute="H2L">'
                      f'{_DELAY}{_SIDECHAIN}{_AUDIOCOMP}'
                      f'<soundSources>{srcs}</soundSources>'
@@ -230,30 +281,45 @@ def write_deluge_song(path, bpm, synth_tracks=None, drum_track=None,
         total = max([total] + [p + l for p, l, _pp, _v in tn])
     total = max([total] + [p + l for p, l, _pp, _v in drum_ticked])
 
-    def _clips_for_range(lo, hi, length, section):
+    def _clips_for_range(lo, hi, length, section, colour=0, label=""):
         """Clips fuer alle Spuren im Tick-Bereich [lo, hi); Positionen relativ zu lo.
-        Leere Clips (keine Noten im Bereich) werden weggelassen."""
+        Leere Clips (keine Noten im Bereich) werden weggelassen. Notenlaengen werden auf
+        das Clip-Ende begrenzt -> kein Ueberhang ueber die Loop-Grenze (sauber loopbar).
+        colour: kleine Part-Variation (Stem-Grundfarbe addiert der Encoder). label: in
+        den Clip-Namen (z.B. 'Vocals 1a')."""
         cl = []
+        col = 0 if colour is None else int(colour)
         if drum_track is not None:
             by_slot = {}
             for p, l, pitch, v in drum_ticked:
                 if lo <= p < hi and pitch in slots:
-                    by_slot.setdefault(pitch, []).append((p - lo, l, v))
+                    by_slot.setdefault(pitch, []).append(
+                        (p - lo, max(1, min(l, hi - p)), v))
             if any(by_slot.values()):
-                cl.append(_drum_clip_xml(slots, by_slot, length, section))
+                cl.append(_drum_clip_xml(slots, by_slot, length, section,
+                                         colour=col, label=label))
         for ti, (name, tn) in enumerate(synth_ticked):
             by_pitch = {}
             for p, l, pitch, v in tn:
                 if lo <= p < hi:
-                    by_pitch.setdefault(pitch % 128, []).append((p - lo, l, v))
+                    by_pitch.setdefault(pitch % 128, []).append(
+                        (p - lo, max(1, min(l, hi - p)), v))
             if by_pitch:
-                cl.append(_synth_clip_xml(name, ti, by_pitch, length, section))
+                cl.append(_synth_clip_xml(name, ti, by_pitch, length, section,
+                                          colour=col, label=label))
         return cl
 
     if force_song_bars and int(force_song_bars) > 0:   # feste Songlaenge (Bundle)
         total = max(total, int(force_song_bars) * TICKS_PER_BAR)
     clips = []
-    if bars_per_clip and int(bars_per_clip) > 0:    # Takt-Loops: mehrere Clips/Spur
+    if section_ranges:                              # Parts: erkannte Abschnitte
+        for rng in section_ranges:
+            lo, hi, length, sec = rng[0], rng[1], rng[2], rng[3]
+            col = rng[4] if len(rng) > 4 else 0       # kleine Part-Variation
+            lbl = rng[5] if len(rng) > 5 else ""      # Label (-> Clip-Name)
+            clips += _clips_for_range(int(lo), int(hi), int(length), int(sec),
+                                      colour=col, label=lbl)
+    elif bars_per_clip and int(bars_per_clip) > 0:  # Takt-Loops: mehrere Clips/Spur
         chunk = int(bars_per_clip) * TICKS_PER_BAR
         for c in range(max(1, -(-total // chunk))):
             clips += _clips_for_range(c * chunk, (c + 1) * chunk, chunk, min(c, 11))
@@ -339,7 +405,7 @@ def write_deluge_bundle(xml_path, stems, sr, midi_notes, bpm, t_db,
         audio_tracks.append(tname)               # zugehoeriger <audioTrack>
         audio_clips.append(_audio_clip_xml(
             tname, fpath, total_n, W * TICKS_PER_BAR, section=1,
-            colour=(i * 17) % 72))
+            colour=0))                               # Stem-Grundfarbe
         if log:
             log(f"  Stem ausgerichtet: {os.path.basename(wp)}")
 
@@ -364,4 +430,101 @@ def write_deluge_bundle(xml_path, stems, sr, midi_notes, bpm, t_db,
     if log:
         log(f"Bundle: {len(wavs)} Stems + MIDI, Downbeat bei Takt {lead_bars + 1}, "
             f"Songlaenge {W} Takte.")
+    return xml_path, wavs
+
+
+def _loop_xfade(a, s0, s1, nxf):
+    """Clip a[s0:s1] (auf Laenge s1-s0 gepolstert) mit kurzer Loop-Kreuzblende AM ENDE:
+    die letzten nxf Samples blenden zum Audio direkt VOR s0 -> beim Loopen geht
+    Clip-Ende nahtlos in den Clip-Anfang ueber (kein Klick), der Downbeat am Anfang
+    bleibt unberuehrt. a erwartet (N, ch)."""
+    need = s1 - s0
+    lo, hi = max(0, s0), max(0, min(len(a), s1))
+    seg = a[lo:hi].copy()
+    if len(seg) < need:                                   # ueber den Rand -> auffuellen
+        pad = np.zeros((need - len(seg),) + seg.shape[1:], dtype=np.float32)
+        seg = (np.concatenate([pad, seg], 0) if s0 < 0
+               else np.concatenate([seg, pad], 0))
+    x = int(min(nxf, max(0, need // 4)))
+    if x > 1 and s0 - x >= 0 and s1 <= len(a):
+        pre = a[s0 - x:s0]                                # Audio direkt vor dem Start
+        if len(pre) == x:
+            f = np.linspace(0.0, 1.0, x, dtype=np.float32)
+            f = f.reshape((-1,) + (1,) * (seg.ndim - 1))
+            seg[need - x:] = seg[need - x:] * (1.0 - f) + pre * f
+    return seg
+
+
+def write_deluge_parts(xml_path, warped_stems, sr, midi_notes, bpm, t_db, sections,
+                       instruments=None, sample_subdir="SAMPLES/AudioWizard", log=None):
+    """Deluge-Song aus erkannten Song-ABSCHNITTEN: jeder Abschnitt wird eine Deluge-
+    SECTION (Launch-Spalte). Pro Abschnitt liegt je Stem ein AUDIO-Clip UND – falls
+    Noten vorhanden – ein MIDI-Clip (Synth fuer tonale Stems, Kit fuer Drums), beide
+    aus den GEWARPTEN (rastergenauen) Stems/Noten geschnitten und gleich lang. So
+    lassen sich die Teile auf der Deluge frei arrangieren/launchen.
+    warped_stems/midi_notes erwarten BEREITS gewarpte (rastergenaue) Daten in der
+    gewarpten Zeit; t_db = Downbeat in gewarpter Zeit. Rueckgabe (xml_path, [wav_paths])."""
+    if sf is None:
+        raise RuntimeError("soundfile nicht verfuegbar (pip install soundfile)")
+    sr = int(sr)
+    bpm = float(bpm) if bpm and bpm > 0 else 120.0
+    bar_n = int(round(4.0 * 60.0 / bpm * sr))             # Samples je Takt
+    bar_t = 4.0 * 60.0 / bpm                              # Sekunden je Takt
+    db_n = int(round(float(t_db) * sr))
+    instruments = list(instruments) if instruments else list(warped_stems.keys())
+    audio_stems = [n for n in instruments if warped_stems.get(n) is not None]
+    out_dir = os.path.dirname(xml_path) or "."
+    base = os.path.splitext(os.path.basename(xml_path))[0]
+
+    wavs, audio_clips = [], []
+    audio_tracks = [f"AUDIO_{n}" for n in audio_stems]
+    nxf = int(0.015 * sr)                                 # ~15 ms Loop-Kreuzblende
+    valid = [s for s in sections if int(s["end_bar"]) > int(s["start_bar"])]
+    # kleine Part-Variation je Abschnitt (Stem-Grundfarbe kommt im Encoder dazu)
+    sec_col = [_part_colour(s.get("label", "")) for s in valid]
+    for i, sec in enumerate(valid):
+        s, e = int(sec["start_bar"]), int(sec["end_bar"])
+        lab = sec.get("label", "X")
+        W = e - s                                         # Takte des Abschnitts
+        sect = min(i, 11)                                 # Deluge-Section 0..11
+        s0, s1 = db_n + s * bar_n, db_n + e * bar_n
+        for k, n in enumerate(audio_stems):
+            a = np.asarray(warped_stems[n], dtype=np.float32)
+            if a.ndim == 1:
+                a = a[:, None]
+            seg = _loop_xfade(a, s0, s1, nxf)             # bar-genau + nahtlos loopbar
+            wp = os.path.join(out_dir, f"{base}_{i + 1:02d}_{lab}_{n}.wav")
+            sf.write(wp, seg, sr, subtype="PCM_16")
+            wavs.append(wp)
+            fpath = f"{sample_subdir.rstrip('/')}/{os.path.basename(wp)}"
+            audio_clips.append(_audio_clip_xml(
+                f"AUDIO_{n}", fpath, len(seg), W * TICKS_PER_BAR,
+                section=sect, colour=sec_col[i], label=lab))  # Farbe + Name "Drums 1a"
+
+    # MIDI-Spuren (gewarpte Noten, absolute gewarpte Zeit) + Abschnitts-Bereiche
+    label = {"bass": "Bass", "other": "Rest", "vocals": "Vocals"}
+    synth_tracks, drum_track = [], None
+    for n in instruments:
+        notes = (midi_notes or {}).get(n)
+        if not notes:
+            continue
+        if n == "drums":
+            drum_track = {"notes": list(notes)}
+        else:
+            synth_tracks.append({"name": label.get(n, n), "notes": list(notes)})
+    section_ranges = []
+    for i, sec in enumerate(valid):
+        s, e = int(sec["start_bar"]), int(sec["end_bar"])
+        lo = _sec_to_ticks(float(t_db) + s * bar_t, bpm)
+        hi = _sec_to_ticks(float(t_db) + e * bar_t, bpm)
+        section_ranges.append((lo, hi, (e - s) * TICKS_PER_BAR, min(i, 11),
+                               sec_col[i], sec.get("label", "")))   # Farbe + Clip-Name
+
+    write_deluge_song(xml_path, bpm, synth_tracks=synth_tracks, drum_track=drum_track,
+                      audio_clips=audio_clips, audio_tracks=audio_tracks,
+                      section_ranges=section_ranges)
+    if log:
+        labs = ", ".join(f"{i + 1:02d}{s.get('label', '')}" for i, s in enumerate(valid))
+        log(f"Parts-Song: {len(valid)} Abschnitte ({labs}), {len(wavs)} Audio-Clips + "
+            f"MIDI je Abschnitt. Stem-WAVs nach {sample_subdir} kopieren.")
     return xml_path, wavs

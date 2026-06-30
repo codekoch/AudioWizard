@@ -1182,7 +1182,8 @@ class DisplayApp:
         txt.config(state="disabled")
         self._small_button(win, "Schließen", win.destroy).pack(pady=8)
         log = {"win": win, "txt": txt, "q": queue.Queue(),
-               "bar": bar, "stat": stat, "t_start": time.time(), "prog": None}
+               "bar": bar, "stat": stat, "t_start": time.time(), "prog": None,
+               "t_done": None}              # Endzeit, einmal gesetzt -> Dauer steht still
 
         def _fmt(sec):
             sec = max(0, int(sec))
@@ -1208,12 +1209,15 @@ class DisplayApp:
             # einer Phase sanft weiter (kein erfundener Prozentwert).
             prog = log.get("prog")
             if prog:
-                el = time.time() - log["t_start"]
                 k, tot, name = prog["step"], prog["total"], prog["name"]
                 if k >= tot:
+                    if log.get("t_done") is None:      # Endzeit EINMALIG einfrieren
+                        log["t_done"] = time.time()    # sonst laeuft "Gesamtdauer" weiter
                     bar["value"] = 100
-                    stat.config(text=f"Fertig · Gesamtdauer {_fmt(el)}")
+                    stat.config(text="Fertig · Gesamtdauer "
+                                     f"{_fmt(log['t_done'] - log['t_start'])}")
                 else:
+                    el = time.time() - log["t_start"]
                     tau = 25.0 if name in ("Stems trennen", "Song-Sheet") else 12.0
                     fp = 1.0 - math.exp(-max(0.0, time.time() - prog["tp"]) / tau)
                     bar["value"] = (k + min(0.92, fp)) / tot * 100.0
@@ -1280,20 +1284,11 @@ class DisplayApp:
         self._run_material_queue(jobs)
 
     def _actions_for_piece(self, actions, name, count):
-        """Kopiert die Aktionen fuer EIN Stueck und macht die Ausgabepfade
-        eindeutig, damit sich mehrere Stuecke nicht gegenseitig ueberschreiben.
-        Export-WAVs werden ohnehin mit dem Stueck-Namen (= title) praefigiert;
-        nur der feste Deluge-XML-Pfad muss je Stueck variiert werden. Bei nur
-        einem Stueck bleibt alles unveraendert."""
-        if count <= 1:
-            return actions
-        a = dict(actions)
-        if a.get("deluge"):
-            d = dict(a["deluge"])
-            root, ext = os.path.splitext(d["path"])
-            d["path"] = f"{root}_{name}{ext or '.XML'}"
-            a["deluge"] = d
-        return a
+        """Aktionen fuer EIN Stueck. Export-WAVs werden ohnehin mit dem Stueck-Namen
+        (= title) praefigiert; der Deluge-Speicherpfad wird je Stueck erst im Tuning-
+        Dialog gefragt. Daher sind aktuell keine Pfad-Anpassungen noetig – Platzhalter
+        fuer kuenftige stueck-spezifische Optionen."""
+        return actions
 
     def _run_material_queue(self, jobs):
         """Verarbeitet mehrere Stuecke NACHEINANDER (ein Job = (source, actions,
@@ -1626,48 +1621,195 @@ class DisplayApp:
         return player
 
     def _save_deluge(self, mp, bpm, stems_dict, sr):
-        """Deluge-BUNDLE aus den aktiven MIDI-Spuren UND den Stems: richtet beide mit
-        DEMSELBEN Downbeat aus (auf der Deluge garantiert synchron, Groove-Downbeat
-        auf dem Takt-Raster). Der Downbeat (erster klarer Drum-Einsatz) wird
-        automatisch erkannt und ist per ◀/▶ um Beats nachjustierbar. Schreibt die
-        ausgerichteten Stem-WAVs + die XML. Drums = 808-Kit (Samples auf SD)."""
+        """Aus dem Stem-Player: aktive MIDI-Spuren einsammeln und den Probehoer-/
+        Tuning-Dialog oeffnen."""
         tracks = mp.enabled_tracks()             # [(name, notes, channel)]
         if not tracks:
             messagebox.showinfo("Deluge-Song",
                                 "Keine aktive Spur – bitte Häkchen setzen.")
             return
-        dref = stems_dict.get("drums")
-        try:
-            t_db0 = core.drums_downbeat_sec(dref, sr) if dref is not None else 0.0
-        except Exception:
-            t_db0 = 0.0
-        beat = 60.0 / (bpm if bpm and bpm > 0 else 120.0)
+        midi = {n: list(notes) for n, notes, _c in tracks}
+        self._deluge_tune_dialog(stems_dict, sr, midi, bpm, list(midi.keys()))
+
+    def _deluge_tune_dialog(self, stems_dict, sr, midi, bpm, instruments, lead=2,
+                            title="AudioWizard"):
+        """Deluge-BUNDLE-Tuning: richtet Stems UND MIDI mit DEMSELBEN Downbeat aufs
+        Takt-Raster aus. Der Downbeat wird automatisch (energie-/kick-basiert) erkannt,
+        ist per ◀/▶ um ganze Beats verschiebbar und per „Probehören (mit Click)" vorab
+        mit Metronom anhoerbar (kurzer Original-Ausschnitt). Warp wird gecacht (Bundle
+        und Parts teilen es). „Bundle speichern" schreibt EIN Stueck (Stem-WAVs + XML);
+        „Parts speichern" schneidet je erkanntem Abschnitt x Stem einen bar-langen Clip
+        zum freien Arrangieren. midi: {stem: [(s,e,pitch,vel)]} in ORIGINAL-Zeit (wird
+        beim Warp mitgezogen). Aus Stem-Player UND „Was soll passieren?"-Ablauf."""
         win = tk.Toplevel(self.root)
         win.title("Deluge-Song (Bundle)")
         win.configure(bg=COL_BG)
         win.transient(self.root)
         tk.Label(win, text="Deluge-Song (Stems + MIDI)", font=self.f_h1, bg=COL_BG,
                  fg=COL_FG).pack(pady=(12, 2))
-        active = ", ".join(core.STEM_LABELS.get(n, n) for n, _x, _c in tracks)
+        active = ", ".join(core.STEM_LABELS.get(n, n) for n in instruments)
         tk.Label(win, text=f"Spuren: {active}", font=self.f_tiny, bg=COL_BG,
                  fg=COL_MUTED).pack(pady=(0, 8))
-        dbv = {"t": float(t_db0)}                 # Downbeat-Zeit (nachjustierbar)
+        dbv = {"shift": 0}            # Downbeat-Versatz in ganzen Beats (vom Auto-Downbeat)
+        warp = {"ws": None, "info": None, "mode": None, "key": None}  # gecachtes Warp
+        pv = {"player": None}                     # laufende Vorschau-Wiedergabe
+        vcache = {"lines": None, "done": False}   # Whisper-Gesangstext (Original-Zeit)
+
+        def _db_orig():
+            """Im Probehoeren GEWAEHLTER Downbeat in ORIGINAL-Zeit (Auto + ◀/▶-Versatz)."""
+            t0o, bpmo = _auto_db()
+            bpmo = bpmo if bpmo > 0 else (bpm or 120.0)
+            return max(0.0, t0o + dbv["shift"] * (60.0 / bpmo))
+
+        def _ensure_warp(g):
+            """Warp fuer Modus g (gecacht; Vorschau und Export teilen es). Die Bar-Phase
+            wird an den GEWAEHLTEN Downbeat gekoppelt, damit Parts exakt auf der 1
+            starten – Cache daher nach (Modus, Downbeat)."""
+            dbo = _db_orig()
+            key = (g, round(dbo, 3))
+            if warp["key"] == key and warp["ws"] is not None:
+                return warp["ws"], warp["info"]
+            if g == "off":
+                ws, info = stems_dict, None
+            else:
+                ws, info = core.warp_stems_to_grid(stems_dict, sr, per=g, db_orig=dbo)
+            warp.update(ws=ws, info=info, mode=g, key=key)
+            return ws, info
+
+        gridc = {"val": None, "done": False}      # gecachte Beat-Karte (beats/bpm/phase)
+
+        def _grid_cache():
+            """Echte Beat-Karte (Beats + Tempo + Kick-Phase) – einmalig gecacht. Basis
+            fuer Auto-Downbeat UND den driftfreien Vorschau-Klick (auf echten Beats)."""
+            if not gridc["done"]:
+                try:
+                    gridc["val"] = core.beat_grid(stems_dict, sr)
+                except Exception:
+                    gridc["val"] = None
+                gridc["done"] = True
+            return gridc["val"]
+
+        def _auto_db():
+            """Auto-Downbeat (Original-Zeit in s) + Tempo – Kick-basiert, OHNE Warp."""
+            g = _grid_cache()
+            if not g:
+                return (0.0, bpm or 120.0)
+            beats = g["beats"]
+            return (float(beats[min(g["phase"], len(beats) - 1)]), g["bpm"])
+
+        def _downbeat(info):
+            """Downbeat-Zeit. Basis = GENAU der im Probehören eingestellte Punkt
+            (Auto-Downbeat + dbv['shift'] in ORIGINAL-Zeit). Bei info!=None wird dieser
+            Punkt in die GEWARPTE Zeit gezogen und aufs Raster gesnappt – so landet im
+            Export exakt der gehörte Downbeat (nicht der separate Warp-Downbeat
+            info['t_db'], der eine andere Zählzeit treffen könnte)."""
+            t0o, bpmo = _auto_db()
+            spb = 60.0 / (bpmo if bpmo > 0 else (bpm or 120.0))
+            t_orig = max(0.0, t0o + dbv["shift"] * spb)   # im Probehören gehört
+            if info is None:
+                return t_orig
+            wt = float(np.interp(t_orig, info["map_src"], info["map_tgt"]))
+            spbw = 60.0 / float(info["bpm"])
+            ref = float(info.get("t_db", wt))
+            return ref + round((wt - ref) / spbw) * spbw   # auf Raster snappen
+
+        def _stop_preview(*_a):
+            if pv["player"] is not None:
+                try:
+                    pv["player"].stop()
+                except Exception:
+                    pass
+                if pv["player"] in self._stem_players:
+                    try:
+                        self._stem_players.remove(pv["player"])
+                    except ValueError:
+                        pass
+                pv["player"] = None
+
+        def _preview():
+            """LEICHTE Vorschau: KEIN Phase-Vocoder-Warp (der friert schwache Rechner
+            ein!), sondern ein kurzer Ausschnitt (~24 s) der ORIGINAL-Stems + Klick auf
+            den ECHTEN erkannten Beats (driftet NICHT gegen die Musik) – nur zum Hoeren,
+            ob der laute Akzent auf der musikalischen 1 sitzt. ◀/▶ verschiebt die
+            Akzent-Phase. Das Aufs-Raster-Ziehen passiert erst beim Speichern."""
+            status.config(text="bereite Vorschau-Ausschnitt vor …")
+
+            def _bg():
+                try:
+                    g = _grid_cache()
+                    bpmo = (g["bpm"] if g else (bpm or 120.0)) or (bpm or 120.0)
+                    spb = 60.0 / bpmo
+                    win_s = 24.0
+                    if g:
+                        beats = g["beats"]
+                        anchor = g["phase"] + int(dbv["shift"])   # gewaehlte "1"-Phase
+                        cand = [k for k in range(len(beats)) if (k - anchor) % 4 == 0]
+                        a0 = cand[0] if cand else max(0, anchor)
+                        t0 = float(beats[min(a0, len(beats) - 1)])
+                    else:                                     # Fallback: konstantes Raster
+                        t0o, _ = _auto_db()
+                        t0 = max(0.0, t0o + dbv["shift"] * spb)
+                    start = max(0.0, t0 - 1.5 * 4 * spb)      # ~1,5 Takte Vorlauf
+                    names = [n for n in stems_dict if stems_dict[n] is not None]
+                    i0, i1 = int(start * sr), int((start + win_s) * sr)
+                    L = max(1, i1 - i0)
+                    mix = np.zeros(L, dtype=np.float32)
+                    for n in names:
+                        a = np.asarray(stems_dict[n], dtype=np.float32)
+                        if a.ndim == 2:
+                            a = a.mean(axis=1)
+                        seg = a[i0:i1]
+                        mix[:len(seg)] += seg
+                    peak = float(np.percentile(np.abs(mix), 99.5)) or 1.0
+                    mix *= min(1.0, 0.7 / peak)
+                    if g:                                     # Klick auf ECHTEN Beats
+                        beats = g["beats"]
+                        sel = [(float(beats[k]) - start, (k - anchor) % 4 == 0)
+                               for k in range(len(beats))
+                               if start <= beats[k] < start + win_s]
+                        click = core.click_from_beats([t for t, _ in sel],
+                                                      [acc for _, acc in sel], win_s, sr)
+                    else:
+                        click = core.metronome_click(t0 - start, spb, win_s, sr)
+                    m = min(len(mix), len(click))
+                    mix[:m] += click[:m]
+
+                    def _start():
+                        _stop_preview()
+                        try:
+                            pl = core.StemPlayer([mix], sr, names=["Vorschau"])
+                            pl.start_stream()
+                            pl.play()
+                            pv["player"] = pl
+                            self._stem_players.append(pl)
+                            status.config(text="Vorschau-Ausschnitt läuft – ◀/▶ schiebt "
+                                          "den Downbeat; sitzt der LAUTE Click auf der 1?")
+                        except Exception as ex:
+                            status.config(text=f"Vorschau-Wiedergabe: {ex}")
+                    self.root.after(0, _start)
+                except Exception as ex:
+                    self.root.after(0, lambda e=ex:
+                                    status.config(text=f"Vorschau-Fehler: {e}"))
+            threading.Thread(target=_bg, daemon=True).start()
+
         dbr = tk.Frame(win, bg=COL_BG)
         dbr.pack(padx=20, pady=2, anchor="w")
-        tk.Label(dbr, text="Downbeat:", font=self.f_tiny, bg=COL_BG,
+        tk.Label(dbr, text="Downbeat-Versatz:", font=self.f_tiny, bg=COL_BG,
                  fg=COL_ACCENT).pack(side="left", padx=(0, 6))
-        dblbl = tk.Label(dbr, text=f"{dbv['t']:.3f} s", font=self.f_small, bg=COL_BG,
-                         fg=COL_FG, width=9)
+        dblbl = tk.Label(dbr, text=f"{dbv['shift']:+d} Beats", font=self.f_small,
+                         bg=COL_BG, fg=COL_FG, width=9)
 
         def _nudge(d):
-            dbv["t"] = max(0.0, dbv["t"] + d * beat)
-            dblbl.config(text=f"{dbv['t']:.3f} s")
+            dbv["shift"] += d
+            dblbl.config(text=f"{dbv['shift']:+d} Beats")
+            if pv["player"] is not None:          # laeuft Vorschau -> neu ausrichten
+                _preview()
         self._small_button(dbr, "◀ Beat", lambda: _nudge(-1)).pack(side="left")
         dblbl.pack(side="left", padx=4)
         self._small_button(dbr, "Beat ▶", lambda: _nudge(+1)).pack(side="left")
         lr = tk.Frame(win, bg=COL_BG)
         lr.pack(padx=20, pady=(4, 0), anchor="w")
-        leadv = tk.StringVar(value="2")
+        leadv = tk.StringVar(value=str(int(lead)))
         tk.Label(lr, text="Vorlauf:", font=self.f_tiny, bg=COL_BG,
                  fg=COL_ACCENT).pack(side="left", padx=(0, 6))
         tk.Entry(lr, textvariable=leadv, width=3, font=self.f_small, bg=COL_SURFACE,
@@ -1683,14 +1825,20 @@ class DisplayApp:
             _gl0 = "bar1"
         gridv = tk.StringVar(value=_gl0 if _gl0 in
                              ("off", "bar1", "groove", "beat") else "off")
+
+        def _grid_changed():
+            warp.update(ws=None, info=None, mode=None, key=None)  # Modus gewechselt -> Cache weg
+            if pv["player"] is not None:
+                _preview()
         tk.Label(gr, text="Taktraster:", font=self.f_tiny, bg=COL_BG,
                  fg=COL_ACCENT).pack(side="left", padx=(0, 6))
         for val, lbl in (("off", "Aus"), ("bar1", "Takt auf Eins"),
                          ("groove", "Groove"), ("beat", "Pro Beat")):
-            tk.Radiobutton(gr, text=lbl, variable=gridv, value=val, font=self.f_small,
-                           bg=COL_BG, fg=COL_FG, selectcolor=COL_SURFACE,
-                           activebackground=COL_BG, activeforeground=COL_FG, bd=0,
-                           highlightthickness=0).pack(side="left", padx=(0, 4))
+            tk.Radiobutton(gr, text=lbl, variable=gridv, value=val,
+                           command=_grid_changed, font=self.f_small, bg=COL_BG,
+                           fg=COL_FG, selectcolor=COL_SURFACE, activebackground=COL_BG,
+                           activeforeground=COL_FG, bd=0, highlightthickness=0).pack(
+                               side="left", padx=(0, 4))
         tk.Label(win, text="Gegen Driften (alle halten den Click synchron): „Takt auf "
                  "Eins“ legt je Takt die 1 aufs Raster, Groove voll erhalten; „Groove“ "
                  "zieht 2–4 zusätzlich halb Richtung Raster (straffer, Feeling bleibt, "
@@ -1698,18 +1846,34 @@ class DisplayApp:
                  "tonhöhen-erhaltend (Drums evtl. weicher). „Aus“ = Original.",
                  font=self.f_tiny, bg=COL_BG, fg=COL_MUTED, justify="left",
                  wraplength=440).pack(padx=20, anchor="w", pady=(2, 0))
-        status = tk.Label(win, text="", font=self.f_tiny, bg=COL_BG, fg=COL_MUTED,
-                          wraplength=440, justify="left")
+        # Parts: Strophe/Refrain zusaetzlich per Gesangstext trennen (Whisper)
+        txtv = tk.BooleanVar(value=core.whisper_available())
+        if core.whisper_available():
+            tr = tk.Frame(win, bg=COL_BG)
+            tr.pack(padx=20, pady=(4, 0), anchor="w")
+            tk.Checkbutton(tr, text="Parts: Strophe/Refrain per Gesangstext trennen "
+                           "(genauer, aber langsamer)", variable=txtv,
+                           font=self.f_small, bg=COL_BG, fg=COL_FG,
+                           selectcolor=COL_SURFACE, activebackground=COL_BG,
+                           activeforeground=COL_FG, bd=0, highlightthickness=0).pack(
+                               side="left")
+        status = tk.Label(win, text="Tipp: „Probehören“ spielt Stems + Metronom; den "
+                          "Downbeat per ◀/▶ so schieben, dass der laute Click auf der 1 "
+                          "sitzt – dann speichern.", font=self.f_tiny, bg=COL_BG,
+                          fg=COL_MUTED, wraplength=440, justify="left")
         status.pack(pady=(8, 2))
+        pvr = tk.Frame(win, bg=COL_BG)
+        pvr.pack(pady=(2, 2))
+        self._small_button(pvr, "▶ Probehören (mit Click)", _preview).pack(
+            side="left", padx=4)
+        self._small_button(pvr, "■ Stop", _stop_preview).pack(side="left", padx=4)
 
         def _do():
-            midi = {n: list(notes) for n, notes, _c in tracks}
-            instruments = list(midi.keys())
-            gmode = gridv.get()                       # off/beat/bar
             try:
                 lead = max(0, int(float(leadv.get().replace(",", "."))))
             except ValueError:
                 lead = 2
+            g = gridv.get()
             cfg = load_config()
             p = filedialog.asksaveasfilename(
                 title="Deluge-Bundle speichern (.XML; Stems daneben)",
@@ -1718,34 +1882,26 @@ class DisplayApp:
                 filetypes=[("Deluge-Song", "*.XML"), ("Alle", "*.*")])
             if not p:
                 return
+            _stop_preview()
             status.config(text="schreibe Bundle …")
 
             def _work():
                 try:
-                    wstems, wmidi = stems_dict, midi
-                    wbpm, wt_db = bpm or 120.0, dbv["t"]
-                    if gmode != "off":                 # Variante B: auf Raster ziehen
-                        self.root.after(0, lambda: status.config(
-                            text=f"ziehe Stems auf Taktraster ({gmode}) …"))
-                        wstems, ginfo = core.warp_stems_to_grid(
-                            stems_dict, sr, per=gmode)
-                        if ginfo is not None:
-                            wbpm = float(ginfo["bpm"])
-                            wmidi = {n: core.warp_notes(list(nt), ginfo)
-                                     for n, nt in midi.items()}
-                            # vom User gesetzten Downbeat in die gewarpte Zeit ziehen
-                            wt_db = float(np.interp(dbv["t"], ginfo["map_src"],
-                                                    ginfo["map_tgt"]))
-                            self.root.after(0, lambda: status.config(
-                                text="Raster fertig – schreibe Bundle …"))
+                    # gecachtes Warp aus der Vorschau wiederverwenden (kein Neu-Rechnen) –
+                    # exakt das, was eben zu hoeren war.
+                    ws, info = _ensure_warp(g)
+                    wbpm = float(info["bpm"]) if info else (bpm or 120.0)
+                    wmidi = ({n: core.warp_notes(list(nt), info)
+                              for n, nt in midi.items()} if info else midi)
+                    wt_db = _downbeat(info)
                     xmlp, wavs = deluge.write_deluge_bundle(
-                        p, wstems, sr, wmidi, wbpm, wt_db,
+                        p, ws, sr, wmidi, wbpm, wt_db,
                         lead_bars=lead, instruments=instruments)
                     save_config({**load_config(),
                                  "last_save_dir": os.path.dirname(p),
-                                 "deluge_gridlock": gmode})
-                    vtxt = (f"Taktraster {gmode} ({wbpm:.1f} BPM)"
-                            if gmode != "off" else "Original-Audio")
+                                 "deluge_gridlock": g})
+                    vtxt = (f"Taktraster {g} ({wbpm:.1f} BPM)"
+                            if g != "off" else "Original-Audio")
                     msg = (f"Gespeichert: {os.path.basename(xmlp)} + {len(wavs)} "
                            f"Stems ({vtxt}). XML → SONGS/, Stem-WAVs → "
                            "SAMPLES/AudioWizard/ auf der SD-Karte.")
@@ -1754,8 +1910,99 @@ class DisplayApp:
                     self.root.after(0, lambda e=ex: status.config(text=f"Fehler: {e}"))
             threading.Thread(target=_work, daemon=True).start()
 
-        self._small_button(win, "Bundle speichern…", _do).pack(pady=(2, 2))
-        self._small_button(win, "Schließen", win.destroy).pack(pady=(0, 10))
+        def _do_parts():
+            """Erkannte Abschnitte als DELUGE-SONG: jeder Abschnitt eine Deluge-Section
+            (Launch-Spalte), darin je Stem ein Audio-Clip UND der passende MIDI-Clip –
+            alles rastergenau, frei arrangierbar. Schreibt die XML + die Abschnitts-WAVs
+            daneben."""
+            g = gridv.get()
+            cfg = load_config()
+            p = filedialog.asksaveasfilename(
+                title="Parts-Deluge-Song speichern (.XML; Abschnitts-WAVs daneben)",
+                defaultextension=".XML",
+                initialfile=core.sanitize_filename(title or "AudioWizard") + "_Parts.XML",
+                initialdir=cfg.get("last_save_dir") or "",
+                filetypes=[("Deluge-Song", "*.XML"), ("Alle", "*.*")])
+            if not p:
+                return
+            _stop_preview()
+            status.config(text="erkenne Abschnitte & ziehe aufs Raster … (kann dauern)")
+
+            use_text = bool(txtv.get())
+
+            def _work():
+                try:
+                    t0o, bpmo = _auto_db()
+                    bpmo = bpmo if bpmo > 0 else (bpm or 120.0)
+                    # Parts brauchen ein Taktraster (sonst driften/loopen sie nicht). Bei
+                    # „Aus“ daher intern Groove verwenden, damit die 1 sauber sitzt.
+                    gp = "groove" if g == "off" else g
+                    ws, info = _ensure_warp(gp)
+                    wbpm = float(info["bpm"]) if info else bpmo
+                    # Downbeat = der GEWARPTE gewaehlte Downbeat (echter Bar-Anker, da der
+                    # Warp die Bar-Phase an genau diesen Punkt koppelt) -> Part startet
+                    # exakt auf der 1.
+                    wt_db = float(info["t_db"]) if info else _db_orig()
+                    # Optional: Gesangstext (Strophe/Refrain). Einmal auf ORIGINAL-Vocals,
+                    # dann auf die gewarpte Zeit ziehen (gleiche Zeitbasis wie Erkennung).
+                    vlines = None
+                    if (use_text and core.whisper_available()
+                            and stems_dict.get("vocals") is not None):
+                        if not vcache["done"]:
+                            self.root.after(0, lambda: status.config(
+                                text="transkribiere Gesang für Strophe/Refrain … (dauert)"))
+                            try:
+                                vcache["lines"] = core.transcribe_segments(
+                                    stems_dict["vocals"], sr, size="small")
+                            except Exception:
+                                vcache["lines"] = None
+                            vcache["done"] = True
+                        if vcache["lines"]:
+                            vlines = (core.warp_lines(vcache["lines"], info)
+                                      if info else vcache["lines"])
+                    self.root.after(0, lambda: status.config(
+                        text="erkenne Abschnitte (rastergenau) …"))
+                    # Abschnitte auf den GEWARPTEN Stems (konstantes Tempo) -> Grenzen
+                    # liegen auf echten Taktlinien, Schnitt trifft die 1.
+                    det_stems = ws if info else stems_dict
+                    secs = core.detect_sections(det_stems, sr, t_db=wt_db, bpm=wbpm,
+                                                target_bars=8, vocal_lines=vlines)
+                    if not secs:
+                        self.root.after(0, lambda: status.config(
+                            text="Keine Abschnitte erkannt – Stück evtl. zu kurz."))
+                        return
+                    # MIDI wie das Audio aufs Raster ziehen (sonst passt es nicht)
+                    wmidi = ({n: core.warp_notes(list(nt), info)
+                              for n, nt in midi.items()} if info else midi)
+                    xmlp, wavs = deluge.write_deluge_parts(
+                        p, ws, sr, wmidi, wbpm, wt_db, secs,
+                        instruments=instruments, log=lambda m: None)
+                    save_config({**load_config(),
+                                 "last_save_dir": os.path.dirname(p),
+                                 "deluge_gridlock": g})
+                    labels = ", ".join(dict.fromkeys(s["label"] for s in secs))
+                    gtxt = (" (Raster: Groove, da „Aus“ für Parts nicht loopbar)"
+                            if g == "off" else "")
+                    msg = (f"Parts-Song: {os.path.basename(xmlp)} – {len(secs)} "
+                           f"Abschnitte ({labels}), {len(wavs)} Audio-Clips + MIDI{gtxt}. "
+                           "XML → SONGS/, Abschnitts-WAVs → SAMPLES/AudioWizard/ auf die SD.")
+                    self.root.after(0, lambda: status.config(text=msg))
+                except Exception as ex:
+                    self.root.after(0, lambda e=ex: status.config(text=f"Fehler: {e}"))
+            threading.Thread(target=_work, daemon=True).start()
+
+        bsr = tk.Frame(win, bg=COL_BG)
+        bsr.pack(pady=(2, 2))
+        self._small_button(bsr, "Bundle speichern… (1 Stück)", _do).pack(
+            side="left", padx=4)
+        self._small_button(bsr, "Parts speichern… (Abschnitte)", _do_parts).pack(
+            side="left", padx=4)
+
+        def _close():
+            _stop_preview()
+            win.destroy()
+        self._small_button(win, "Schließen", _close).pack(pady=(0, 10))
+        win.protocol("WM_DELETE_WINDOW", _close)
         win._a2m_deluge = (dblbl, leadv, gridv)   # Tk-Variablen vor GC schuetzen
 
     def _save_stems_dialog(self, parent_win, stems_dict, sr, bpm=0.0):
@@ -2993,7 +3240,9 @@ class DisplayApp:
                                side="left", padx=(0, 4))
         tk.Label(delf, text="Bundle: ausgerichtete Stems (WAV) + MIDI, gemeinsamer "
                  "Downbeat auf Takt-1-Raster. Tonale Spuren brauchen basic-pitch; "
-                 "Drums = 808-Kit. WAVs danach in SAMPLES/AudioWizard/ auf die SD.\n"
+                 "Drums = 808-Kit. Nach der Trennung öffnet sich ein Probehör-/Tuning-"
+                 "Fenster (Stems + Metronom hören, Downbeat per ◀/▶ setzen, dann "
+                 "speichern); WAVs danach in SAMPLES/AudioWizard/ auf die SD.\n"
                  "Taktraster gegen Driften (alle halten den Click synchron, dehnen "
                  "das Audio tonhöhen-erhaltend; Drums evtl. etwas weicher): „Takt auf "
                  "Eins“ legt je Takt die 1 aufs Raster, Groove dazwischen voll erhalten "
@@ -3064,20 +3313,14 @@ class DisplayApp:
                                if dl_instr[n].get()]
                 if not instruments:
                     return                   # kein Instrument gewaehlt
-                dlp = filedialog.asksaveasfilename(
-                    title="Deluge-Song speichern", defaultextension=".XML",
-                    initialfile="AudioWizard.XML",
-                    initialdir=cfg.get("last_save_dir") or "",
-                    filetypes=[("Deluge-Song", "*.XML"), ("Alle", "*.*")])
-                if not dlp:
-                    return
                 try:
                     dlead = max(0, int(float(dl_bars.get().replace(",", "."))))
                 except ValueError:
                     dlead = 2
-                gmode = dl_grid.get()                 # off/beat/bar
-                deluge_cfg = {"path": dlp, "lead": dlead, "instruments": instruments,
-                              "gridlock": None if gmode == "off" else gmode}
+                # KEINE Pfad-Abfrage hier: nach der Trennung oeffnet sich der Probehoer-/
+                # Tuning-Dialog, der das Taktraster (cfg) + den Downbeat per Ohr setzt
+                # und beim Speichern den Pfad fragt.
+                deluge_cfg = {"lead": dlead, "instruments": instruments}
             lang = next(v for lbl, v in lang_map if lbl == lvar.get())
             model = next(v for lbl, v in model_map if lbl == mvar.get())
             qual = next(v for lbl, v in qual_map if lbl == qvar.get())
@@ -3086,8 +3329,6 @@ class DisplayApp:
                        "deluge_gridlock": dl_grid.get()}
             if out_dir:
                 new_cfg["last_save_dir"] = out_dir
-            elif deluge_cfg:
-                new_cfg["last_save_dir"] = os.path.dirname(deluge_cfg["path"])
             save_config(new_cfg)
             # "Automatisch": hohe Trennqualitaet, wenn die Stems als Audio/MIDI
             # genutzt werden (Export/Abspielen/Stems-MIDI) -- sonst schnell.
@@ -3258,85 +3499,49 @@ class DisplayApp:
                         self._stem_log(log, f"Schlagzeug→MIDI übersprungen: {ex}")
                 step += 1                          # Stems→MIDI fertig
             if actions.get("deluge"):
-                # Fortschritt VOR der Arbeit melden (Warp+Bundle koennen dauern); der
-                # Schritt wird erst NACH dem Schreiben hochgezaehlt, sonst zeigt der
-                # Balken „Fertig", bevor das Bundle wirklich geschrieben ist.
                 self._stem_progress(log, step, total, "Deluge-Song")
-                self._stem_log(log, "== Deluge-Song erstellen ==")
+                self._stem_log(log, "== Deluge-Song vorbereiten ==")
                 dcfg = actions["deluge"]
-                gl = dcfg.get("gridlock")             # None | "bar1" | "groove" | "beat"
-                # Variante B: Stems VORHER auf ein konstantes Takt-Raster ziehen,
-                # damit der Deluge-Clip nicht wegdriftet. dstems/ginfo: bei Erfolg die
-                # gewarpten Stems + Zeit-Abbildung, sonst die unveraenderten (Var. A).
-                dstems, ginfo = stems, None
-                if gl:                                # off -> gl is None
-                    self._stem_log(log, f"== Auf Takt-Raster ziehen (Variante B, "
-                                   f"{gl}) ==")
+                dbpm = float((out.get("sheet") or {}).get("bpm", 0.0))
+                if dbpm <= 0:
                     try:
-                        dstems, ginfo = core.warp_stems_to_grid(
-                            stems, ssr, per=gl, log=cb)
-                    except Exception as ex:
-                        self._stem_log(log, f"Raster-Warp fehlgeschlagen – nutze "
-                                       f"Original-Audio: {ex}")
-                        dstems, ginfo = stems, None
-                # Tempo: bei Raster-Bindung das KONSTANTE Zieltempo, sonst messen.
-                if ginfo is not None:
-                    dbpm = float(ginfo["bpm"])
-                else:
-                    dbpm = float((out.get("sheet") or {}).get("bpm", 0.0))
-                    if dbpm <= 0:
-                        try:
-                            ts = dstems.get("drums")
-                            if ts is None:
-                                ts = core.accompaniment_from_stems(dstems)
-                            ts = ts.mean(axis=1) if getattr(ts, "ndim", 1) == 2 else ts
-                            dbpm = float(core.estimate_tempo(ts, ssr) or 0.0)
-                        except Exception:
-                            dbpm = 0.0
-                # MIDI: bei Raster-Bindung FRISCH aus den gewarpten Stems (die aus den
-                # Original-Stems wiederverwendete MIDI passt sonst nicht zum Audio).
-                midi = {} if ginfo is not None else (out.get("midi_notes") or {})
+                        ts = stems.get("drums")
+                        if ts is None:
+                            ts = core.accompaniment_from_stems(stems)
+                        ts = ts.mean(axis=1) if getattr(ts, "ndim", 1) == 2 else ts
+                        dbpm = float(core.estimate_tempo(ts, ssr) or 0.0)
+                    except Exception:
+                        dbpm = 0.0
+                # MIDI je gewaehltem Instrument aus den (Original-)Stems. Das Aufs-
+                # Raster-Ziehen UND die Downbeat-Feinjustage passieren INTERAKTIV im
+                # Probehoer-/Tuning-Dialog, der sich nach der Trennung oeffnet.
+                midi = out.get("midi_notes") or {}
                 min_ms = float(load_config().get("bass_min_ms", 130))
-                for nm in dcfg["instruments"]:        # MIDI je gewaehltem Instrument
-                    if midi.get(nm) is not None or dstems.get(nm) is None:
+                for nm in dcfg["instruments"]:
+                    if midi.get(nm) is not None or stems.get(nm) is None:
                         continue
                     try:
                         if nm == "drums":
                             dmap, dsens = self._drum_settings()
                             midi[nm] = core.drums_to_midi_notes(
-                                dstems["drums"], ssr, mapping=dmap,
+                                stems["drums"], ssr, mapping=dmap,
                                 sensitivity=dsens, log=cb)
                         else:
                             lo, hi = core.STEM_MIDI_RANGE.get(nm, (40.0, 2000.0))
                             midi[nm] = core.stem_to_midi_notes(
-                                dstems[nm], ssr, min_freq=lo, max_freq=hi,
+                                stems[nm], ssr, min_freq=lo, max_freq=hi,
                                 min_note_ms=min_ms,
                                 label=core.STEM_LABELS.get(nm, nm), log=cb)
                     except Exception as ex:
                         self._stem_log(log, f"{nm}→MIDI übersprungen: {ex}")
-                if ginfo is None:                     # nur bei Original-Audio teilen
-                    out["midi_notes"] = midi
-                # Downbeat (erster klarer Drum-Einsatz) -> gemeinsame Ausrichtung
-                try:
-                    dref = dstems.get("drums")
-                    t_db = (core.drums_downbeat_sec(dref, ssr)
-                            if dref is not None else 0.0)
-                except Exception:
-                    t_db = 0.0
-                lead = int(dcfg.get("lead", 2))
-                try:
-                    p2, wavs = deluge.write_deluge_bundle(
-                        dcfg["path"], dstems, ssr, midi, dbpm or 120.0, t_db,
-                        lead_bars=lead, instruments=dcfg["instruments"], log=cb)
-                    out["deluge_path"] = p2
-                    vtxt = (f"auf Takt-Raster gezogen ({gl}, {dbpm:.1f} BPM)"
-                            if ginfo is not None else "Original-Audio")
-                    self._stem_log(log, f"Deluge-Bundle: {os.path.basename(p2)} + "
-                                   f"{len(wavs)} Stems – {vtxt}, Downbeat auf Takt "
-                                   f"{lead + 1}, Stems in SAMPLES/AudioWizard/ kopieren.")
-                except Exception as ex:
-                    self._stem_log(log, f"Deluge-Bundle fehlgeschlagen: {ex}")
-                step += 1                          # Deluge-Bundle fertig
+                out["midi_notes"] = midi
+                out["deluge_tune"] = {
+                    "stems": stems, "sr": ssr,
+                    "midi": {n: midi[n] for n in dcfg["instruments"] if midi.get(n)},
+                    "bpm": dbpm, "instruments": list(dcfg["instruments"]),
+                    "lead": int(dcfg.get("lead", 2)), "title": title}
+                self._stem_log(log, "Bereit – das Probehör-/Tuning-Fenster öffnet sich.")
+                step += 1                          # Deluge-Vorbereitung fertig
             # Stem-Player oeffnen, wenn Abspielen ODER Stems-MIDI gewaehlt ist
             # (die MIDI-Spuren laufen synchron zur Stem-Position mit).
             if actions["play"] or actions.get("stemmidi"):
@@ -3802,9 +4007,15 @@ class DisplayApp:
                 if out.get("sheet"):
                     self._open_sheet_window(out["sheet"], player=player)
                     msgs.append("Song-Sheet erstellt")
-                if out.get("deluge_path"):
-                    msgs.append("Deluge-Song: "
-                                + os.path.basename(out["deluge_path"]))
+                # Deluge: nach der Trennung den Probehör-/Tuning-Dialog oeffnen
+                # (Stems + Click probehoeren, Downbeat per ◀/▶ setzen, dann speichern).
+                dt = out.get("deluge_tune")
+                if dt:
+                    msgs.append("Deluge-Tuning offen")
+                    self._deluge_tune_dialog(dt["stems"], dt["sr"], dt["midi"],
+                                             dt["bpm"], dt["instruments"],
+                                             lead=int(dt.get("lead", 2)),
+                                             title=dt.get("title", "AudioWizard"))
                 if msgs:
                     self.err_label.config(text="Fertig: " + ", ".join(msgs))
                 # MIDI-Clock (nur Datei) erst jetzt starten, nach der Verarbeitung

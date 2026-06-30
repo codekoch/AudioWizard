@@ -3252,6 +3252,363 @@ GROOVE_STRENGTH = 0.5    # 'groove'-Modus: Anteil, mit dem die Beats 2-4 Richtun
                          # 1 = wie 'beat' starr). 0.5 = straffer, aber lebendig.
 
 
+def _kick_phase(ref, beats, sr):
+    """Welche der 4 Zaehlzeiten traegt die meiste KICK-Energie (Tiefbass-Onset, 30-160
+    Hz)? Liefert die musikalische 1 ZUVERLAESSIGER als breitbandige Onsets, die oft die
+    Snare auf 2/4 bevorzugen. Summiert ueber ALLE Takte -> globale Downbeat-Phase.
+    ref = Drums (oder Mix) mono/stereo. Rueckgabe (phase 0-3, konfidenz, scores)."""
+    import librosa
+    y = np.asarray(ref, dtype=np.float32)
+    if y.ndim == 2:
+        y = y.mean(axis=1)
+    b = np.asarray(beats, dtype=np.float64)
+    if y.size == 0 or len(b) < 2:
+        return 0, 1.0, np.ones(4)
+    n_fft, hop = 2048, 512
+    try:
+        S = np.abs(librosa.stft(np.ascontiguousarray(y), n_fft=n_fft, hop_length=hop))
+        freqs = librosa.fft_frequencies(sr=int(sr), n_fft=n_fft)
+        band = (freqs >= 30.0) & (freqs <= 160.0)        # Kick-Band
+        e = S[band].sum(axis=0) if band.any() else S.sum(axis=0)
+        flux = np.maximum(0.0, np.diff(e, prepend=e[:1]))  # positive Aenderung = Onset
+    except Exception:
+        return 0, 1.0, np.ones(4)
+    fr = int(sr) / float(hop)
+    bidx = np.clip(np.round(b * fr).astype(int), 0, len(flux) - 1)
+    bs = flux[bidx]
+    scores = np.array([float(bs[p::4].sum()) for p in range(4)], dtype=np.float64)
+    ph = int(np.argmax(scores))
+    conf = float(scores[ph] / (scores.mean() + 1e-9))     # 1.0 = keine Praeferenz
+    return (ph if ph < len(b) else 0), conf, scores
+
+
+def beat_grid(stems, sr, log=None):
+    """ECHTE Beat-Karte (raw, evtl. driftend) + Tempo + Kick-Phase – die gemeinsame
+    Basis fuer Auto-Downbeat UND die Vorschau (Klick auf echten Beats). Rueckgabe dict
+    {beats (s), bpm, phase (0-3, Kick), conf} oder None. Kein Phase-Vocoder => leicht."""
+    import librosa
+    sr = int(sr)
+    sel = [n for n in stems if stems[n] is not None]
+    if not sel:
+        return None
+    maxn = max(len(np.asarray(stems[n])) for n in sel)
+    mix = np.zeros(maxn, dtype=np.float32)
+    for n in sel:
+        a = np.asarray(stems[n], dtype=np.float32)
+        if a.ndim == 2:
+            a = a.mean(axis=1)
+        mix[:len(a)] += a
+    try:
+        y_an = (librosa.resample(mix, orig_sr=sr, target_sr=ANALYSIS_SR)
+                if sr != ANALYSIS_SR else mix)
+        bm = analyze_file_beatmap(y_an, ANALYSIS_SR, raw_beats=True)
+    except Exception:
+        return None
+    if not bm or len(np.asarray(bm.get("beats", []))) < 2:
+        return None
+    beats = np.asarray(bm["beats"], dtype=np.float64)
+    ref = stems.get("drums")
+    ph, conf, _ = _kick_phase(mix if ref is None else ref, beats, sr)
+    return {"beats": beats, "bpm": float(bm["bpm"]), "phase": int(ph),
+            "conf": float(conf)}
+
+
+def detect_downbeat(stems, sr, log=None):
+    """Auto-Downbeat (musikalische 1) in ORIGINAL-Zeit + Tempo OHNE Audio zu warpen –
+    fuer die leichte Vorschau (kein Phase-Vocoder => kein Einfrieren schwacher Rechner).
+    Beat-Karte (raw) + Kick-Phase. Rueckgabe (t_db_sec, bpm) oder (0.0, 0.0)."""
+    g = beat_grid(stems, sr)
+    if not g:
+        return 0.0, 0.0
+    beats, ph = g["beats"], g["phase"]
+    _emit(log, f"Auto-Downbeat: Zaehlzeit {ph + 1}/4 (Kick, Konfidenz {g['conf']:.2f}), "
+               f"{g['bpm']:.2f} BPM.")
+    return float(beats[min(ph, len(beats) - 1)]), g["bpm"]
+
+
+def _finalize_sections(seg_bars, n_bars_total, target_bars):
+    """seg_bars: Liste (start_bar, end_bar, type_id). Macht sie luecken-/ueberlappungs-
+    frei, snappt auf ganze Takte, verschmilzt benachbarte GLEICHE Typen und zu kurze
+    Abschnitte. Vergibt Label <Typ-Nummer><Instanz-Buchstabe>: Nummer = Abschnitts-TYP
+    (in Reihenfolge des ersten Auftretens), Buchstabe = das wievielte Mal dieser Typ
+    vorkommt (1a,1b Strophen; 2a,2b verschiedene Refrains)."""
+    segs = []
+    for s, e, t in seg_bars:
+        s = max(0, min(int(round(s)), n_bars_total))
+        e = max(0, min(int(round(e)), n_bars_total))
+        if e > s:
+            segs.append([s, e, int(t)])
+    if not segs:
+        return []
+    segs.sort()
+    segs[0][0] = 0                                        # luecken-/ueberlappungsfrei
+    for i in range(1, len(segs)):
+        segs[i][0] = segs[i - 1][1]
+    segs[-1][1] = n_bars_total
+    segs = [s for s in segs if s[1] > s[0]]
+
+    def _merge_same(ss):
+        out = [list(ss[0])]
+        for s in ss[1:]:
+            if s[2] == out[-1][2]:
+                out[-1][1] = s[1]
+            else:
+                out.append(list(s))
+        return out
+    segs = _merge_same(segs)
+    minb = max(1, target_bars // 2)                       # zu kurze verschmelzen
+    i = 0
+    while len(segs) > 1 and i < len(segs):
+        if segs[i][1] - segs[i][0] < minb:
+            if i == 0:
+                segs[1][0] = segs[0][0]; segs.pop(0)
+            else:                                         # in den Vorgaenger ziehen
+                segs[i - 1][1] = segs[i][1]; segs.pop(i)
+        else:
+            i += 1
+    segs = _merge_same(segs)
+
+    # Label: Typ-Nummer (erstes Auftreten) + Instanz-Buchstabe (Vorkommen je Typ)
+    order, count, out = {}, {}, []
+    for s, e, t in segs:
+        if t not in order:
+            order[t] = len(order) + 1
+        count[t] = count.get(t, 0) + 1
+        lab = f"{order[t]}{chr(ord('a') + (count[t] - 1) % 26)}"
+        out.append({"start_bar": s, "end_bar": e, "label": lab, "type": int(t)})
+    return out
+
+
+def _refine_types_with_lyrics(raw, types, vocal_lines, log=None):
+    """Verfeinert die (akkord-/bass-basierten) Segment-Typen mit dem GESANGSTEXT.
+    Kern-Idee (User): ein sich WIEDERHOLENDER Text deutet auf einen REFRAIN, ein
+    eindeutiger Text auf eine STROPHE. Akkorde/Bass allein verwechseln Strophe und
+    Refrain gern (gleiche Harmonik) -> der Text trennt sie zuverlaessig:
+      * Segmente mit STARK aehnlichem Text (Jaccard >= LYR_SAME) werden EINE Klasse
+        (Refrain-Instanzen 2a/2b, auch wenn die Audio-Clusterung sie getrennt hatte).
+      * Segmente mit eindeutigem/keinem Text bleiben nach AUDIO-Typ gruppiert
+        (Strophen mit gleichen Akkorden 1a/1b bleiben zusammen, aber GETRENNT vom
+        Refrain, selbst wenn dessen Harmonik aehnelt).
+    raw: Liste (a,b) Zeitbereiche (gleiche Zeitbasis wie vocal_lines!). types: bisherige
+    Audio-Typen. vocal_lines: Whisper-Zeilen [{'text','words':[{'word','start',...}]}].
+    Rueckgabe: neue Typ-Liste (oder unveraendert, wenn zu wenig Text)."""
+    import re
+    from collections import Counter
+    words = []                                            # (Zeit, Token)
+    for ln in (vocal_lines or []):
+        for w in ln.get("words", []):
+            for tok in re.findall(r"[^\W\d_]+", (w.get("word") or "").lower()):
+                if len(tok) >= 2:
+                    words.append((float(w.get("start", 0.0)), tok))
+    if len(words) < 8:
+        _emit(log, "Textvergleich uebersprungen (zu wenig erkannter Gesang).")
+        return types
+    seg_tok = [[t for (ti, t) in words if a <= ti < b] for (a, b) in raw]
+    seg_set = [set(t) for t in seg_tok]
+    nw = [len(t) for t in seg_tok]
+    MIN_WORDS, LYR_SAME = 5, 0.5
+    n = len(raw)
+
+    def sim(i, j):
+        if nw[i] < MIN_WORDS or nw[j] < MIN_WORDS:
+            return 0.0
+        inter = len(seg_set[i] & seg_set[j])
+        uni = len(seg_set[i] | seg_set[j]) or 1
+        return inter / uni
+
+    parent = list(range(n))                               # Union-Find ueber Textaehnlichkeit
+
+    def find(x):
+        while parent[x] != x:
+            parent[x] = parent[parent[x]]
+            x = parent[x]
+        return x
+    for i in range(n):
+        for j in range(i + 1, n):
+            if sim(i, j) >= LYR_SAME:
+                ri, rj = find(i), find(j)
+                if ri != rj:
+                    parent[rj] = ri
+    grp = [find(i) for i in range(n)]
+    gsize = Counter(grp)
+    # neuer Schluessel: wiederkehrender Text -> eigene Klasse je Lyric-Gruppe (Refrain);
+    # sonst nach Audio-Typ (Strophe/instrumental). Disjunkte Schluesselraeume ("R"/"A")
+    # erzwingen die Trennung Refrain<->Strophe.
+    keys = [("R", grp[i]) if (nw[i] >= MIN_WORDS and gsize[grp[i]] >= 2)
+            else ("A", int(types[i])) for i in range(n)]
+    order, out = {}, []
+    for k in keys:
+        order.setdefault(k, len(order))
+        out.append(order[k])
+    nref = sum(1 for k in keys if k[0] == "R")
+    _emit(log, f"Textvergleich: {len(set(keys))} Typen "
+               f"({nref} Segmente mit wiederkehrendem Text = Refrain-artig).")
+    return out
+
+
+def detect_sections(stems, sr, t_db=None, bpm=None, target_bars=8, log=None,
+                    vocal_lines=None):
+    """Strukturelle Song-Abschnitte (Strophe/Refrain/Bridge ...) erkennen, indem
+    WIEDERKEHRENDE Muster zusammengefasst werden (nicht nur gleichmaessige Takt-Bloecke),
+    und auf GANZE TAKTE (4/4) ausrichten. Schluessel-Annahme (User): gleiche Teile haben
+    die GLEICHEN AKKORDE/BASSLAEUFE. Daher nutzt die Erkennung NICHT den verrauschten
+    Gesamt-Mix, sondern die getrennte BEGLEITUNG (Bass + Rest, ohne Drums/Gesang):
+    agglomerative Grenzen am Begleitungs-Chroma (Akkord-/Klangwechsel) + Aehnlichkeits-
+    Cluster der Segmente nach Akkord- UND Basslauf-Chroma (gleiches Profil = gleicher
+    Typ). (Eine Laplacian-Recurrence-Segmentierung wurde getestet, kollabierte aber zu
+    grob; die akkord-/bass-basierte agglomerative Variante trifft die Wiederholungen
+    deutlich sauberer.) Zusaetzlich verfeinert – falls vocal_lines (Whisper-Text)
+    uebergeben – ein TEXTVERGLEICH die Typen: wiederkehrender Gesangstext = Refrain,
+    eindeutiger Text = Strophe (trennt beide auch bei aehnlicher Harmonik, s.
+    _refine_types_with_lyrics). vocal_lines muessen in DERSELBEN Zeitbasis liegen wie
+    die uebergebenen stems (also ggf. vorher mit warp_lines mitziehen).
+    Label: <Typ-Nummer><Instanz-Buchstabe> (1a,1b Strophen; 2a,2b,2c
+    Refrains). Rueckgabe: Liste {start_bar, end_bar, label, type, start_sec, end_sec}
+    (bar relativ zum Downbeat) oder []. t_db/bpm optional (sonst via detect_downbeat)."""
+    import librosa
+    sr = int(sr)
+    sel = [k for k in stems if stems[k] is not None]
+    if not sel:
+        return []
+    maxn = max(len(np.asarray(stems[k])) for k in sel)
+    mix = np.zeros(maxn, dtype=np.float32)
+    for k in sel:
+        a = np.asarray(stems[k], dtype=np.float32)
+        if a.ndim == 2:
+            a = a.mean(axis=1)
+        mix[:len(a)] += a
+    dur = maxn / float(sr)
+    if t_db is None or bpm is None:
+        t_db, bpm = detect_downbeat(stems, sr)
+    if not (bpm and bpm > 0):
+        return []
+    bar = 4 * 60.0 / bpm
+    t_db = float(t_db or 0.0)
+    n_bars_total = max(2, int(round((dur - t_db) / bar)))
+    an = ANALYSIS_SR
+    hop = 512
+    try:
+        def _rs(x):
+            x = np.asarray(x, dtype=np.float32)
+            if x.ndim == 2:
+                x = x.mean(axis=1)
+            return librosa.resample(x, orig_sr=sr, target_sr=an) if sr != an else x
+
+        # Begleitung (Bass + Rest) = Harmonik/Akkorde OHNE Drums/Gesang -> sauberste
+        # Basis fuer WIEDERKEHRENDE Muster: gleiche Akkordfolge/Basslauf = gleicher Teil
+        # (genau die Annahme des Users). Fallback auf den Mix, falls Stems fehlen.
+        harm = [stems[k] for k in ("bass", "other") if stems.get(k) is not None]
+        if harm:
+            L = max(len(np.asarray(h)) for h in harm)
+            acc = np.zeros(L, dtype=np.float32)
+            for h in harm:
+                a = np.asarray(h, dtype=np.float32)
+                a = a.mean(axis=1) if a.ndim == 2 else a
+                acc[:len(a)] += a
+            acc = _rs(acc)
+        else:
+            acc = _rs(mix)
+        bassy = _rs(stems["bass"]) if stems.get("bass") is not None else acc
+        ch_acc = librosa.feature.chroma_cqt(y=acc, sr=an, hop_length=hop)    # Akkorde
+        ch_bass = librosa.feature.chroma_cqt(y=bassy, sr=an, hop_length=hop)  # Basslauf
+        mf = librosa.feature.mfcc(y=_rs(mix), sr=an, hop_length=hop, n_mfcc=13)
+        nf = min(ch_acc.shape[1], ch_bass.shape[1], mf.shape[1])
+        fr = an / float(hop)
+        # Grenzen: an Akkord-/Klangwechseln (Begleitungs-Chroma + MFCC).
+        feat_bnd = np.vstack([2.0 * librosa.util.normalize(ch_acc[:, :nf], axis=0),
+                              librosa.util.normalize(mf[:, :nf], axis=0)])
+        # Wiederkehr/Aehnlichkeit: Akkorde + Basslauf (genau das wiederholt sich).
+        feat_cl = np.vstack([librosa.util.normalize(ch_acc[:, :nf], axis=0),
+                             librosa.util.normalize(ch_bass[:, :nf], axis=0)])
+        n_sec = int(np.clip(round(n_bars_total / float(max(2, target_bars))), 3, 14))
+        bounds = librosa.segment.agglomerative(feat_bnd, n_sec)
+        bt = librosa.frames_to_time(np.asarray(bounds), sr=an, hop_length=hop)
+        bt = np.concatenate([[0.0], bt, [dur]])
+    except Exception as e:
+        _emit(log, f"Abschnitts-Erkennung uebersprungen ({e}).")
+        return []
+
+    # Grenzen (Zeit) -> Roh-Segmente (Frame-Bereiche) + mittleres Akkord/Bass-Feature
+    raw = []
+    for i in range(len(bt) - 1):
+        a, b = bt[i], bt[i + 1]
+        if b > a:
+            raw.append((a, b))
+    if not raw:
+        return []
+    def seg_feat(a, b):
+        f0, f1 = int(a * fr), int(min(feat_cl.shape[1], b * fr))
+        return feat_cl[:, f0:f1].mean(axis=1) if f1 > f0 else feat_cl.mean(axis=1)
+    fv = [seg_feat(a, b) for a, b in raw]
+    # WIEDERKEHRENDE Muster: Segmente mit aehnlichem Akkord-/Bass-Profil = gleicher Typ
+    # (Reihenfolge des ersten Auftretens). Schwelle relativ zur Feature-Norm.
+    types, nxt = [-1] * len(raw), 0
+    for i in range(len(raw)):
+        if types[i] != -1:
+            continue
+        types[i] = nxt
+        for j in range(i + 1, len(raw)):
+            if types[j] == -1:
+                d = np.linalg.norm(fv[i] - fv[j]) / (np.linalg.norm(fv[i]) + 1e-9)
+                if d < 0.45:                              # gleiche Akkorde/Bass -> gleicher Teil
+                    types[j] = nxt
+        nxt += 1
+    # Optional: Gesangstext trennt Strophe/Refrain (wiederkehrender Text = Refrain),
+    # was die reine Akkord-/Bass-Clusterung nicht zuverlaessig kann.
+    if vocal_lines:
+        types = _refine_types_with_lyrics(raw, types, vocal_lines, log=log)
+    seg_bars = [((a - t_db) / bar, (b - t_db) / bar, t)
+                for (a, b), t in zip(raw, types)]
+
+    secs = _finalize_sections(seg_bars, n_bars_total, target_bars)
+    for s in secs:
+        s["start_sec"] = t_db + s["start_bar"] * bar
+        s["end_sec"] = t_db + s["end_bar"] * bar
+    _emit(log, f"Abschnitte: {len(secs)} (wiederkehrende Muster) – "
+               + ", ".join(f"{s['label']}[{s['start_bar']}-{s['end_bar']}]"
+                           for s in secs))
+    return secs
+
+
+def slice_sections_to_wavs(warped, sr, t_db, bpm, sections, out_dir, base,
+                           instruments=None, log=None):
+    """Schneidet aus GEWARPTEN (rastergenauen) Stems je Abschnitt x Stem einen
+    bar-langen Clip und schreibt ihn als WAV. Jeder Clip ist eine ganze Zahl Takte und
+    metronomisch -> loopt auf der Deluge sauber und passt beim freien Arrangieren
+    zusammen. Datei: <base>_<NN><Label>_<stem>.wav. Rueckgabe: Liste der Pfade."""
+    if sf is None:
+        raise RuntimeError("soundfile nicht verfuegbar (pip install soundfile)")
+    sr = int(sr)
+    bpm = float(bpm) if bpm and bpm > 0 else 120.0
+    bar_n = int(round(4.0 * 60.0 / bpm * sr))             # Samples je Takt
+    db_n = int(round(float(t_db) * sr))                   # Downbeat-Sample (gewarpt)
+    instruments = [n for n in (instruments or list(warped.keys()))
+                   if warped.get(n) is not None]
+    written = []
+    for i, sec in enumerate(sections):
+        s0 = db_n + int(sec["start_bar"]) * bar_n
+        s1 = db_n + int(sec["end_bar"]) * bar_n
+        need = max(1, s1 - s0)
+        lab = sec.get("label", "X")
+        for n in instruments:
+            a = np.asarray(warped[n], dtype=np.float32)
+            if a.ndim == 1:
+                a = a[:, None]
+            lo, hi = max(0, s0), max(0, min(len(a), s1))
+            seg = a[lo:hi]
+            if len(seg) < need:                           # ueber den Rand -> auffuellen
+                pad = np.zeros((need - len(seg),) + seg.shape[1:], dtype=np.float32)
+                seg = (np.concatenate([pad, seg], axis=0) if s0 < 0
+                       else np.concatenate([seg, pad], axis=0))
+            p = os.path.join(out_dir, f"{base}_{i + 1:02d}_{lab}_{n}.wav")
+            sf.write(p, seg, sr, subtype="PCM_16")
+            written.append(p)
+            _emit(log, f"  ✓ {os.path.basename(p)} "
+                       f"({sec['end_bar'] - sec['start_bar']} Takte)")
+    _emit(log, f"Parts: {len(written)} Clips aus {len(sections)} Abschnitten.")
+    return written
+
+
 def _groove_targets(beats, phase, spb, strength):
     """Zielzeiten fuer den 'groove'-Modus: jede Takt-Eins (jeder 4. Beat ab 'phase')
     liegt EXAKT auf dem gleichmaessigen Raster (kein Drift), die Beats dazwischen
@@ -3280,7 +3637,7 @@ def _groove_targets(beats, phase, spb, strength):
     return tgt
 
 
-def warp_stems_to_grid(stems, sr, per="beat", bpm=None, log=None):
+def warp_stems_to_grid(stems, sr, per="beat", bpm=None, log=None, db_orig=None):
     """Zieht ALLE Stems auf ein GLEICHMAESSIGES Raster eines KONSTANTEN Tempos,
     sodass ein Deluge-Audio-Clip (der mit konstantem Songtempo laeuft) dauerhaft im
     Takt bleibt und NICHT mehr wegdriftet. Vorgehen:
@@ -3335,14 +3692,23 @@ def warp_stems_to_grid(stems, sr, per="beat", bpm=None, log=None):
         return dict(stems), None
     spb = 60.0 / tgt_bpm                                   # Ziel-Sekunden je Beat
 
-    def _downbeat_phase():                                 # welcher Beat ist die 1
-        try:
-            dref = stems.get("drums")
-            t_db = (drums_downbeat_sec(dref, sr)
-                    if dref is not None else float(beats[0]))
-            return int(np.argmin(np.abs(beats - t_db))) % 4
-        except Exception:
-            return 0
+    # Takt-Phase (welcher Beat ist die musikalische "1"): die Zaehlzeit mit der
+    # groessten KICK-Energie (Tiefbass 30-160 Hz), summiert ueber ALLE Takte. Robuster
+    # als breitbandige Onsets (die oft die Snare auf 2/4 bevorzugen) und als der erste
+    # laute Onset (drums_downbeat_sec, landet sonst auf 2/3/4).
+    dref = stems.get("drums")
+    phase, _pconf, _psc = _kick_phase(mix if dref is None else dref, beats, sr)
+    if db_orig is not None:
+        # Bar-Phase an den im Probehoeren GEWAEHLTEN Downbeat koppeln (inkl. ◀/▶-Versatz),
+        # sonst kann die interne Kick-Phase eine ANDERE Zaehlzeit als der gehoerte Downbeat
+        # treffen -> Parts-Schnitt laege zwischen den Rasterschlaegen (Groove nicht auf 1).
+        nearest = int(np.argmin(np.abs(beats - float(db_orig))))
+        phase = nearest % 4
+        _emit(log, f"Downbeat-Phase an gewaehlten Downbeat gekoppelt: Zaehlzeit "
+                   f"{phase + 1}/4 (statt Kick-Phase {(_psc.argmax() % 4) + 1}/4).")
+    else:
+        _emit(log, f"Downbeat-Phase (Kick): Zaehlzeit {phase + 1}/4, "
+                   f"Konfidenz {_pconf:.2f} (1.0 = keine klare 1).")
 
     # Anker + Zielzeiten je Modus. 'beat' = jeder Beat aufs Raster (straff);
     # 'bar1' = nur jede Taktlinie, phasenausgerichtet auf die erkannte musikalische 1;
@@ -3351,9 +3717,8 @@ def warp_stems_to_grid(stems, sr, per="beat", bpm=None, log=None):
     # an seiner Originalzeit (Intro/Outro 1:1).
     if per == "groove":
         src_anchor = beats.copy()
-        tgt_anchor = _groove_targets(beats, _downbeat_phase(), spb, GROOVE_STRENGTH)
+        tgt_anchor = _groove_targets(beats, phase, spb, GROOVE_STRENGTH)
     elif per == "bar1":                                   # jede musikalische 1 aufs Raster
-        phase = _downbeat_phase()
         idx = np.arange(phase, len(beats), 4)
         if len(idx) == 0 or idx[-1] != len(beats) - 1:
             idx = np.append(idx, len(beats) - 1)
@@ -3404,9 +3769,15 @@ def warp_stems_to_grid(stems, sr, per="beat", bpm=None, log=None):
     for n in stems:                                       # None-Stems durchreichen
         if n not in warped:
             warped[n] = stems[n]
-    info = {"bpm": tgt_bpm, "per": per, "map_src": map_src, "map_tgt": map_tgt}
+    # rastergenauer erster Downbeat (musikalische "1") in der GEWARPTEN Zeit: die
+    # Quell-Zeit des ersten "1"-Beats (beats[phase]) durch dieselbe Abbildung gezogen.
+    # beats[phase] ist immer ein Stuetzpunkt -> liegt exakt auf einer Raster-Zaehlzeit.
+    pdb = min(int(phase), len(beats) - 1)
+    t_db = float(np.interp(beats[pdb], map_src, map_tgt))
+    info = {"bpm": tgt_bpm, "per": per, "map_src": map_src, "map_tgt": map_tgt,
+            "t_db": t_db}
     _emit(log, f"Raster-Warp ({per}): {len(src_anchor)} Anker, Zieltempo "
-               f"{tgt_bpm:.2f} BPM, Laenge {total_n / sr:.1f}s "
+               f"{tgt_bpm:.2f} BPM, Downbeat {t_db:.3f}s, Laenge {total_n / sr:.1f}s "
                f"(Quelle {dur_src:.1f}s).")
     return warped, info
 
@@ -3426,6 +3797,79 @@ def warp_notes(notes, info):
         if e2 > s2:
             out.append((s2, e2, p, v))
     return out
+
+
+def warp_lines(lines, info):
+    """Zieht Whisper-Zeilen (Wort-Zeitstempel) mit DERSELBEN Zeit-Abbildung wie die
+    Stems (warp_stems_to_grid) auf das Raster. Noetig, damit der Textvergleich in
+    detect_sections zu den GEWARPTEN Abschnitten passt (gleiche Zeitbasis)."""
+    if not lines or not info:
+        return list(lines or [])
+    ms = np.asarray(info["map_src"], dtype=np.float64)
+    mt = np.asarray(info["map_tgt"], dtype=np.float64)
+    out = []
+    for ln in lines:
+        ws = []
+        for w in ln.get("words", []):
+            s = float(np.interp(float(w.get("start", 0.0)), ms, mt))
+            e = float(np.interp(float(w.get("end", w.get("start", 0.0))), ms, mt))
+            ws.append({"word": w.get("word", ""), "start": s, "end": e})
+        out.append({"text": ln.get("text", ""), "words": ws})
+    return out
+
+
+def metronome_click(t0, spb, dur, sr, accent=4):
+    """Metronom-Klickspur (mono float32) fuer die Vorschau: kurze Bleeps bei
+    t0 + n*spb Sekunden (auch n<0, sofern >=0s), jeder 'accent'-te ab t0 (die "1")
+    hoeher und lauter. Laenge 'dur' Sekunden. So hoert man, ob die Takt-1 auf dem
+    Beat des Materials sitzt."""
+    sr = int(sr)
+    y = np.zeros(int(dur * sr) + 1, dtype=np.float32)
+    spb = float(spb)
+    if spb <= 0 or dur <= 0:
+        return y
+    Lc = int(0.045 * sr)
+    env = np.exp(-np.linspace(0.0, 9.0, Lc)).astype(np.float32)
+    tt = np.arange(Lc) / float(sr)
+    n = int(math.ceil((0.0 - t0) / spb))             # erster Klick mit Zeit >= 0
+    while True:
+        t = t0 + n * spb
+        if t >= dur:
+            break
+        if t >= 0.0:
+            i = int(t * sr)
+            acc = (n % int(accent) == 0)             # die "1"
+            blip = ((0.6 if acc else 0.32) * env
+                    * np.sin(2 * np.pi * (1760.0 if acc else 1100.0) * tt)).astype(np.float32)
+            j = min(i + Lc, len(y))
+            y[i:j] += blip[:j - i]
+        n += 1
+    return y
+
+
+def click_from_beats(beat_times, accent_mask, dur, sr):
+    """Klickspur (mono float32) mit Bleeps an ECHTEN Beat-Zeiten (s, rel. zum Fenster).
+    Im Gegensatz zu metronome_click (konstantes Raster) folgt der Klick exakt den
+    erkannten Beats und DRIFTET daher NICHT gegen die Original-Stems -> man hoert
+    sauber, ob der laute Akzent (accent_mask True) auf der musikalischen 1 sitzt, ohne
+    dass Tempo-Schwankungen das verfaelschen. Laenge 'dur' Sekunden."""
+    sr = int(sr)
+    y = np.zeros(int(dur * sr) + 1, dtype=np.float32)
+    if dur <= 0:
+        return y
+    Lc = int(0.045 * sr)
+    env = np.exp(-np.linspace(0.0, 9.0, Lc)).astype(np.float32)
+    tt = np.arange(Lc) / float(sr)
+    for t, acc in zip(beat_times, accent_mask):
+        t = float(t)
+        if t < 0.0 or t >= dur:
+            continue
+        i = int(t * sr)
+        blip = ((0.6 if acc else 0.32) * env
+                * np.sin(2 * np.pi * (1760.0 if acc else 1100.0) * tt)).astype(np.float32)
+        j = min(i + Lc, len(y))
+        y[i:j] += blip[:j - i]
+    return y
 
 
 def separate_stems_to_files(path, out_dir, model="htdemucs", base=None, log=None,

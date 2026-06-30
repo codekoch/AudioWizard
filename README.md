@@ -63,10 +63,10 @@ siehe [Webversion](#webversion-browser).
   (Default GM-Drum-Map, Kanal 10), **Empfindlichkeit** justieren → **Anwenden**.
 - **Datei als MIDI-Clock:** **Datei …** → nur **MIDI-Clock-Ausgabe** → **▶ Start / ■ Stopp**.
 - **Deluge-Song (Bundle) bauen:** **Datei …** (oder nach einer **Aufnahme** → **Weiter**)
-  → **Deluge-Song erstellen** anhaken, **Instrumente** + **Vorlauf-Takte** wählen und beim
-  **Taktraster** z. B. **„Groove"** (driftfrei, lebendig) → Speicherort. Danach die `.XML`
-  in den **SONGS**-Ordner und die daneben erzeugten Stem-WAVs nach **`SAMPLES/AudioWizard/`**
-  auf die SD-Karte kopieren.
+  → **Deluge-Song erstellen** anhaken, **Instrumente** + **Vorlauf-Takte** + **Taktraster**
+  (z. B. **„Groove"**) wählen → **Los**. Nach der Trennung öffnet sich das **Tuning-Fenster**:
+  **„▶ Probehören"**, die Takt-1 per **◀/▶** auf den Click ziehen, dann **„Bundle speichern…"**.
+  Die `.XML` in den **SONGS**-Ordner, die Stem-WAVs nach **`SAMPLES/AudioWizard/`** auf die SD.
 - **MIDI-Ausgang prüfen:** Einstellungen → **▶ MIDI-Ausgang testen** (Dreiklang hörbar?).
 
 ## Funktionen im Detail
@@ -244,11 +244,14 @@ siehe [Webversion](#webversion-browser).
   Komponenten auch in einer **bereits gespeicherten** Datei noch umlegen (eine
   Neuerkennung aus Audio ist dann nicht mehr möglich, nur das Verschieben der
   Tonhöhen). Reine MIDI-Ausgabe (kein Audio); braucht nur einen MIDI-Ausgang.
-- **Deluge-Song erzeugen (Bundle)** – direkt im Dialog **„Was soll passieren?"** als
-  eigene Aktion **„Deluge-Song erstellen"** (mit Auswahl der **Instrumente**
-  Bass/Drums/Rest/Gesang und der **Vorlauf-Takte**) **oder** im Stem-Player (bei
-  „Stems → MIDI") über **„Deluge-Song…"** (dort ist der erkannte **Downbeat per
-  ◀/▶ um Beats nachjustierbar**): daraus entsteht ein **gemeinsames Bundle** aus
+- **Deluge-Song erzeugen (Bundle)** – über die Aktion **„Deluge-Song erstellen"** im
+  Dialog **„Was soll passieren?"** (mit Auswahl der **Instrumente** Bass/Drums/Rest/
+  Gesang und der **Vorlauf-Takte**) **oder** im Stem-Player (bei „Stems → MIDI") über
+  **„Deluge-Song…"**. Beide Wege öffnen nach der Stem-Trennung dasselbe **Probehör-/
+  Tuning-Fenster**: dort lässt sich der Downbeat **per ◀/▶ um Beats verschieben** und
+  mit **„▶ Probehören (mit Click)"** vorab anhören – die Stems laufen mit einem
+  **akzentuierten Metronom** auf dem Raster, sodass man die Takt-1 **vor dem Export
+  aufs Gehör** ausrichtet; **„Speichern"** schreibt dann das **gemeinsame Bundle** aus
   ausgerichteten **Stem-WAVs + MIDI** als **Synthstrom-Deluge-Songdatei** (`.XML`,
   Community-Firmware c1.2.x). Jede aktive Stem-Spur wird ein **Pattern**: die
   **melodischen** Stems (Bass/Rest/Gesang) als **interne Synth-Spuren**, das
@@ -273,7 +276,36 @@ siehe [Webversion](#webversion-browser).
   `.XML`). Hinweis: Das Kit referenziert zusätzlich das **Factory-808-Kit** – diese
   Samples müssen auf der SD-Karte liegen, sonst lädt der Song zwar, die Drums bleiben
   aber stumm. (Format inkl. Noten-Encoding/Tempo wurde gegen eine echte c1.2.1-Datei
-  verifiziert und auf dem Gerät getestet.)
+  verifiziert und auf dem Gerät getestet.) Den Downbeat („1") bestimmt eine
+  **Kick-basierte** Erkennung (Tiefbass-Energie über alle Takte) – zuverlässiger als der
+  erste laute Onset; per **◀/▶** lässt er sich beatweise korrigieren.
+- **Deluge-Song aus Parts (Abschnitten)** – im selben Tuning-Fenster über
+  **„Parts speichern…"**: AudioWizard erkennt die **Song-Struktur** über
+  **wiederkehrende Muster** (gleiche Akkordfolgen/Klangfarbe → derselbe Abschnitts-Typ)
+  und schreibt einen **Deluge-Song, in dem jeder Abschnitt eine eigene Deluge-Section**
+  (Launch-Spalte) ist. **Zusätzlich trennt ein Gesangstext-Vergleich Strophe und
+  Refrain** (Häkchen *„Strophe/Refrain per Gesangstext trennen"*, braucht
+  `faster-whisper`): **wiederkehrender Text = Refrain**, eindeutiger Text = Strophe –
+  das verhindert, dass Strophen und Refrains trotz ähnlicher Harmonik in denselben Typ
+  geraten, und fasst gleiche Refrains zuverlässig zusammen. Die Teile heißen
+  **`<Typ><Vorkommen>`**: gleiche **Nummer** = wiederkehrender Teil, **Buchstabe** = das
+  wievielte Mal – z. B. **1a, 1b, 1c** (drei Strophen), **2a, 2b** (zwei Refrains),
+  **3a** (Bridge). Pro Abschnitt liegt **je Stem ein Audio-Clip UND der passende
+  MIDI-Clip** (Synth bzw. Kit), beide **taktgenau aufs selbe Raster gezogen** und gleich
+  lang. So lassen sich die Teile auf der Deluge **frei arrangieren/launchen** – sie
+  passen tempo- und taktmäßig zusammen. Jeder Clip ist **sauber loopbar**: ganze Takte,
+  **Start exakt auf der „1"** (das Taktraster wird an genau den im Probehören
+  eingestellten Downbeat gekoppelt, und die Abschnitte werden direkt auf den
+  rastergenauen Stems geschnitten – der Groove sitzt damit auf dem ersten Schlag), eine
+  kurze **Loop-Kreuzblende** am Ende verhindert den Klick an der Naht, und MIDI-Noten
+  enden innerhalb der Loop. Jeder Clip trägt den **Abschnitts-Namen** (z. B. *Vocals
+  1a*, *Bass 2a*, *Drums 1b* – Audio- **und** MIDI-Clip), und die Spuren sind **je Stem
+  eingefärbt** (z. B. alle Gesang-Spuren rötlich, Bass/Drums/Rest je eigene Farbe; die
+  Parts innerhalb einer Spur sind leicht abgestuft). So erkennt man Spur **und**
+  Abschnitt im Deluge-Grid sofort. Clips/WAVs sind nach Abschnitt + Stem benannt (z. B.
+  `…_02_2a_bass.wav`). Parts brauchen ein Taktraster; steht es auf **„Aus"**, nutzt der
+  Parts-Export intern **Groove**, damit die Teile loopbar bleiben. Wie beim Bundle:
+  `.XML` nach **SONGS/**, die Abschnitts-WAVs nach **`SAMPLES/AudioWizard/`** auf die SD.
 - **Song-Sheet (Text + Akkorde)** (optional) – aus einer Datei entsteht ein
   **Chord-Sheet wie bei Ultimate Guitar**: die Akkorde stehen über den jeweiligen
   Wörtern des gesungenen Textes. Ablauf komplett **lokal/offline**: Demucs trennt
