@@ -37,11 +37,12 @@ Eingänge; unter macOS leistet das ein virtuelles Ausgabegerät wie
 | **Noten/Akkorde → MIDI** | Erkannte Tonhöhen live als MIDI senden (mono/poly/Akkord). |
 | **Datei → MIDI-Clock** | Audiodatei mit driftfreier Clock abspielen, mit ▶ Start / ■ Stopp. |
 | **Stems** | Gesang/Bass/Drums/Rest lokal trennen (Demucs) – exportieren oder abspielen. |
-| **Song-Sheet** | Gesangstext + Akkorde im Ultimate-Guitar-Stil (lokal, Whisper + Forced Alignment). |
+| **Song-Sheet** | Gesangstext + Akkorde im Ultimate-Guitar-Stil (lokal, Whisper + Forced Alignment); optional **Online-Abgleich** (Song identifizieren, unsichere Text-/Akkord-Stellen gewichtet gegen Internet-Referenzen korrigieren). |
 | **Stems → MIDI** | Bass/Rest/Gesang via Basic Pitch nach MIDI, je Kanal; optional MIDI-Clock mitsenden; als `.mid` speichern. |
 | **Schlagzeug → MIDI** | Drums in Kick/Snare/HiHat (+ optional Tom/Crash) zerlegen, Note je Komponente frei wählbar; Standard GM-Drum-Map auf Kanal 10. |
 | **MIDI-Datei laden** | Eine `.mid` spurweise (an/aus + Kanal) über den MIDI-Ausgang abspielen. |
 | **Deluge-Song (Bundle)** | Synthstrom-Deluge-Songdatei (`.XML`) aus **Stems + MIDI**: ausgerichtete Audio-Spuren parallel zu internen Synths/Kit, gemeinsam **aufs Taktraster gezogen** (driftfrei, Groove erhalten). |
+| **Deluge-Song (Parts)** | Erkannte **Song-Abschnitte** (Strophe/Refrain/Instrumental, Labels 1a/2b …) als **launchbare Deluge-Sections**: je Abschnitt Audio-Clip + MIDI-Clip, loopbar, farblich nach Stem; Struktur optional per **Online-Referenz** (Lyrics-Blöcke) abgesichert. |
 | **DJ-Modus** | Zwei Decks, Equal-Power-Crossfade; die Clock folgt dem Ziel-Deck. |
 | **Aufnahme** | Live-Signal mitschneiden und als Datei(en) speichern. |
 
@@ -53,7 +54,8 @@ siehe [Webversion](#webversion-browser).
 - **Live mitspielen (Clock):** Quelle + MIDI-Ausgang wählen → **Start**. Die Clock
   startet mit der ersten Tempo-Schätzung und taktet Drumcomputer/Sequenzer mit.
 - **Song-Sheet erstellen:** **Datei (Audio/MIDI) …** → Audiodatei → im Dialog
-  **Song-Sheet** anhaken (Sprache fest wählen) → **Los**; Ergebnis als `.txt`/`.chordpro`.
+  **Song-Sheet** anhaken (Sprache fest wählen; optional **Online-Abgleich** für
+  Text-/Akkord-Korrektur aus dem Netz) → **Los**; Ergebnis als `.txt`/`.chordpro`.
 - **Stems exportieren:** **Datei …** → **Stems exportieren**, Stem-Qualität **Hoch**
   → Zielordner.
 - **Spuren → MIDI aufnehmen:** MIDI-Ausgang einstellen → **Datei …** →
@@ -65,7 +67,8 @@ siehe [Webversion](#webversion-browser).
 - **Deluge-Song (Bundle) bauen:** **Datei …** (oder nach einer **Aufnahme** → **Weiter**)
   → **Deluge-Song erstellen** anhaken, **Instrumente** + **Vorlauf-Takte** + **Taktraster**
   (z. B. **„Groove"**) wählen → **Los**. Nach der Trennung öffnet sich das **Tuning-Fenster**:
-  **„▶ Probehören"**, die Takt-1 per **◀/▶** auf den Click ziehen, dann **„Bundle speichern…"**.
+  **„▶ Probehören"**, die Takt-1 per **◀/▶** auf den Click ziehen, dann **„Bundle speichern…"**
+  – oder **„Parts speichern…"** für launchbare **Song-Abschnitte** (Strophe/Refrain/…).
   Die `.XML` in den **SONGS**-Ordner, die Stem-WAVs nach **`SAMPLES/AudioWizard/`** auf die SD.
 - **MIDI-Ausgang prüfen:** Einstellungen → **▶ MIDI-Ausgang testen** (Dreiklang hörbar?).
 
@@ -281,13 +284,26 @@ siehe [Webversion](#webversion-browser).
   erste laute Onset; per **◀/▶** lässt er sich beatweise korrigieren.
 - **Deluge-Song aus Parts (Abschnitten)** – im selben Tuning-Fenster über
   **„Parts speichern…"**: AudioWizard erkennt die **Song-Struktur** über
-  **wiederkehrende Muster** (gleiche Akkordfolgen/Klangfarbe → derselbe Abschnitts-Typ)
-  und schreibt einen **Deluge-Song, in dem jeder Abschnitt eine eigene Deluge-Section**
-  (Launch-Spalte) ist. **Zusätzlich trennt ein Gesangstext-Vergleich Strophe und
-  Refrain** (Häkchen *„Strophe/Refrain per Gesangstext trennen"*, braucht
-  `faster-whisper`): **wiederkehrender Text = Refrain**, eindeutiger Text = Strophe –
-  das verhindert, dass Strophen und Refrains trotz ähnlicher Harmonik in denselben Typ
-  geraten, und fasst gleiche Refrains zuverlässig zusammen. Die Teile heißen
+  **wiederkehrende Muster** und schreibt einen **Deluge-Song, in dem jeder Abschnitt
+  eine eigene Deluge-Section** (Launch-Spalte) ist. Die **Grenzen** kommen aus einer
+  takt-weisen Novelty-Analyse über drei Evidenzen: **Akkorde/Klangfarbe**,
+  **Stem-Energie** (Drums setzen ein/aus, Gesang da/weg – erkennt Part-Wechsel auch,
+  wenn das ganze Stück dieselbe Akkordfolge spielt, wie bei *Creep*) und
+  **Text-Wiederholung** (wiederholte Gesangs-Passagen markieren Refrains samt
+  Startpunkt). **Ein Gesangstext-Vergleich trennt dann Strophe und Refrain**
+  (Häkchen *„Strophe/Refrain per Gesangstext trennen"*, braucht `faster-whisper`):
+  **wiederkehrender Text = Refrain**, eindeutiger Text = Strophe, **ohne Gesang =
+  Instrumental/Intro/Solo** (eigener Typ) – das verhindert, dass Strophen und
+  Refrains trotz ähnlicher Harmonik in denselben Typ geraten, und fasst gleiche
+  Refrains zuverlässig zusammen (auch einen verdoppelten Schluss-Refrain; an echten
+  Songs gegen Referenz-Sheets evaluiert). Ist zusätzlich der **Online-Abgleich**
+  aktiv (gleiches Häkchen wie beim Song-Sheet), nutzt die Parterkennung auch die
+  **Struktur der Referenz-Lyrics** (lrclib.net): Die Strophen-Blöcke des
+  Referenztexts werden per Wort-Alignment auf die eigene Aufnahme gelegt und
+  liefern **Grenz- und Typ-Anker** (wiederholte Blöcke = Refrain) – Whisper-Hörfehler
+  können die Zuordnung dann nicht mehr verfälschen. Instrumentale Teile behalten
+  dabei ihren eigenen Typ, und bei zu dünner Verankerung (Song kaum erkannt,
+  andere Version) bleibt automatisch die interne Erkennung maßgeblich. Die Teile heißen
   **`<Typ><Vorkommen>`**: gleiche **Nummer** = wiederkehrender Teil, **Buchstabe** = das
   wievielte Mal – z. B. **1a, 1b, 1c** (drei Strophen), **2a, 2b** (zwei Refrains),
   **3a** (Bridge). Pro Abschnitt liegt **je Stem ein Audio-Clip UND der passende
@@ -317,7 +333,36 @@ siehe [Webversion](#webversion-browser).
   unterscheidet (C vs. Am, G vs. Em) und so die häufigste Fehlerkennung behebt;
   fürs Sheet werden bewusst **nur Dur-/Moll-Dreiklänge** zugelassen (Septakkorde
   flackern auf der gesangslosen Begleitung) und leitereigene Akkorde der
-  erkannten Tonart leicht bevorzugt. Aufgerufen über den **„Was soll passieren?"-Dialog** beim Laden
+  erkannten Tonart leicht bevorzugt. Ein **Dur/Moll-Terzcheck** sorgt dabei dafür,
+  dass klar klingende **leiterfremde Akkorde** (Borrowed Chords wie das **Cm** in
+  *Creep*, G-Dur) nicht von der Tonart-Bevorzugung „geradegebogen" werden; das
+  Beat-Raster wird über die **ganze Songlänge** gezogen, sodass auch ein Intro/Outro
+  **ohne Schlagzeug** Akkorde bekommt (z. B. *99 Luftballons*), und praktisch
+  stille Passagen (Fade-in/-out) bekommen bewusst **keinen** (geratenen) Akkord.
+  Die **Mindestdauer** eines Akkord-Abschnitts ist **beat-relativ** (1 Beat statt
+  fester 1,2 s) – bei schnellem Harmonierhythmus (*Piano Man* wechselt alle 1–2
+  Beats) wurden sonst echte kurze Akkorde weggeglättet. (Alles gegen
+  Ground-Truth-Sheets von 5 bekannten Songs gemessen; zeitverankerte
+  Akkord-Accuracy dabei von 67 % auf 73 % gestiegen – getestete Alternativen wie
+  Viterbi-Decoding, Chroma-Terz-Ratios und phasen-adaptive Fenster brachten
+  messbar nichts und blieben draußen.)
+  **Optionaler Online-Abgleich** (Häkchen im Dialog; sonst bleibt alles offline):
+  Das Stück wird über den erkannten Text/Dateinamen **im Netz identifiziert**
+  (lrclib.net), dann werden **unsichere Stellen gewichtet korrigiert** – bei den
+  **Wörtern** entscheidet die Whisper-Wortwahrscheinlichkeit (nur unsichere Wörter
+  übernehmen die Referenz), bei den **Akkorden** automatisch gefundene
+  Referenz-Sheets aus **mehreren Quellen** (cifraclub, chordie als Meta-Suche über
+  mehrere Archive, e-chords): Jedes Sheet wird per **Stufen-Transposition** auf die
+  erkannte Tonart gedreht (Quellen sind oft transponiert/Capo – der *funktionale
+  Verlauf* zählt) und die Übereinstimmung mit der eigenen Erkennung ist zugleich
+  das **Vertrauensmaß** – bei mehreren Quellen **gewinnt die wahrscheinlichste**.
+  Nur wenn die beste Quelle sicher genug passt, übernehmen **einzig die unsicheren
+  eigenen Stellen** (kleine Konfidenz-Margin) den Referenz-Akkord – ist nichts
+  (Sicheres) zu finden, **gewinnt immer die interne Erkennung** (Internet-Quellen
+  können ja ebenfalls falsch sein). Ultimate Guitar selbst blockt maschinelle
+  Zugriffe (auch mit Login) und bleibt daher außen vor. In der Konsole:
+  `--online` zusätzlich zu `--sheet`.
+  Aufgerufen über den **„Was soll passieren?"-Dialog** beim Laden
   einer Datei bzw. nach einer Aufnahme (er fragt auch **Sprache** und
   **Modellgröße** ab) bzw. `--sheet DATEI [--out ORDNER]
   [--lang de|en] [--whisper small|medium|large-v3]` in der Konsole. Das Ergebnis

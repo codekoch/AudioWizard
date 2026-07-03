@@ -1956,17 +1956,46 @@ class DisplayApp:
                                     stems_dict["vocals"], sr, size="small")
                             except Exception:
                                 vcache["lines"] = None
+                            # Optionaler Online-Abgleich (cfg): korrigierter Text
+                            # macht die Refrain-Wiederholungen fuer die
+                            # Parterkennung sauberer. Faellt still zurueck.
+                            if vcache["lines"] and load_config().get("online_ref"):
+                                try:
+                                    import online_ref
+                                    v = np.asarray(stems_dict["vocals"])
+                                    ident = online_ref.identify_song(
+                                        vcache["lines"], dur=len(v) / float(sr),
+                                        title_hint=title)
+                                    if ident and ident.get("conf", 0) >= 0.35:
+                                        online_ref.correct_lines(
+                                            vcache["lines"], ident["plain"])
+                                        vcache["ident"] = ident
+                                except Exception:
+                                    pass
                             vcache["done"] = True
                         if vcache["lines"]:
                             vlines = (core.warp_lines(vcache["lines"], info)
                                       if info else vcache["lines"])
                     self.root.after(0, lambda: status.config(
                         text="erkenne Abschnitte (rastergenau) …"))
+                    # Online-STRUKTUR: Strophen-Bloecke der Referenz-Lyrics als
+                    # Grenz-/Typ-Anker (auf den GEWARPTEN Zeiten der vlines).
+                    oanch = None
+                    ident = vcache.get("ident")
+                    if vlines and ident:
+                        try:
+                            import online_ref
+                            oanch = online_ref.stanza_anchors(
+                                ident.get("plain", ""), vlines,
+                                synced=ident.get("synced", "")) or None
+                        except Exception:
+                            oanch = None
                     # Abschnitte auf den GEWARPTEN Stems (konstantes Tempo) -> Grenzen
                     # liegen auf echten Taktlinien, Schnitt trifft die 1.
                     det_stems = ws if info else stems_dict
                     secs = core.detect_sections(det_stems, sr, t_db=wt_db, bpm=wbpm,
-                                                target_bars=8, vocal_lines=vlines)
+                                                target_bars=8, vocal_lines=vlines,
+                                                online_anchors=oanch)
                     if not secs:
                         self.root.after(0, lambda: status.config(
                             text="Keine Abschnitte erkannt – Stück evtl. zu kurz."))
@@ -3188,10 +3217,20 @@ class DisplayApp:
                      cfg.get("sheet_lang", "auto"))
         mvar = _menu(sheetf, 1, "Sheet-Modell", model_map,
                      cfg.get("sheet_model", "medium"))
+        v_online = tk.BooleanVar(value=bool(cfg.get("online_ref", False)))
+        tk.Checkbutton(sheetf, text="Online-Abgleich (Song im Netz identifizieren; "
+                       "unsichere Text-/Akkord-Stellen gewichtet korrigieren)",
+                       variable=v_online, font=self.f_small, bg=COL_BG, fg=COL_FG,
+                       selectcolor=COL_SURFACE, activebackground=COL_BG,
+                       activeforeground=COL_FG, bd=0, highlightthickness=0,
+                       wraplength=430, justify="left").grid(
+                           row=2, column=0, columnspan=2, sticky="w", pady=(4, 0))
         tk.Label(sheetf, text="Tipp: Sprache fest wählen – die Auto-Erkennung liegt "
-                 "bei Gesang oft daneben.", font=self.f_tiny, bg=COL_BG,
-                 fg=COL_MUTED, justify="left").grid(row=2, column=0, columnspan=2,
-                                                    sticky="w", pady=(4, 0))
+                 "bei Gesang oft daneben. Online-Abgleich: Quellen lrclib.net + "
+                 "cifraclub; sichere eigene Erkennung hat immer Vorrang.",
+                 font=self.f_tiny, bg=COL_BG,
+                 fg=COL_MUTED, justify="left", wraplength=430).grid(
+                     row=3, column=0, columnspan=2, sticky="w", pady=(4, 0))
 
         def _toggle_sheetopts():
             if v_sheet.get():
@@ -3326,7 +3365,8 @@ class DisplayApp:
             qual = next(v for lbl, v in qual_map if lbl == qvar.get())
             new_cfg = {**load_config(), "sheet_lang": lang, "sheet_model": model,
                        "stem_quality": qual, "stem_barcut": bool(v_barcut.get()),
-                       "deluge_gridlock": dl_grid.get()}
+                       "deluge_gridlock": dl_grid.get(),
+                       "online_ref": bool(v_online.get())}
             if out_dir:
                 new_cfg["last_save_dir"] = out_dir
             save_config(new_cfg)
@@ -3357,7 +3397,7 @@ class DisplayApp:
                           export=bool(v_export.get()), sheet=bool(v_sheet.get()),
                           play=bool(v_play.get()), stemmidi=bool(v_stemmidi.get()),
                           barcut=bool(v_barcut.get()), quicktest_s=qts,
-                          deluge=deluge_cfg,
+                          deluge=deluge_cfg, sheet_online=bool(v_online.get()),
                           out_dir=out_dir, overlap=overlap, shifts=shifts,
                           sep_model=sep_model, sep_backend=sep_backend,
                           language=None if lang == "auto" else lang, model=model)
@@ -3466,7 +3506,8 @@ class DisplayApp:
                 self._stem_log(log, "== Song-Sheet erstellen ==")
                 out["sheet"] = core.song_sheet_from_stems(
                     stems, ssr, title=title, whisper_size=actions["model"],
-                    language=actions["language"], log=cb)
+                    language=actions["language"], log=cb,
+                    online=bool(actions.get("sheet_online")))
                 # Wird kein eigener Stem-Player geoeffnet, spielt das Sheet-Fenster
                 # selbst den ganzen Mix ab (Mitlauf + Start/Stopp).
                 if not actions["play"]:

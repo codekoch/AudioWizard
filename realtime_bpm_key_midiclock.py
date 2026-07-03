@@ -204,6 +204,16 @@ CHORD_STICKY          = 0.02    # kleiner Score-Bonus fuer den zuletzt
                                 #   erkannten Akkord (nur noch fuer die
                                 #   Einzelbild-Funktion classify_chord; der
                                 #   Worker glaettet stattdessen per HMM, s. u.)
+CHORD_THIRD_MARGIN    = 0.04    # Dur/Moll-Terzcheck im Sheet: sagt die AKUSTIK
+                                #   (Roh-Score inkl. Bass) beim GLEICHEN Grundton
+                                #   klar das andere Terz-Geschlecht (Vorsprung >
+                                #   Margin), dann schlaegt sie die Tonart-Prioren
+                                #   -- sonst wuerden leiterfremde Borrowed Chords
+                                #   (Cm in G-Dur, Creep!) IMMER zur Dur-Variante
+                                #   gebogen (diatonic+func = +0.22 Handicap)
+# (Ein zusaetzlicher Chroma-Terz-Ratio-Check wurde 2026-07-03 gegen die
+# Ground-Truth-Sheets gemessen und brachte NETTO NICHTS (+-0.5pp) -> wieder
+# entfernt; der Roh-Score-Margin-Check oben reicht.)
 CHORD_SELF_P          = 0.85    # HMM-Glaettung (ChordTracker): Wahrschein-
                                 #   lichkeit, dass der Akkord von einer Analyse
                                 #   (~1 s) zur naechsten derselbe bleibt --
@@ -3406,15 +3416,20 @@ def _refine_types_with_lyrics(raw, types, vocal_lines, log=None):
     seg_tok = [[t for (ti, t) in words if a <= ti < b] for (a, b) in raw]
     seg_set = [set(t) for t in seg_tok]
     nw = [len(t) for t in seg_tok]
-    MIN_WORDS, LYR_SAME = 5, 0.5
+    # Jaccard ODER Containment: Jaccard findet gleich lange Wiederholungen;
+    # Containment (Schnitt/kleinere Menge) findet auch einen VERDOPPELTEN
+    # Schluss-Refrain (doppelt so viele Woerter -> Jaccard faellt unter die
+    # Schwelle, obwohl der kurze Refrain fast ganz enthalten ist).
+    MIN_WORDS, LYR_SAME, LYR_CONT = 5, 0.5, 0.6
     n = len(raw)
 
-    def sim(i, j):
+    def sim_ok(i, j):
         if nw[i] < MIN_WORDS or nw[j] < MIN_WORDS:
-            return 0.0
+            return False
         inter = len(seg_set[i] & seg_set[j])
         uni = len(seg_set[i] | seg_set[j]) or 1
-        return inter / uni
+        small = min(len(seg_set[i]), len(seg_set[j])) or 1
+        return (inter / uni >= LYR_SAME) or (inter / small >= LYR_CONT)
 
     parent = list(range(n))                               # Union-Find ueber Textaehnlichkeit
 
@@ -3425,17 +3440,20 @@ def _refine_types_with_lyrics(raw, types, vocal_lines, log=None):
         return x
     for i in range(n):
         for j in range(i + 1, n):
-            if sim(i, j) >= LYR_SAME:
+            if sim_ok(i, j):
                 ri, rj = find(i), find(j)
                 if ri != rj:
                     parent[rj] = ri
     grp = [find(i) for i in range(n)]
     gsize = Counter(grp)
     # neuer Schluessel: wiederkehrender Text -> eigene Klasse je Lyric-Gruppe (Refrain);
-    # sonst nach Audio-Typ (Strophe/instrumental). Disjunkte Schluesselraeume ("R"/"A")
-    # erzwingen die Trennung Refrain<->Strophe.
+    # Segmente MIT eindeutigem Text -> Audio-Typ (Strophen); Segmente OHNE Text ->
+    # EIGENER Namensraum (Instrumental/Intro/Solo) -- sonst erben Zwischenspiele das
+    # Strophen-Label, obwohl dort gar nicht gesungen wird. Disjunkte Schluesselraeume
+    # ("R"/"A"/"I") erzwingen die Trennung.
     keys = [("R", grp[i]) if (nw[i] >= MIN_WORDS and gsize[grp[i]] >= 2)
-            else ("A", int(types[i])) for i in range(n)]
+            else (("A", int(types[i])) if nw[i] >= MIN_WORDS
+                  else ("I", int(types[i]))) for i in range(n)]
     order, out = {}, []
     for k in keys:
         order.setdefault(k, len(order))
@@ -3447,21 +3465,26 @@ def _refine_types_with_lyrics(raw, types, vocal_lines, log=None):
 
 
 def detect_sections(stems, sr, t_db=None, bpm=None, target_bars=8, log=None,
-                    vocal_lines=None):
+                    vocal_lines=None, online_anchors=None):
     """Strukturelle Song-Abschnitte (Strophe/Refrain/Bridge ...) erkennen, indem
     WIEDERKEHRENDE Muster zusammengefasst werden (nicht nur gleichmaessige Takt-Bloecke),
-    und auf GANZE TAKTE (4/4) ausrichten. Schluessel-Annahme (User): gleiche Teile haben
-    die GLEICHEN AKKORDE/BASSLAEUFE. Daher nutzt die Erkennung NICHT den verrauschten
-    Gesamt-Mix, sondern die getrennte BEGLEITUNG (Bass + Rest, ohne Drums/Gesang):
-    agglomerative Grenzen am Begleitungs-Chroma (Akkord-/Klangwechsel) + Aehnlichkeits-
-    Cluster der Segmente nach Akkord- UND Basslauf-Chroma (gleiches Profil = gleicher
-    Typ). (Eine Laplacian-Recurrence-Segmentierung wurde getestet, kollabierte aber zu
-    grob; die akkord-/bass-basierte agglomerative Variante trifft die Wiederholungen
-    deutlich sauberer.) Zusaetzlich verfeinert – falls vocal_lines (Whisper-Text)
-    uebergeben – ein TEXTVERGLEICH die Typen: wiederkehrender Gesangstext = Refrain,
-    eindeutiger Text = Strophe (trennt beide auch bei aehnlicher Harmonik, s.
-    _refine_types_with_lyrics). vocal_lines muessen in DERSELBEN Zeitbasis liegen wie
-    die uebergebenen stems (also ggf. vorher mit warp_lines mitziehen).
+    und auf GANZE TAKTE (4/4) ausrichten. GRENZEN kommen aus einer takt-weisen
+    Novelty-Analyse ueber DREI Evidenzen (Eval 2026-07 an Creep/99 Luftballons: reine
+    Akkord-Grenzen kollabieren, wenn das GANZE Stueck dieselbe Folge spielt):
+      * Begleitungs-Chroma (Akkordwechsel) + MFCC (Klangfarbe),
+      * STEM-ENERGIE je Takt (Drums setzen ein/aus, Gesang da/weg, Bass-Drop --
+        typische Part-Wechsel auch bei identischer Harmonik),
+      * TEXT-ANKER: wiederkehrende ZEILENANFAENGE aus vocal_lines (der Refrain
+        beginnt fast immer mit derselben Phrase -> jede Wiederholung ist eine
+        Grenz-Kandidatin).
+    TYPEN (welche Segmente sind derselbe Teil) wie gehabt: Aehnlichkeits-Cluster nach
+    Akkord- UND Basslauf-Chroma; danach verfeinert der TEXTVERGLEICH die Typen
+    (wiederkehrender Text = Refrain, s. _refine_types_with_lyrics). vocal_lines
+    muessen in DERSELBEN Zeitbasis liegen wie die stems (ggf. warp_lines).
+    online_anchors (optional, s. online_ref.stanza_anchors): Strophen-Anker aus
+    der ONLINE-Referenzstruktur [{'t','gid','kind'}] in derselben Zeitbasis --
+    liefern harte GRENZEN an den Blockanfaengen und ueberstimmen die TYPEN
+    (Referenz weiss besser als Whisper, welche Bloecke derselbe Teil sind).
     Label: <Typ-Nummer><Instanz-Buchstabe> (1a,1b Strophen; 2a,2b,2c
     Refrains). Rueckgabe: Liste {start_bar, end_bar, label, type, start_sec, end_sec}
     (bar relativ zum Downbeat) oder []. t_db/bpm optional (sonst via detect_downbeat)."""
@@ -3514,26 +3537,157 @@ def detect_sections(stems, sr, t_db=None, bpm=None, target_bars=8, log=None,
         mf = librosa.feature.mfcc(y=_rs(mix), sr=an, hop_length=hop, n_mfcc=13)
         nf = min(ch_acc.shape[1], ch_bass.shape[1], mf.shape[1])
         fr = an / float(hop)
-        # Grenzen: an Akkord-/Klangwechseln (Begleitungs-Chroma + MFCC).
-        feat_bnd = np.vstack([2.0 * librosa.util.normalize(ch_acc[:, :nf], axis=0),
-                              librosa.util.normalize(mf[:, :nf], axis=0)])
         # Wiederkehr/Aehnlichkeit: Akkorde + Basslauf (genau das wiederholt sich).
         feat_cl = np.vstack([librosa.util.normalize(ch_acc[:, :nf], axis=0),
                              librosa.util.normalize(ch_bass[:, :nf], axis=0)])
-        n_sec = int(np.clip(round(n_bars_total / float(max(2, target_bars))), 3, 14))
-        bounds = librosa.segment.agglomerative(feat_bnd, n_sec)
-        bt = librosa.frames_to_time(np.asarray(bounds), sr=an, hop_length=hop)
-        bt = np.concatenate([[0.0], bt, [dur]])
+
+        # ---- takt-weise Feature-Matrix (Chroma + MFCC + Stem-Energie) ----
+        nb = n_bars_total
+        minb = max(2, int(target_bars) // 2)             # Mindestlaenge eines Parts
+
+        def _bar_frames(b):
+            f0 = int(max(0.0, (t_db + b * bar)) * fr)
+            f1 = int(max(0.0, (t_db + (b + 1) * bar)) * fr)
+            return f0, max(f0 + 1, min(f1, nf))
+
+        F = []                                            # je Takt ein Vektor
+        ch_n = librosa.util.normalize(ch_acc[:, :nf], axis=0)
+        mf_n = mf[:, :nf]
+        for b in range(nb):
+            f0, f1 = _bar_frames(b)
+            cvec = ch_n[:, f0:f1].mean(axis=1)
+            cn = np.linalg.norm(cvec)
+            cvec = cvec / cn if cn > 0 else cvec
+            F.append(np.concatenate([2.0 * cvec, mf_n[:, f0:f1].mean(axis=1)]))
+        F = np.asarray(F)
+        # MFCC-Anteil pro Koeffizient z-normieren (vergleichbare Skala zum Chroma)
+        mstd = F[:, 12:].std(axis=0)
+        mstd[mstd <= 1e-9] = 1.0
+        F[:, 12:] = 0.5 * (F[:, 12:] - F[:, 12:].mean(axis=0)) / mstd
+        # Stem-Energie je Takt (log-RMS, z-normiert): faengt Drums-Einsatz/-Pause,
+        # Gesang an/aus, Bass-Drop -- Part-Wechsel trotz identischer Akkorde.
+        E = []
+        for k in ("vocals", "drums", "bass", "other"):
+            a = stems.get(k)
+            if a is None:
+                continue
+            a = np.asarray(a, dtype=np.float32)
+            if a.ndim == 2:
+                a = a.mean(axis=1)
+            e = np.empty(nb)
+            for b in range(nb):
+                s0 = int(max(0.0, (t_db + b * bar)) * sr)
+                s1 = int(max(0.0, (t_db + (b + 1) * bar)) * sr)
+                seg = a[s0:min(s1, len(a))]
+                e[b] = np.sqrt(float(np.mean(seg * seg))) if len(seg) else 0.0
+            e = np.log1p(e / (np.median(e[e > 0]) + 1e-9) * 10.0)
+            st = e.std()
+            E.append(1.2 * (e - e.mean()) / (st if st > 1e-9 else 1.0))
+        if E:
+            F = np.hstack([F, np.stack(E, axis=1)])
+
+        # ---- Text-Wiederholung: wiederholte 5-Gramme aus dem WORTSTROM ----
+        # Robuster als Zeilenanfaenge (Whisper bricht Zeilen je Instanz anders um):
+        # ein 5-Gramm, das an zwei WEIT auseinanderliegenden Stellen vorkommt, ist
+        # wiederholter Text (Refrain). Daraus (a) je Takt der Anteil wiederholter
+        # Woerter als zusaetzliches Feature (Refrain-Plateau -> Novelty sieht die
+        # Kanten) und (b) harte GRENZ-ANKER an den ANFAENGEN wiederholter Bloecke.
+        anchors = set()
+        if vocal_lines:
+            import re as _re
+            stream = []                                   # (Zeit, Token)
+            for ln in vocal_lines:
+                for w in ln.get("words", []):
+                    for tok in _re.findall(r"[^\W\d_]+", (w.get("word") or "").lower()):
+                        stream.append((float(w.get("start", 0.0)), tok))
+            NGR = 5
+            occ = {}
+            for i in range(len(stream) - NGR + 1):
+                k5 = tuple(t for _, t in stream[i:i + NGR])
+                occ.setdefault(k5, []).append(i)
+            rep_w = np.zeros(len(stream), dtype=bool)     # Wort gehoert zu Wiederholung
+            for k5, idxs in occ.items():
+                if len(idxs) < 2:
+                    continue
+                ts = [stream[i][0] for i in idxs]
+                if max(ts) - min(ts) < minb * bar:        # nur echte Fern-Wiederholung
+                    continue
+                for i in idxs:
+                    rep_w[i:i + NGR] = True
+            if rep_w.any():
+                rep = np.zeros(nb)
+                cnt = np.zeros(nb)
+                for i, (t, _tok) in enumerate(stream):
+                    b = int((t - t_db) / bar)
+                    if 0 <= b < nb:
+                        cnt[b] += 1.0
+                        rep[b] += 1.0 if rep_w[i] else 0.0
+                rep = np.where(cnt > 0, rep / np.maximum(cnt, 1.0), 0.0)
+                st = rep.std()
+                F = np.hstack([F, (1.2 * (rep - rep.mean())
+                                   / (st if st > 1e-9 else 1.0))[:, None]])
+                # Anker: Blockanfang = wiederholtes Wort, dessen Vorgaenger nicht
+                # wiederholt ist (oder Gesangs-Luecke davor) -> Refrain-Start-Takt.
+                # NUR fuer LANGE Bloecke (>= 10 Woerter): kurze Wiederholungen
+                # ("I wish I was special") kommen auch mitten in Strophen vor und
+                # wuerden den Song in 4-Takt-Schnipsel fragmentieren (Creep-Eval);
+                # sie wirken weiter ueber das rep-Feature, nur nicht als harte Grenze.
+                for i in range(len(stream)):
+                    if not rep_w[i]:
+                        continue
+                    if i > 0 and rep_w[i - 1] and stream[i][0] - stream[i - 1][0] < 2.0:
+                        continue
+                    j = i                                  # Blockende suchen
+                    while j + 1 < len(stream) and rep_w[j + 1]:
+                        j += 1
+                    if j - i + 1 < 10:
+                        continue
+                    b = int(round((stream[i][0] - t_db) / bar))
+                    if 0 < b < nb:
+                        anchors.add(b)
+
+        # ---- Novelty je Taktgrenze: Kontrast der K Takte davor/danach ----
+        K = max(2, min(4, minb))
+        nov = np.zeros(nb)
+        for b in range(1, nb):
+            l0, r1 = max(0, b - K), min(nb, b + K)
+            u, v = F[l0:b].mean(axis=0), F[b:r1].mean(axis=0)
+            nu, nvv = np.linalg.norm(u), np.linalg.norm(v)
+            nov[b] = 1.0 - float(u @ v) / (nu * nvv) if nu > 0 and nvv > 0 else 0.0
+        thr = nov.mean() + 0.5 * nov.std()
+        peaks = [b for b in range(1, nb)
+                 if nov[b] >= thr and nov[b] == nov[max(0, b - 2):b + 3].max()]
+
+        # Online-Struktur-Anker (Referenz-Strophen) als zusaetzliche harte Grenzen
+        if online_anchors:
+            for a in online_anchors:
+                b = int(round((float(a.get("t", -1)) - t_db) / bar))
+                if 0 < b < nb:
+                    anchors.add(b)
+
+        # ---- Grenzen zusammenfuehren (Anker schlagen Peaks), Mindestabstand ----
+        cand = sorted(set([0, nb]) | set(peaks) | anchors)
+        bounds, last = [0], 0
+        for b in cand[1:]:
+            if b - last < minb:
+                # zu nah: Anker verdraengt einen schwaecheren Peak
+                if b in anchors and last not in anchors and last != 0 and bounds:
+                    bounds[-1] = b
+                    last = b
+                continue
+            if nb - b < minb and b != nb:
+                continue
+            bounds.append(b)
+            last = b
+        if bounds[-1] != nb:
+            bounds.append(nb)
+        raw = [(t_db + b0 * bar, t_db + b1 * bar)
+               for b0, b1 in zip(bounds, bounds[1:]) if b1 > b0]
+        _emit(log, f"Grenzen: {len(peaks)} Novelty-Peaks + {len(anchors)} Text-Anker "
+                   f"-> {len(raw)} Segmente.")
     except Exception as e:
         _emit(log, f"Abschnitts-Erkennung uebersprungen ({e}).")
         return []
-
-    # Grenzen (Zeit) -> Roh-Segmente (Frame-Bereiche) + mittleres Akkord/Bass-Feature
-    raw = []
-    for i in range(len(bt) - 1):
-        a, b = bt[i], bt[i + 1]
-        if b > a:
-            raw.append((a, b))
     if not raw:
         return []
     def seg_feat(a, b):
@@ -3557,6 +3711,40 @@ def detect_sections(stems, sr, t_db=None, bpm=None, target_bars=8, log=None,
     # was die reine Akkord-/Bass-Clusterung nicht zuverlaessig kann.
     if vocal_lines:
         types = _refine_types_with_lyrics(raw, types, vocal_lines, log=log)
+    # Online-Referenzstruktur ueberstimmt die Typen: welcher Referenz-Block
+    # (Strophe/Refrain der plainLyrics) deckt die Segmentmitte ab? Bloecke
+    # derselben Gruppe (gid) = derselbe Part-Typ. NUR fuer Segmente MIT Gesang:
+    # die Referenz-Bloecke wissen nichts von Instrumentals/Intro/Solo dazwischen
+    # -- die behalten ihren Typ (sonst klebt das Riff an der Strophe fest).
+    if online_anchors and vocal_lines:
+        wt = sorted(float(w.get("start", 0.0)) for ln in vocal_lines
+                    for w in ln.get("words", []))
+        wt = np.asarray(wt, dtype=float)
+        oa = sorted((float(a["t"]), int(a["gid"])) for a in online_anchors
+                    if a.get("t") is not None)
+        if oa and wt.size:
+            span = np.median([b2 - a2 for (a2, _g1), (b2, _g2)
+                              in zip(oa, oa[1:])]) if len(oa) > 1 else 30.0
+            n_ov = 0
+            for i, (a, b) in enumerate(raw):
+                n_words = int(np.searchsorted(wt, b) - np.searchsorted(wt, a))
+                if n_words < 5:                           # instrumental -> lassen
+                    continue
+                mid = 0.5 * (a + b)
+                gid, ta = None, None
+                for t_a, g in oa:
+                    if t_a <= mid + 1.0:
+                        gid, ta = g, t_a
+                    else:
+                        break
+                # nur wenn der Anker das Segment plausibel noch abdeckt
+                # (hart gedeckelt -- ein Anker darf nicht minutenlang "halten")
+                if gid is not None and (mid - ta) <= min(60.0,
+                                                         max(20.0, 1.5 * span)):
+                    types[i] = 1000 + gid                 # eigener Namensraum
+                    n_ov += 1
+            _emit(log, f"Online-Struktur: {n_ov}/{len(raw)} Segmente nach "
+                       "Referenz-Bloecken getypt.")
     seg_bars = [((a - t_db) / bar, (b - t_db) / bar, t)
                 for (a, b), t in zip(raw, types)]
 
@@ -3813,7 +4001,8 @@ def warp_lines(lines, info):
         for w in ln.get("words", []):
             s = float(np.interp(float(w.get("start", 0.0)), ms, mt))
             e = float(np.interp(float(w.get("end", w.get("start", 0.0))), ms, mt))
-            ws.append({"word": w.get("word", ""), "start": s, "end": e})
+            ws.append({"word": w.get("word", ""), "start": s, "end": e,
+                       "prob": float(w.get("prob", 1.0))})
         out.append({"text": ln.get("text", ""), "words": ws})
     return out
 
@@ -4082,7 +4271,8 @@ def transcribe_segments(audio, sr, size="medium", language=None, log=None,
                        + ("" if language else " (automatisch erkannt)"))
         for seg in segments:                # Generator -> hier laeuft die KI
             words = [{"word": (w.word or "").strip(),
-                      "start": float(w.start), "end": float(w.end)}
+                      "start": float(w.start), "end": float(w.end),
+                      "prob": float(getattr(w, "probability", 1.0) or 1.0)}
                      for w in (seg.words or []) if (w.word or "").strip()]
             if words:
                 lines.append({"text": seg.text.strip(), "words": words})
@@ -4097,7 +4287,8 @@ def transcribe_segments(audio, sr, size="medium", language=None, log=None,
         for seg in res.get("segments", []):
             words = [{"word": (w.get("word") or "").strip(),
                       "start": float(w.get("start", 0.0)),
-                      "end": float(w.get("end", 0.0))}
+                      "end": float(w.get("end", 0.0)),
+                      "prob": float(w.get("probability", 1.0) or 1.0)}
                      for w in seg.get("words", []) if (w.get("word") or "").strip()]
             if words:
                 lines.append({"text": (seg.get("text") or "").strip(),
@@ -4183,8 +4374,11 @@ def transcribe_aligned(audio, sr, size="medium", language=None, log=None):
         raw = [w for w in seg.get("words", []) if (w.get("word") or "").strip()]
         raw = _fill_word_times(raw, float(seg.get("start", 0.0)),
                                float(seg.get("end", 0.0)))
+        # prob: WhisperX-Align-Score als Sicherheits-Proxy (schlecht ausrichtbare
+        # Woerter sind oft auch verhoert); ohne Score -> 0.5 (unsicher).
         words = [{"word": w["word"].strip(), "start": float(w["start"]),
-                  "end": float(w["end"])} for w in raw]
+                  "end": float(w["end"]),
+                  "prob": float(w.get("score", 0.5) or 0.5)} for w in raw]
         if words:
             out.append({"text": (seg.get("text") or "").strip(), "words": words})
     if not out:
@@ -4289,11 +4483,15 @@ _TRIAD_MASK = _suffix_mask(("", "m"))
 
 
 def _merge_equal_chords(seq):
-    """Benachbarte gleiche Akkorde zu einem Abschnitt verschmelzen."""
+    """Benachbarte gleiche Akkorde zu einem Abschnitt verschmelzen. Die
+    Konfidenz-Margin des Abschnitts ist das MINIMUM der Teile (konservativ)."""
     out = []
     for s in seq:
         if out and out[-1]["chord"] == s["chord"]:
             out[-1]["end"] = s["end"]
+            if "margin" in s:
+                out[-1]["margin"] = min(out[-1].get("margin", s["margin"]),
+                                        s["margin"])
         else:
             out.append(dict(s))
     return out
@@ -4388,14 +4586,17 @@ def _chord_emissions(y, sr, bass_audio=None, beat_times=None, win_beats=2,
 
 
 def chord_sequence(y, sr, key=None, bass_audio=None, beat_times=None,
-                   win_beats=2, min_dur=1.2, triads_only=True, simple=True,
+                   win_beats=2, min_dur=None, triads_only=True, simple=True,
                    key_bias=0.12, bass_weight=None, harmonic_sep=True,
                    func_bias=None, log=None):
     """Offline-Akkordfolge eines ganzen Stuecks (ueber die vorhandene Erkennung
     chroma_pcp + chord_scores). Fuer ein lesbares Sheet stabilisiert:
       * je 'win_beats' Beats EIN Akkord (Chroma ueber das Fenster gemittelt),
       * 'triads_only': nur Dur-/Moll-Dreiklaenge (sonst 'simple': +7/m7),
-      * 'min_dur': zu kurze Abschnitte gehen im Nachbarn auf.
+      * 'min_dur': zu kurze Abschnitte gehen im Nachbarn auf. Default (None):
+        EIN Beat (aus dem Beat-Raster) -- ein fester Wert (frueher 1,2 s) frass
+        bei schnellem Harmonierhythmus ECHTE kurze Akkorde (Piano Man wechselt
+        je 1-2 Beats; GT-Eval: Gesamt-Accuracy 67%->73% durch diesen Fix).
     'bass_audio' (z. B. der getrennte Bass-Stem) liefert einen SAUBEREN Grundton
     -- das entscheidet zwischen tonverwandten Akkorden (C vs. Am, G vs. Em) und
     behebt die haeufigste Fehlerkennung. 'bass_weight' steuert dessen Gewicht.
@@ -4418,10 +4619,31 @@ def chord_sequence(y, sr, key=None, bass_audio=None, beat_times=None,
     bt = np.asarray(beat_times, dtype=float) if beat_times is not None else None
     if bt is None or bt.size < 2:
         bt = np.arange(0.0, dur, 0.5)       # Ausweich: feste 0,5-s-Fenster
-    # Beats zu Fenstern von win_beats gruppieren (weniger, ruhigere Akkorde)
-    edges = list(bt[::max(1, int(win_beats))])
-    if edges[-1] < bt[-1]:
+    # Beat-Raster auf die GANZE Songlaenge ausdehnen: beat_track auf dem Drums-Stem
+    # liefert erst ab dem Drum-Einsatz Beats -> ohne Verlaengerung bekaeme ein
+    # ruhiges Intro/Outro (z. B. 99 Luftballons) KEINE Akkordfenster und damit
+    # keine Akkorde im Sheet. Extrapolation mit dem Median-Beatabstand.
+    if bt.size >= 2:
+        ibi = float(np.median(np.diff(bt)))
+        if ibi > 0:
+            if bt[0] > ibi:
+                pre = np.arange(bt[0] - ibi, ibi * 0.25, -ibi)[::-1]
+                bt = np.concatenate([pre, bt])
+            if dur - bt[-1] > ibi:
+                post = np.arange(bt[-1] + ibi, dur, ibi)
+                bt = np.concatenate([bt, post])
+    if min_dur is None:                        # beat-relativ: 1 Beat Mindestdauer
+        ibi0 = float(np.median(np.diff(bt))) if bt.size >= 2 else 0.65
+        min_dur = float(min(1.2, max(0.4, ibi0)))
+    # Beats zu Fenstern von win_beats gruppieren (weniger, ruhigere Akkorde).
+    # (Eine PHASEN-adaptive Fensterwahl -- beide 2-Beat-Phasen rechnen, die mit
+    # hoeherer Roh-Konfidenz gewinnt -- wurde 2026-07-03 gegen die Ground-Truth-
+    # Sheets gemessen: kein Gewinn, doppelte Laufzeit -> verworfen.)
+    wb = max(1, int(win_beats))
+    edges = [float(x) for x in bt[::wb]]
+    if edges[-1] < float(bt[-1]):
         edges.append(float(bt[-1]))
+    edge_cands = [edges]
     if harmonic_sep:
         _emit(log, "Trenne harmonischen Anteil (einmalig) …")
         try:
@@ -4450,43 +4672,88 @@ def chord_sequence(y, sr, key=None, bass_audio=None, beat_times=None,
     fbias = (_function_bias(key, CHORD_FUNC_BIAS if func_bias is None else func_bias)
              if key else None)
     allowed = _TRIAD_MASK if triads_only else (_SHEET_MASK if simple else None)
-    _emit(log, f"Bestimme Akkorde ({max(0, len(edges) - 1)} Fenster) …")
-    raw, prev = [], None
     minlen = int(0.05 * sr)
-    # Kurze Akkordfenster lassen die CQT "n_fft zu gross"-Warnungen fluten
-    # (harmlos, nur Zero-Padding) -- hier lokal unterdruecken.
-    with warnings.catch_warnings():
-        warnings.simplefilter("ignore")
+
+    def _win_scores(edges):
+        """Je Fenster (start, end, raw0|None) + Phasen-Guete (mittlerer bester
+        Roh-Score). raw0=None: Fenster still (Energie-Gate) oder unbrauchbar.
+        Das Energie-Gate verhindert Geister-Akkorde in Fade-in/-out."""
+        rms = []
         for i in range(len(edges) - 1):
             a, b = int(edges[i] * sr), int(edges[i + 1] * sr)
-            if b - a < minlen:
-                continue
-            res = chroma_pcp(yh[a:b], sr, y_harm=yh[a:b])
-            ch = prev or "—"
-            if res:
-                pcp, bass = res[0], res[1]
-                if bass_cg is not None:                # sauberer Stem-Bass
-                    f0 = int(edges[i] * sr / CHROMA_HOP)
-                    f1 = max(f0 + 1, int(edges[i + 1] * sr / CHROMA_HOP))
-                    bv = bass_cg[:, f0:min(f1, bass_cg.shape[1])].mean(axis=1)
-                    bs = bv.sum()
-                    bass = bv / bs if bs > 0 else bass
-                scores = chord_scores(pcp, bass, bass_weight=bass_weight)
-                if scores is not None:
-                    if prev is not None:
-                        k = _CHORD_IDX.get(prev)
-                        if k is not None:
-                            scores[k] += CHORD_STICKY
-                    if diatonic is not None:
-                        scores = scores + key_bias * diatonic
-                    if fbias is not None:
-                        scores = scores + fbias
-                    if allowed is not None:
-                        scores = np.where(allowed, scores, -1e9)
-                    ch = CHORD_NAMES[int(np.argmax(scores))]
-            raw.append({"start": float(edges[i]), "end": float(edges[i + 1]),
-                        "chord": ch})
-            prev = ch
+            seg = yh[a:min(b, len(yh))]
+            rms.append(np.sqrt(float(np.mean(seg * seg))) if len(seg) else 0.0)
+        med = float(np.median([r for r in rms if r > 0]) or 0.0)
+        gate = 0.03 * med
+        out, tot, nok = [], 0.0, 0
+        # Kurze Fenster fluten CQT-"n_fft zu gross"-Warnungen (harmlos).
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore")
+            for i in range(len(edges) - 1):
+                a, b = int(edges[i] * sr), int(edges[i + 1] * sr)
+                if b - a < minlen:
+                    continue
+                if rms[i] <= gate:
+                    out.append((float(edges[i]), float(edges[i + 1]), None))
+                    continue
+                res = chroma_pcp(yh[a:b], sr, y_harm=yh[a:b])
+                raw0 = None
+                if res:
+                    pcp, bass = res[0], res[1]
+                    if bass_cg is not None:            # sauberer Stem-Bass
+                        f0 = int(edges[i] * sr / CHROMA_HOP)
+                        f1 = max(f0 + 1, int(edges[i + 1] * sr / CHROMA_HOP))
+                        bv = bass_cg[:, f0:min(f1, bass_cg.shape[1])].mean(axis=1)
+                        bs = bv.sum()
+                        bass = bv / bs if bs > 0 else bass
+                    raw0 = chord_scores(pcp, bass, bass_weight=bass_weight)
+                if raw0 is not None:
+                    mask = np.where(allowed, raw0, -1e9) if allowed is not None \
+                        else raw0
+                    tot += float(mask.max())
+                    nok += 1
+                out.append((float(edges[i]), float(edges[i + 1]), raw0))
+        return out, (tot / nok if nok else -1e9)
+
+    _emit(log, f"Bestimme Akkorde ({max(0, len(edge_cands[0]) - 1)} Fenster) …")
+    wins, _quality = _win_scores(edge_cands[0])
+
+    raw, prev = [], None
+    for (t0, t1, raw0) in wins:
+        if raw0 is None:
+            raw.append({"start": t0, "end": t1, "chord": "—", "margin": 0.0})
+            prev = None
+            continue
+        scores = raw0.copy()
+        if prev is not None:
+            k = _CHORD_IDX.get(prev)
+            if k is not None:
+                scores[k] += CHORD_STICKY
+        if diatonic is not None:
+            scores = scores + key_bias * diatonic
+        if fbias is not None:
+            scores = scores + fbias
+        if allowed is not None:
+            scores = np.where(allowed, scores, -1e9)
+        kb = int(np.argmax(scores))
+        # Dur/Moll-Terzcheck: die Prioren (diatonisch/Funktion) duerfen ein KLAR
+        # klingendes Terz-Geschlecht nicht ueberstimmen. Sonst wird jeder
+        # Borrowed Chord (Cm in G-Dur) zur Dur-Variante gebogen.
+        T = len(CHORD_TYPES)
+        t = kb % T
+        if t in (0, 1):
+            ka = kb - t + (1 - t)                  # Gegenstueck gleichen Grundtons
+            if ((allowed is None or allowed[ka])
+                    and raw0[ka] - raw0[kb] > CHORD_THIRD_MARGIN):
+                kb = ka
+        ch = CHORD_NAMES[kb]
+        # Konfidenz-Margin: Abstand zum besten ANDEREN Akkord (roh, akustische
+        # Evidenz) -- kleine Margin = unsichere Stelle (Online-Abgleich).
+        oth = np.where(allowed, raw0, -1e9) if allowed is not None else raw0.copy()
+        oth[kb] = -1e9
+        marg = float(raw0[kb] - oth.max())
+        raw.append({"start": t0, "end": t1, "chord": ch, "margin": marg})
+        prev = ch
     seq = _merge_equal_chords(raw)
     seq = _merge_short_chords(seq, min_dur)
     _emit(log, f"{len(seq)} Akkord-Abschnitte.")
@@ -4673,14 +4940,19 @@ def accompaniment_from_stems(stems):
 
 
 def song_sheet_from_stems(stems, sr, title="", whisper_size="medium",
-                          language=None, snap=False, log=None):
+                          language=None, snap=False, log=None, online=False):
     """Chord-Sheet aus BEREITS getrennten Stems bauen (Schritte 2-4). So muss
     die teure Stem-Trennung nur einmal laufen, wenn neben dem Sheet z. B. auch
     der Stem-Export gewuenscht ist. Rueckgabe wie song_sheet().
     snap=True zieht die Whisper-Wortzeiten auf die naechsten Gesang-Onsets. Tests
     zeigten KEINE verlaessliche Verbesserung (Gesang hat sehr dichte Onsets ~3/s,
     'naechster Onset' ist eher Rauschen) -> standardmaessig AUS. Wortgenaue
-    Alignment braucht eher Forced Alignment (z. B. WhisperX/wav2vec2)."""
+    Alignment braucht eher Forced Alignment (z. B. WhisperX/wav2vec2).
+    online=True: OPTIONALER Internet-Abgleich (online_ref) -- Song per Hook-Text
+    identifizieren (LRCLIB), unsichere Whisper-Woerter gewichtet korrigieren und
+    unsichere Akkord-Stellen mit einem Referenz-Sheet (cifraclub) fusionieren.
+    Faellt bei JEDEM Problem (offline, nichts gefunden, Quelle zu unsicher)
+    still auf die interne Erkennung zurueck."""
     vocals = stems.get("vocals")
     if vocals is None:
         raise RuntimeError("Kein Gesang-Stem erhalten (Modell ohne 'vocals'?).")
@@ -4703,6 +4975,24 @@ def song_sheet_from_stems(stems, sr, title="", whisper_size="medium",
                                     language=language, log=log)
         if snap:
             snap_words_to_onsets(lines, vocals, sr, log=log)
+
+    # Optionaler ONLINE-ABGLEICH (Text): Song identifizieren, unsichere Woerter
+    # gewichtet korrigieren. Referenz-Sheet fuer die Akkord-Fusion s. unten.
+    ident = None
+    if online:
+        _emit(log, "== Online-Abgleich (optional) ==")
+        try:
+            import online_ref
+            v = np.asarray(vocals, dtype=np.float32)
+            ident = online_ref.identify_song(
+                lines, dur=len(v) / float(sr), title_hint=title, log=log)
+            if ident and ident.get("conf", 0.0) >= 0.35 and ident.get("plain"):
+                online_ref.correct_lines(lines, ident["plain"], log=log)
+            elif ident:
+                _emit(log, "Online-Treffer zu unsicher – Text bleibt intern.")
+        except Exception as e:
+            _emit(log, f"Online-Abgleich uebersprungen ({e}).")
+            ident = None
 
     _emit(log, "== Tonart + Akkorde bestimmen ==")
 
@@ -4747,6 +5037,21 @@ def song_sheet_from_stems(stems, sr, title="", whisper_size="medium",
     chords = chord_sequence(harm, sr, key=key, bass_audio=bass_mono,
                             beat_times=beats, harmonic_sep=not drum_free, log=log)
 
+    # Optionaler ONLINE-ABGLEICH (Akkorde): Referenz-Sheet holen, Akkorde per
+    # Text-Alignment zeitlich verankern, beste Stufen-Transposition bestimmen
+    # (= Vertrauensmass) und NUR unsichere eigene Stellen angleichen.
+    if online and ident and ident.get("conf", 0.0) >= 0.35:
+        try:
+            import online_ref
+            sheets = online_ref.fetch_chord_sheets(ident["artist"],
+                                                   ident["title"], log=log)
+            if sheets:
+                # Voting: das Sheet mit der hoechsten Uebereinstimmung gewinnt.
+                if online_ref.best_sheet_fusion(chords, sheets, lines, log=log)[0]:
+                    chords = _merge_equal_chords(chords)
+        except Exception as e:
+            _emit(log, f"Akkord-Abgleich uebersprungen ({e}).")
+
     _emit(log, "== Chord-Sheet zusammensetzen ==")
     lead = chord_lead_for_bpm(bpm)             # ~1 Beat Vorlauf (tempoabhaengig)
     text, chordpro = build_chord_sheet(lines, chords, title=title,
@@ -4757,16 +5062,17 @@ def song_sheet_from_stems(stems, sr, title="", whisper_size="medium",
 
 
 def song_sheet(path, model="htdemucs", whisper_size="medium", language=None,
-               log=None):
+               log=None, online=False):
     """Komplettpipeline: Datei -> Stems (Gesang isolieren) -> Text (Whisper) +
     Akkorde (Begleitung) -> Chord-Sheet. Rueckgabe-dict mit 'text', 'chordpro',
-    'key', 'bpm', 'lines', 'chords'. OFFLINE, kann einige Minuten dauern."""
+    'key', 'bpm', 'lines', 'chords'. OFFLINE (online=True: optionaler
+    Internet-Abgleich fuer Text/Akkorde), kann einige Minuten dauern."""
     _emit(log, "== Gesang per KI heraustrennen ==")
     stems, sr = separate_stems(path, model, log=log)
     title = os.path.splitext(os.path.basename(path))[0]
     return song_sheet_from_stems(stems, sr, title=title,
                                  whisper_size=whisper_size,
-                                 language=language, log=log)
+                                 language=language, log=log, online=online)
 
 
 class StemPlayer:
@@ -6852,10 +7158,12 @@ def run_stems_export(path, out_dir=None):
     print("Fertig.")
 
 
-def run_song_sheet(path, out_dir=None, language=None, whisper_size="medium"):
+def run_song_sheet(path, out_dir=None, language=None, whisper_size="medium",
+                   online=False):
     """Konsole: Gesang heraustrennen + transkribieren, Akkorde bestimmen und ein
     Chord-Sheet schreiben (Text + ChordPro). Offline, kann einige Minuten dauern.
-    language: 'de'/'en'/... erzwingt die Sprache (bei Gesang empfohlen)."""
+    language: 'de'/'en'/... erzwingt die Sprache (bei Gesang empfohlen).
+    online=True: optionaler Internet-Abgleich (Text/Akkorde, gewichtet)."""
     if not os.path.exists(path):
         sys.exit(f"Datei nicht gefunden: {path}")
     if not demucs_available():
@@ -6870,7 +7178,8 @@ def run_song_sheet(path, out_dir=None, language=None, whisper_size="medium"):
     print(f"  Sprache: {language or 'automatisch'}  ·  Modell: {whisper_size}")
     try:
         res = song_sheet(path, model="htdemucs", whisper_size=whisper_size,
-                         language=language, log=lambda m: print("  " + m))
+                         language=language, log=lambda m: print("  " + m),
+                         online=online)
     except Exception as e:
         sys.exit(f"Song-Sheet fehlgeschlagen: {e}")
     base = sanitize_filename(res.get("title") or
@@ -6965,11 +7274,13 @@ def main():
 
     # Song-Sheet: Gesangstext (Whisper) + Akkorde -> Text + ChordPro
     #   --lang de|en (Sprache erzwingen, empfohlen)  --whisper small|medium|large-v3
+    #   --online (Internet-Abgleich: Text/Akkorde gewichtet korrigieren)
     sheet_path = _arg_value('--sheet')
     if sheet_path:
         run_song_sheet(sheet_path, _arg_value('--out'),
                        language=_arg_value('--lang'),
-                       whisper_size=_arg_value('--whisper') or "medium")
+                       whisper_size=_arg_value('--whisper') or "medium",
+                       online=('--online' in sys.argv))
         return
 
     winmm = None
