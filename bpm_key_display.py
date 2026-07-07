@@ -2141,10 +2141,11 @@ class DisplayApp:
         self._small_button(win, "Schließen", win.destroy).pack(pady=(0, 10))
         win._a2m_save_vars = (sel, cutv, namev)   # Tk-Variablen vor GC schuetzen
 
-    def _bh_text_dialog(self, parent, store, lbl=None):
+    def _bh_text_dialog(self, parent, store, lbl=None, short=False):
         """Kleines Fenster: Songtext aus BandHelper einfuegen (Karaoke-Automation,
         Modus 'vorgegebener Text'). Ergebnis in store['text']; lbl zeigt den
-        Status an. Leer = AudioWizard erzeugt selbst ChordPro (+Zip)."""
+        Status an (short=True: Kurzform fuer Listenzeilen im Stapel-Dialog).
+        Leer = AudioWizard erzeugt selbst ChordPro (+Zip)."""
         win = tk.Toplevel(self.root)
         win.title("Text aus BandHelper")
         win.configure(bg=COL_BG)
@@ -2189,9 +2190,11 @@ class DisplayApp:
             if lbl is not None:
                 if store["text"].strip():
                     n = len(store["text"].split("\n"))
-                    lbl.config(text=f"✓ BandHelper-Text übernommen ({n} Zeilen)")
+                    lbl.config(text=(f"✓ {n} Zeilen" if short else
+                                     f"✓ BandHelper-Text übernommen ({n} Zeilen)"))
                 else:
-                    lbl.config(text="kein Text – ChordPro-Zip wird miterzeugt")
+                    lbl.config(text=("– ChordPro" if short else
+                                     "kein Text – ChordPro-Zip wird miterzeugt"))
             _close()
 
         row = tk.Frame(win, bg=COL_BG)
@@ -2392,6 +2395,60 @@ class DisplayApp:
             v_bh.set(False)
             cb_bh.config(state="disabled")
         cb_bh.pack(anchor="w", pady=(4, 0))
+        # Pro Datei optional ein BandHelper-Text (wie im Einzel-Dialog); Dateien
+        # ohne Text landen als ChordPro im Sammel-Zip. Liste ist scrollbar.
+        bh_texts = {p: {"text": ""} for p in paths}
+        bhf = tk.Frame(win, bg=COL_BG)
+        tk.Label(bhf, text="Vorhandene BandHelper-Texte zuweisen (optional):",
+                 font=self.f_tiny, bg=COL_BG, fg=COL_MUTED,
+                 anchor="w").pack(anchor="w")
+        lstf = tk.Frame(bhf, bg=COL_BG)
+        lstf.pack(fill="x")
+        cvs = tk.Canvas(lstf, bg=COL_BG, highlightthickness=0, bd=0,
+                        width=440, height=min(160, 30 * len(paths) + 4))
+        sb = tk.Scrollbar(lstf, orient="vertical", command=cvs.yview)
+        inner = tk.Frame(cvs, bg=COL_BG)
+        cvs.create_window((0, 0), window=inner, anchor="nw")
+        cvs.configure(yscrollcommand=sb.set)
+        cvs.pack(side="left", fill="x", expand=True)
+        if len(paths) > 5:
+            sb.pack(side="right", fill="y")
+
+        def _mk_row(p):
+            row = tk.Frame(inner, bg=COL_BG)
+            row.pack(anchor="w", fill="x", pady=1)
+            nm = os.path.basename(p)
+            if len(nm) > 34:
+                nm = nm[:33] + "…"
+            tk.Label(row, text=nm, font=self.f_tiny, bg=COL_BG, fg=COL_FG,
+                     anchor="w", width=36).pack(side="left")
+            st = tk.Label(row, text="– ChordPro", font=self.f_tiny, bg=COL_BG,
+                          fg=COL_MUTED, anchor="w", width=12)
+            self._small_button(row, "Text…",
+                               lambda p=p, st=st: self._bh_text_dialog(
+                                   win, bh_texts[p], st, short=True)).pack(
+                                       side="left", padx=(4, 0))
+            st.pack(side="left", padx=(6, 0))
+
+        for p in paths:
+            _mk_row(p)
+        inner.update_idletasks()
+        cvs.configure(scrollregion=cvs.bbox("all"))
+
+        def _wheel(ev):
+            cvs.yview_scroll(int(-ev.delta / 120), "units")
+
+        bhf.bind("<Enter>", lambda e: cvs.bind_all("<MouseWheel>", _wheel))
+        bhf.bind("<Leave>", lambda e: cvs.unbind_all("<MouseWheel>"))
+
+        def _toggle_bh():
+            if v_bh.get():
+                bhf.pack(padx=20, pady=(4, 0), anchor="w", fill="x",
+                         before=fmtf)
+            else:
+                bhf.pack_forget()
+
+        cb_bh.config(command=_toggle_bh)
         fmtf = tk.Frame(win, bg=COL_BG)
         fmtf.pack(padx=20, pady=(6, 0), anchor="w")
         tk.Label(fmtf, text="Format:", font=self.f_tiny, bg=COL_BG,
@@ -2425,28 +2482,34 @@ class DisplayApp:
                 return
             fmt = fmtv.get()
             bh = bool(v_bh.get())
+            btexts = {p: bh_texts[p]["text"] for p in paths}  # Snapshot
             save_config({**load_config(), "last_save_dir": out_dir,
                          "mixout_fmt": fmt})
             win.destroy()
+            n_ref = sum(1 for t in btexts.values() if t.strip())
             log = self._stem_log_open("Stapel: Play-Along-Mixe")
             self._stem_log(log, f"{len(paths)} Datei(en) → {len(variants)} "
                            f"Variante(n) je Datei, Format {fmt.upper()}"
-                           + (", + BandHelper-Automation/ChordPro" if bh else "")
+                           + (f", + BandHelper-Automation ({n_ref} mit "
+                              "eigenem Text, Rest ChordPro)" if bh else "")
                            + ".")
             threading.Thread(target=self._batch_playalong_worker,
-                             args=(paths, variants, fmt, out_dir, bh, log),
+                             args=(paths, variants, fmt, out_dir, bh, btexts,
+                                   log),
                              daemon=True).start()
 
         self._small_button(win, "Los…", _go).pack(pady=(2, 2))
         self._small_button(win, "Abbrechen", win.destroy).pack(pady=(0, 10))
         win._a2m_batch_vars = (v_db, v_kar, fmtv, v_bh)  # Tk-Vars vor GC schuetzen
 
-    def _batch_playalong_worker(self, paths, variants, fmt, out_dir, bh, log):
+    def _batch_playalong_worker(self, paths, variants, fmt, out_dir, bh,
+                                bh_texts, log):
         """Hintergrund-Stapel: je Datei EINMAL trennen, dann alle gewaehlten
         Varianten mischen und speichern; mit bh zusaetzlich je Datei die
-        BandHelper-Automationsspur (Karaoke) und am Ende EIN ChordPro-Zip fuer
-        den BandHelper-Import. Ein Fehler bei einer Datei stoppt den Stapel
-        nicht -- es geht mit der naechsten weiter."""
+        BandHelper-Automationsspur (Karaoke) -- mit zugewiesenem BandHelper-Text
+        (bh_texts[pfad]) passend zu DESSEN Anzeige-Zeilen, sonst mit eigenem
+        ChordPro, das am Ende gesammelt als EIN Zip fuer den Import entsteht.
+        Ein Fehler bei einer Datei stoppt den Stapel nicht."""
         cb = lambda m: self._stem_log(log, m)
         total = len(paths)
         ok = 0
@@ -2480,7 +2543,8 @@ class DisplayApp:
                             log=cb, online=bool(cfgb.get("online_ref")))
                         _tp, cptxt = core.write_bandhelper_automation(
                             out_dir, core.sanitize_filename(name), sh,
-                            len(mix) / float(ssr), log=cb)
+                            len(mix) / float(ssr),
+                            ref_text=(bh_texts or {}).get(path, ""), log=cb)
                         if cptxt is not None:
                             pros.append((name, cptxt))
                     except Exception as ex:

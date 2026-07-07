@@ -73,8 +73,9 @@ siehe [Webversion](#webversion-browser).
   unter **Automationsspur → Einfügen** einsetzen und den Play-Along-Mix als
   Aufnahme anhängen. Beim Abspielen startet die Aufnahme und die Textzeilen
   werden **0,3 s vor dem Einsatz** markiert. Text vorher aus BandHelper kopieren
-  (**„Text aus BandHelper…"**) – oder ohne Vorlage das miterzeugte
-  **ChordPro-Zip** importieren (gleiches Format wie
+  (**„Text aus BandHelper…"**; im Stapel per **„Text…"** neben jeder Datei) –
+  oder ohne Vorlage das miterzeugte **ChordPro-Zip** importieren (gleiches
+  Format wie
   [UltimateGuitar2Bandhelper](https://github.com/codekoch/UltimateGuitar2Bandhelper)).
 - **Spuren → MIDI aufnehmen:** MIDI-Ausgang einstellen → **Datei …** →
   **Stems → MIDI** → im Stem-Player Spuren/Kanäle wählen, **MIDI-Clock mitsenden**
@@ -254,7 +255,8 @@ siehe [Webversion](#webversion-browser).
   eigene Markierungen (kurz nach dem letzten gesungenen Wort davor), damit man
   auch in Instrumentalteilen sieht, wo man ist. Zwei Wege für die
   Zeilennummern: **(1)** den vorhandenen Songtext **aus BandHelper einfügen**
-  („Text aus BandHelper…") – die Nummern passen dann exakt zu dessen Anzeige
+  („Text aus BandHelper…"; in der Stapelverarbeitung hat jede Datei ihren
+  eigenen **„Text…"**-Knopf) – die Nummern passen dann exakt zu dessen Anzeige
   (reine Akkordzeilen und Leerzeilen verschieben nur die Nummerierung,
   unsicher zugeordnete Zeilen werden weggelassen, Wiederholungen landen dank
   monotonem Alignment im richtigen Refrain); **(2)** ohne Vorlage erzeugt
