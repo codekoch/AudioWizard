@@ -37,6 +37,7 @@ Eingänge; unter macOS leistet das ein virtuelles Ausgabegerät wie
 | **Noten/Akkorde → MIDI** | Erkannte Tonhöhen live als MIDI senden (mono/poly/Akkord). |
 | **Datei → MIDI-Clock** | Audiodatei mit driftfreier Clock abspielen, mit ▶ Start / ■ Stopp. |
 | **Stems** | Gesang/Bass/Drums/Rest lokal trennen (Demucs) – exportieren oder abspielen. |
+| **Play-Along-Mix** | Instrumente aus dem **Gesamtmix ausblenden** (Bass/Drums/Rest/Gesang beliebig): die übrigen Stems werden wieder zu **einer Datei** gemischt – z. B. ohne Gesang = Karaoke, ohne Bass = Übe-Playback. Als **MP3 (320 kbit/s)** oder **WAV**. Optional mit **BandHelper-Automation** (Karaoke-Zeilenmarkierung passend zur Aufnahme) + ChordPro-Zip. |
 | **Song-Sheet** | Gesangstext + Akkorde im Ultimate-Guitar-Stil (lokal, Whisper + Forced Alignment); optional **Online-Abgleich** (Song identifizieren, unsichere Text-/Akkord-Stellen gewichtet gegen Internet-Referenzen korrigieren). |
 | **Stems → MIDI** | Bass/Rest/Gesang via Basic Pitch nach MIDI, je Kanal; optional MIDI-Clock mitsenden; als `.mid` speichern. |
 | **Schlagzeug → MIDI** | Drums in Kick/Snare/HiHat (+ optional Tom/Crash) zerlegen, Note je Komponente frei wählbar; Standard GM-Drum-Map auf Kanal 10. |
@@ -58,6 +59,23 @@ siehe [Webversion](#webversion-browser).
   Text-/Akkord-Korrektur aus dem Netz) → **Los**; Ergebnis als `.txt`/`.chordpro`.
 - **Stems exportieren:** **Datei …** → **Stems exportieren**, Stem-Qualität **Hoch**
   → Zielordner.
+- **Play-Along-Mix (Instrumente ausblenden):** **Datei …** → **Play-Along-Mix
+  erstellen** anhaken, auszublendende Spuren (z. B. **Gesang**) + Format
+  (**MP3**/**WAV**) wählen → **Los** → Zielordner. Auch nachträglich im
+  Stem-Player: **„🎤 Play-Along-Mix…"**.
+- **Viele Songs auf einmal (Stapel):** Einstellungen → **„Stapel: Play-Along …"**
+  → beliebig viele Audiodateien wählen → Varianten (**nur Drums + Bass** und/oder
+  **alles ohne Gesang**) + Format wählen → **Los…** → Zielordner. Läuft
+  unbeaufsichtigt durch; Fehler bei einer Datei stoppen den Stapel nicht.
+- **Karaoke in BandHelper:** beim Play-Along-Mix (einzeln oder Stapel)
+  **BandHelper-Automation** anhaken → pro Song entsteht
+  `Name_bandhelper_automation.txt`; den Inhalt in BandHelper (Web) beim Song
+  unter **Automationsspur → Einfügen** einsetzen und den Play-Along-Mix als
+  Aufnahme anhängen. Beim Abspielen startet die Aufnahme und die Textzeilen
+  werden **0,3 s vor dem Einsatz** markiert. Text vorher aus BandHelper kopieren
+  (**„Text aus BandHelper…"**) – oder ohne Vorlage das miterzeugte
+  **ChordPro-Zip** importieren (gleiches Format wie
+  [UltimateGuitar2Bandhelper](https://github.com/codekoch/UltimateGuitar2Bandhelper)).
 - **Spuren → MIDI aufnehmen:** MIDI-Ausgang einstellen → **Datei …** →
   **Stems → MIDI** → im Stem-Player Spuren/Kanäle wählen, **MIDI-Clock mitsenden**
   an → **▶**; die DAW nimmt taktsynchron auf. Alternativ **MIDI speichern…** (`.mid`).
@@ -201,6 +219,53 @@ siehe [Webversion](#webversion-browser).
   es zum Laden) oder die `demucs.api` fehlt – ist die installierte Demucs-/
   PyTorch-Version unvollständig, weicht das Programm automatisch auf einen anderen
   Weg aus.
+- **Play-Along-Mix (Instrumente ausblenden)** (optional) – aus den getrennten
+  Stems wird der Song **ohne beliebige Spuren** neu gemischt (Bass, Drums, Rest,
+  Gesang – einzeln oder kombiniert): ohne Gesang = **Karaoke-Version**, ohne
+  Bass oder Drums = **Übe-Playback** zum Mitspielen. Die übrigen Spuren werden
+  unverändert summiert (die Demucs-Stems ergeben zusammen praktisch das
+  Original – der Mix klingt daher wie der Song, nur ohne die gewählten
+  Instrumente; nur bei Übersteuerung wird der Pegel minimal abgesenkt).
+  Ergebnis wahlweise als **MP3 mit 320 kbit/s** (direkt über libsndfile/LAME,
+  kein FFmpeg nötig) oder als **WAV**. Erreichbar im Dialog „Was soll
+  passieren?" (**„Play-Along-Mix erstellen"** – mit allen anderen Aktionen
+  kombinierbar, die teure Trennung läuft trotzdem nur einmal) und nachträglich
+  im Stem-Player (**„🎤 Play-Along-Mix…"**); ausgeblendete Spuren und Format
+  werden fürs nächste Mal gemerkt. Für ganze Song-Sammlungen gibt es die
+  **Stapelverarbeitung** (Einstellungen → **„Stapel: Play-Along …"**): beliebig
+  viele Audiodateien wählen, dann entsteht je Datei wahlweise **„nur Drums +
+  Bass"** (Rhythmusgruppe zum Mitspielen) und/oder **„alles ohne Gesang"**
+  (Karaoke) – jede Datei wird einmal getrennt, ein Fortschritts-/Log-Fenster
+  zeigt den Stand, und eine fehlerhafte Datei wird übersprungen statt den
+  Stapel abzubrechen (`Name_nur_Drums-Bass.mp3`, `Name_ohne_Gesang.mp3`).
+  **Karaoke-Kopplung mit BandHelper:** Das Häkchen **„BandHelper-Automation"**
+  erzeugt zusätzlich `Name_bandhelper_automation.txt` – eine fertige
+  **Automationsspur** im Einfüge-Format der BandHelper-Web-Oberfläche
+  (`0.00|playRecording|,12.40|highlightLyricsLine|5,…,240.00|end|`): die
+  Aufnahme startet, und jede Gesangszeile wird **0,3 Sekunden vor ihrem Einsatz**
+  markiert (Whisper-Wortzeiten; der Play-Along-Mix hat dieselbe Zeitachse wie
+  das Original). Die Zeilennummern zählen die **Anzeige-Zeilen in BandHelper,
+  beginnend bei 0**:
+  Zeilen mit `[Akkord]`-Klammern **und Text** rendert BandHelper **zweizeilig**
+  (Akkordzeile über der Textzeile – markiert wird die Textzeile), reine
+  Klammer-Zeilen (z. B. Interlude `[A ][G ]…`) einzeilig, `{Direktiven}`
+  blendet es aus (an echten Songs gegen die Anzeige verifiziert).
+  **Abschnitts-Marker** wie *Intro/Interlude/Solo/Outro/Verse/Chorus* bekommen
+  eigene Markierungen (kurz nach dem letzten gesungenen Wort davor), damit man
+  auch in Instrumentalteilen sieht, wo man ist. Zwei Wege für die
+  Zeilennummern: **(1)** den vorhandenen Songtext **aus BandHelper einfügen**
+  („Text aus BandHelper…") – die Nummern passen dann exakt zu dessen Anzeige
+  (reine Akkordzeilen und Leerzeilen verschieben nur die Nummerierung,
+  unsicher zugeordnete Zeilen werden weggelassen, Wiederholungen landen dank
+  monotonem Alignment im richtigen Refrain); **(2)** ohne Vorlage erzeugt
+  AudioWizard den Text selbst als **ChordPro** und legt ihn als Zip mit
+  `.pro`-Dateien daneben (`Name_bandhelper.zip`, im Stapel gesammelt als
+  `chordsheets_bandhelper.zip`) – die Zeilennummern der Automation passen zu
+  genau dieser Datei. Das Zip-Format ist dasselbe wie beim Schwesterprojekt
+  **[UltimateGuitar2Bandhelper](https://github.com/codekoch/UltimateGuitar2Bandhelper)**,
+  das umgekehrt vorhandene Ultimate-Guitar-Sheets (PDF/Seite) in
+  BandHelper-taugliches ChordPro umwandelt – beide Wege füllen dieselbe
+  BandHelper-Bibliothek.
 - **Stems → MIDI (Basic Pitch)** (optional) – wird im Dialog „Was soll passieren?"
   **Stems → MIDI** gewählt, wandelt **Basic Pitch** (Spotify) die getrennten
   **tonalen** Spuren (**Bass, „Rest", Gesang**) in MIDI-Noten um. Im **Stem-Player**
@@ -297,7 +362,8 @@ siehe [Webversion](#webversion-browser).
   Refrains trotz ähnlicher Harmonik in denselben Typ geraten, und fasst gleiche
   Refrains zuverlässig zusammen (auch einen verdoppelten Schluss-Refrain; an echten
   Songs gegen Referenz-Sheets evaluiert). Ist zusätzlich der **Online-Abgleich**
-  aktiv (gleiches Häkchen wie beim Song-Sheet), nutzt die Parterkennung auch die
+  aktiv (eigenes Häkchen im Deluge-Song-Dialog; gleiche Einstellung wie beim
+  Song-Sheet), nutzt die Parterkennung auch die
   **Struktur der Referenz-Lyrics** (lrclib.net): Die Strophen-Blöcke des
   Referenztexts werden per Wort-Alignment auf die eigene Aufnahme gelegt und
   liefern **Grenz- und Typ-Anker** (wiederholte Blöcke = Refrain) – Whisper-Hörfehler

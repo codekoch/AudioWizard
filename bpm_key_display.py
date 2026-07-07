@@ -37,6 +37,7 @@ import json
 import math
 import os
 import queue
+import re
 import sys
 import threading
 import time
@@ -534,6 +535,9 @@ class DisplayApp:
                  bg=COL_BG, fg="#55544E").pack(anchor="w", pady=(2, 0))
         self._small_button(bottom, "Noten-Kalibrierung …",
                            self.open_note_calib).pack(side="left", padx=(16, 0))
+        # Stapel: viele Dateien -> Play-Along-Mixe (braucht keine Live-Quelle)
+        self._small_button(bottom, "Stapel: Play-Along …",
+                           self.on_batch_playalong).pack(side="left", padx=(8, 0))
         tk.Button(bottom, text="Start", command=self.on_setup_start,
                   font=self.f_btn, bg="#1D9E75", fg="#04342C",
                   activebackground=COL_OK, activeforeground="#04342C",
@@ -1380,7 +1384,11 @@ class DisplayApp:
         savef.pack(pady=(0, 6))
         self._small_button(
             savef, "💾 Stems speichern…",
-            lambda: self._save_stems_dialog(win, stems_dict, sr, bpm)).pack()
+            lambda: self._save_stems_dialog(win, stems_dict, sr, bpm)).pack(
+                side="left", padx=(0, 8))
+        self._small_button(
+            savef, "🎤 Play-Along-Mix… (Spuren ausblenden)",
+            lambda: self._mixout_dialog(win, stems_dict, sr)).pack(side="left")
 
         # --- Stems → MIDI (Basic Pitch): mehrere Spuren synchron senden ---
         midi_player = {"obj": None, "port": None}
@@ -1653,7 +1661,9 @@ class DisplayApp:
         dbv = {"shift": 0}            # Downbeat-Versatz in ganzen Beats (vom Auto-Downbeat)
         warp = {"ws": None, "info": None, "mode": None, "key": None}  # gecachtes Warp
         pv = {"player": None}                     # laufende Vorschau-Wiedergabe
-        vcache = {"lines": None, "done": False}   # Whisper-Gesangstext (Original-Zeit)
+        # Whisper-Gesangstext (Original-Zeit) + Online-Identifikation; 'online' merkt
+        # sich, mit welchem Haekchen-Stand der Cache gefuellt wurde
+        vcache = {"lines": None, "done": False, "ident": None, "online": None}
 
         def _db_orig():
             """Im Probehoeren GEWAEHLTER Downbeat in ORIGINAL-Zeit (Auto + ◀/▶-Versatz)."""
@@ -1846,8 +1856,10 @@ class DisplayApp:
                  "tonhöhen-erhaltend (Drums evtl. weicher). „Aus“ = Original.",
                  font=self.f_tiny, bg=COL_BG, fg=COL_MUTED, justify="left",
                  wraplength=440).pack(padx=20, anchor="w", pady=(2, 0))
-        # Parts: Strophe/Refrain zusaetzlich per Gesangstext trennen (Whisper)
+        # Parts: Strophe/Refrain zusaetzlich per Gesangstext trennen (Whisper);
+        # Online-Haekchen = derselbe Config-Wert wie im "Was soll passieren?"-Dialog
         txtv = tk.BooleanVar(value=core.whisper_available())
+        onlv = tk.BooleanVar(value=bool(load_config().get("online_ref", False)))
         if core.whisper_available():
             tr = tk.Frame(win, bg=COL_BG)
             tr.pack(padx=20, pady=(4, 0), anchor="w")
@@ -1857,6 +1869,14 @@ class DisplayApp:
                            selectcolor=COL_SURFACE, activebackground=COL_BG,
                            activeforeground=COL_FG, bd=0, highlightthickness=0).pack(
                                side="left")
+            tk.Checkbutton(win, text="Parts: Online-Abgleich (Song im Netz "
+                           "identifizieren; Referenz-Text/-Struktur stützt die "
+                           "Parterkennung)", variable=onlv,
+                           font=self.f_small, bg=COL_BG, fg=COL_FG,
+                           selectcolor=COL_SURFACE, activebackground=COL_BG,
+                           activeforeground=COL_FG, bd=0, highlightthickness=0,
+                           wraplength=440, justify="left").pack(
+                               padx=20, anchor="w", pady=(2, 0))
         status = tk.Label(win, text="Tipp: „Probehören“ spielt Stems + Metronom; den "
                           "Downbeat per ◀/▶ so schieben, dass der laute Click auf der 1 "
                           "sitzt – dann speichern.", font=self.f_tiny, bg=COL_BG,
@@ -1929,6 +1949,7 @@ class DisplayApp:
             status.config(text="erkenne Abschnitte & ziehe aufs Raster … (kann dauern)")
 
             use_text = bool(txtv.get())
+            use_online = bool(onlv.get())
 
             def _work():
                 try:
@@ -1948,6 +1969,10 @@ class DisplayApp:
                     vlines = None
                     if (use_text and core.whisper_available()
                             and stems_dict.get("vocals") is not None):
+                        # Online-Korrektur veraendert den gecachten Text: bei
+                        # umgeschaltetem Haekchen daher neu transkribieren.
+                        if vcache["done"] and vcache.get("online") != use_online:
+                            vcache.update(lines=None, done=False, ident=None)
                         if not vcache["done"]:
                             self.root.after(0, lambda: status.config(
                                 text="transkribiere Gesang für Strophe/Refrain … (dauert)"))
@@ -1956,10 +1981,10 @@ class DisplayApp:
                                     stems_dict["vocals"], sr, size="small")
                             except Exception:
                                 vcache["lines"] = None
-                            # Optionaler Online-Abgleich (cfg): korrigierter Text
-                            # macht die Refrain-Wiederholungen fuer die
+                            # Optionaler Online-Abgleich (Haekchen): korrigierter
+                            # Text macht die Refrain-Wiederholungen fuer die
                             # Parterkennung sauberer. Faellt still zurueck.
-                            if vcache["lines"] and load_config().get("online_ref"):
+                            if vcache["lines"] and use_online:
                                 try:
                                     import online_ref
                                     v = np.asarray(stems_dict["vocals"])
@@ -1972,6 +1997,7 @@ class DisplayApp:
                                         vcache["ident"] = ident
                                 except Exception:
                                     pass
+                            vcache["online"] = use_online
                             vcache["done"] = True
                         if vcache["lines"]:
                             vlines = (core.warp_lines(vcache["lines"], info)
@@ -2008,7 +2034,8 @@ class DisplayApp:
                         instruments=instruments, log=lambda m: None)
                     save_config({**load_config(),
                                  "last_save_dir": os.path.dirname(p),
-                                 "deluge_gridlock": g})
+                                 "deluge_gridlock": g,
+                                 "online_ref": use_online})
                     labels = ", ".join(dict.fromkeys(s["label"] for s in secs))
                     gtxt = (" (Raster: Groove, da „Aus“ für Parts nicht loopbar)"
                             if g == "off" else "")
@@ -2113,6 +2140,365 @@ class DisplayApp:
         self._small_button(win, "Speichern…", _do_save).pack(pady=(2, 2))
         self._small_button(win, "Schließen", win.destroy).pack(pady=(0, 10))
         win._a2m_save_vars = (sel, cutv, namev)   # Tk-Variablen vor GC schuetzen
+
+    def _bh_text_dialog(self, parent, store, lbl=None):
+        """Kleines Fenster: Songtext aus BandHelper einfuegen (Karaoke-Automation,
+        Modus 'vorgegebener Text'). Ergebnis in store['text']; lbl zeigt den
+        Status an. Leer = AudioWizard erzeugt selbst ChordPro (+Zip)."""
+        win = tk.Toplevel(self.root)
+        win.title("Text aus BandHelper")
+        win.configure(bg=COL_BG)
+        win.transient(parent)
+        # Der "Was soll passieren?"-Dialog haelt einen modalen Grab -- ohne
+        # eigenen Grab kaeme hier KEINE Eingabe an (nichts einfuegbar). Grab
+        # uebernehmen und beim Schliessen an den Eltern-Dialog zurueckgeben.
+        prev_grab = self.root.grab_current()
+        try:
+            win.grab_set()
+        except Exception:
+            pass
+
+        def _close():
+            win.destroy()
+            if prev_grab is not None:
+                try:
+                    prev_grab.grab_set()
+                except Exception:
+                    pass
+
+        win.protocol("WM_DELETE_WINDOW", _close)
+        tk.Label(win, text="Songtext aus BandHelper einfügen", font=self.f_h1,
+                 bg=COL_BG, fg=COL_FG).pack(pady=(12, 2))
+        tk.Label(win, text="Den kompletten Songtext aus BandHelper hierher "
+                 "kopieren (Strg+V) – die Zeilennummern der Automation beziehen "
+                 "sich dann exakt auf diesen Text (alle Zeilen zählen, auch "
+                 "leere und Akkordzeilen). Leer lassen: AudioWizard erzeugt "
+                 "selbst einen ChordPro-Text als Zip.",
+                 font=self.f_tiny, bg=COL_BG, fg=COL_MUTED, justify="left",
+                 wraplength=440).pack(padx=16, pady=(0, 6))
+        txt = tk.Text(win, width=60, height=18, bg=COL_SURFACE, fg=COL_FG,
+                      insertbackground=COL_FG, bd=0, highlightthickness=0,
+                      font=self.f_tiny)
+        txt.pack(padx=16, pady=4, fill="both", expand=True)
+        if store.get("text"):
+            txt.insert("1.0", store["text"])
+        txt.focus_set()                    # sofort Strg+V moeglich
+
+        def _ok():
+            store["text"] = txt.get("1.0", "end").rstrip("\n")
+            if lbl is not None:
+                if store["text"].strip():
+                    n = len(store["text"].split("\n"))
+                    lbl.config(text=f"✓ BandHelper-Text übernommen ({n} Zeilen)")
+                else:
+                    lbl.config(text="kein Text – ChordPro-Zip wird miterzeugt")
+            _close()
+
+        row = tk.Frame(win, bg=COL_BG)
+        row.pack(pady=(4, 10))
+        self._small_button(row, "Übernehmen", _ok).pack(side="left", padx=4)
+        self._small_button(row, "Abbrechen", _close).pack(side="left", padx=4)
+
+    def _mixout_dialog(self, parent_win, stems_dict, sr, base=""):
+        """Dialog: Instrumente aus dem Gesamtmix AUSBLENDEN (Play-Along) -- die
+        uebrigen Stems werden wieder zu EINER Datei summiert (z. B. ohne Gesang =
+        Karaoke, ohne Bass = Uebe-Playback). Format: MP3 (320 kbit/s) oder WAV."""
+        names = [n for n in core.STEM_NAMES if stems_dict.get(n) is not None]
+        if not names:
+            messagebox.showinfo("Play-Along-Mix", "Keine Stems vorhanden.")
+            return
+        cfg = load_config()
+        mp3_ok = core.mp3_supported()
+        win = tk.Toplevel(self.root)
+        win.title("Play-Along-Mix")
+        win.configure(bg=COL_BG)
+        win.transient(parent_win)
+        tk.Label(win, text="Play-Along-Mix", font=self.f_h1, bg=COL_BG,
+                 fg=COL_FG).pack(pady=(12, 2))
+        tk.Label(win, text="Welche Spuren sollen aus dem Mix verschwinden?\n"
+                 "Die übrigen werden zu einer Datei zusammengemischt.",
+                 font=self.f_tiny, bg=COL_BG, fg=COL_MUTED,
+                 justify="left").pack(pady=(0, 8))
+        body = tk.Frame(win, bg=COL_BG)
+        body.pack(padx=20, pady=4, anchor="w")
+        last_drop = cfg.get("mixout_drop", ["vocals"])
+        drop = {}
+        for nm in names:
+            v = tk.BooleanVar(value=(nm in last_drop))
+            drop[nm] = v
+            tk.Checkbutton(body, text=core.STEM_LABELS.get(nm, nm) + " ausblenden",
+                           variable=v, font=self.f_small, bg=COL_BG, fg=COL_FG,
+                           selectcolor=COL_SURFACE, activebackground=COL_BG,
+                           activeforeground=COL_FG, bd=0, highlightthickness=0,
+                           anchor="w", width=20).pack(anchor="w")
+        fmtf = tk.Frame(win, bg=COL_BG)
+        fmtf.pack(padx=20, pady=(6, 0), anchor="w")
+        tk.Label(fmtf, text="Format:", font=self.f_tiny, bg=COL_BG,
+                 fg=COL_MUTED).pack(side="left", padx=(0, 6))
+        fmtv = tk.StringVar(value=(cfg.get("mixout_fmt", "mp3")
+                                   if mp3_ok else "wav"))
+        for val, lbl in (("mp3", "MP3 (320 kbit/s)"), ("wav", "WAV")):
+            rb = tk.Radiobutton(fmtf, text=lbl, variable=fmtv, value=val,
+                                font=self.f_small, bg=COL_BG, fg=COL_FG,
+                                selectcolor=COL_SURFACE, activebackground=COL_BG,
+                                activeforeground=COL_FG, bd=0, highlightthickness=0)
+            if val == "mp3" and not mp3_ok:
+                rb.config(state="disabled", fg=COL_MUTED)
+            rb.pack(side="left", padx=(0, 8))
+        # BandHelper: Karaoke-Automationsspur (+ ChordPro-Zip) mit erzeugen
+        whisper_ok = core.whisper_available()
+        v_bh = tk.BooleanVar(value=bool(cfg.get("mixout_bh", False)) and whisper_ok)
+        bh_ref = {"text": ""}
+        bhr = tk.Frame(win, bg=COL_BG)
+        bhr.pack(padx=20, pady=(6, 0), anchor="w")
+        cb_bh = tk.Checkbutton(bhr, text="BandHelper-Automation (Karaoke)",
+                               variable=v_bh, font=self.f_small, bg=COL_BG,
+                               fg=COL_FG if whisper_ok else COL_MUTED,
+                               selectcolor=COL_SURFACE, activebackground=COL_BG,
+                               activeforeground=COL_FG, bd=0, highlightthickness=0)
+        if not whisper_ok:
+            v_bh.set(False)
+            cb_bh.config(state="disabled")
+        cb_bh.pack(side="left")
+        bh_lbl = tk.Label(win, text=("kein Text – ChordPro-Zip wird miterzeugt"
+                                     if whisper_ok
+                                     else "braucht: pip install faster-whisper"),
+                          font=self.f_tiny, bg=COL_BG, fg=COL_MUTED)
+        self._small_button(bhr, "Text aus BandHelper…",
+                           lambda: self._bh_text_dialog(win, bh_ref, bh_lbl)).pack(
+                               side="left", padx=(8, 0))
+        bh_lbl.pack(padx=24, anchor="w")
+        status = tk.Label(win, text="", font=self.f_tiny, bg=COL_BG, fg=COL_MUTED)
+        status.pack(pady=(6, 2))
+
+        def _do_save():
+            drops = [n for n in names if drop[n].get()]
+            if not drops:
+                status.config(text="Nichts zum Ausblenden gewählt.")
+                return
+            if len(drops) >= len(names):
+                status.config(text="Mindestens eine Spur muss übrig bleiben.")
+                return
+            fmt = fmtv.get()
+            use_bh = bool(v_bh.get())
+            bh_text = bh_ref.get("text", "")
+            cfg2 = load_config()
+            ohne = "-".join(core.STEM_LABELS.get(n, n) for n in drops)
+            init = core.sanitize_filename((base or "Mix") + "_ohne_" + ohne)
+            p = filedialog.asksaveasfilename(
+                title="Play-Along-Mix speichern",
+                defaultextension="." + fmt, initialfile=init + "." + fmt,
+                initialdir=cfg2.get("last_save_dir") or "",
+                filetypes=[("MP3", "*.mp3"), ("WAV", "*.wav"), ("Alle", "*.*")])
+            if not p:
+                return
+            status.config(text="mische & speichere …")
+
+            def _work():
+                try:
+                    mix = core.mix_from_stems(stems_dict, drop=drops)
+                    core.save_mix_file(p, mix, sr)
+                    save_config({**load_config(),
+                                 "last_save_dir": os.path.dirname(p),
+                                 "mixout_drop": drops, "mixout_fmt": fmt,
+                                 "mixout_bh": use_bh})
+                    if use_bh:
+                        # Transkription (+ Akkorde) nur fuer die Automation --
+                        # Status zeigt den Fortschritt der Pipeline an
+                        slog = lambda m: self.root.after(
+                            0, lambda mm=str(m): status.config(text=mm[:90]))
+                        cfg3 = load_config()
+                        lang = cfg3.get("sheet_lang", "auto")
+                        base0 = os.path.splitext(os.path.basename(p))[0]
+                        base0 = re.sub(r"_ohne_[^.]*$", "", base0) or "Mix"
+                        sh = core.song_sheet_from_stems(
+                            stems_dict, sr, title=base0,
+                            whisper_size=cfg3.get("sheet_model", "medium"),
+                            language=None if lang == "auto" else lang,
+                            log=slog, online=bool(cfg3.get("online_ref")))
+                        d = os.path.dirname(p)
+                        bb = core.sanitize_filename(base0)
+                        _tp, cptxt = core.write_bandhelper_automation(
+                            d, bb, sh, len(mix) / float(sr),
+                            ref_text=bh_text, log=slog)
+                        if cptxt is not None:
+                            core.write_bandhelper_zip(
+                                os.path.join(d, bb + "_bandhelper.zip"),
+                                [(base0, cptxt)], log=slog)
+                    self.root.after(0, lambda: status.config(
+                        text="Gespeichert: " + os.path.basename(p)
+                        + (" + BandHelper-Dateien" if use_bh else "")))
+                except Exception as ex:
+                    self.root.after(0, lambda e=ex: status.config(
+                        text=f"Fehler: {e}"))
+            threading.Thread(target=_work, daemon=True).start()
+
+        self._small_button(win, "Speichern…", _do_save).pack(pady=(2, 2))
+        self._small_button(win, "Schließen", win.destroy).pack(pady=(0, 10))
+        win._a2m_mix_vars = (drop, fmtv, v_bh)    # Tk-Variablen vor GC schuetzen
+
+    def on_batch_playalong(self):
+        """Stapelverarbeitung: beliebig viele Audiodateien nacheinander in Stems
+        trennen und je Datei als Play-Along-Mixe speichern -- wahlweise (1) nur
+        Drums + Bass (Rhythmusgruppe zum Mitspielen) und/oder (2) alles ohne
+        Gesang (Karaoke). Format MP3 (320 kbit/s) oder WAV."""
+        if not core.demucs_available():
+            messagebox.showinfo("Stapel: Play-Along-Mixe",
+                                "Stem-Trennung nicht verfügbar – bitte zuerst "
+                                "'pip install demucs' ausführen.")
+            return
+        cfg = load_config()
+        paths = filedialog.askopenfilenames(
+            title="Audiodateien für Play-Along-Mixe wählen (Mehrfachauswahl)",
+            initialdir=cfg.get("last_save_dir") or "",
+            filetypes=[("Audio", "*.wav *.flac *.mp3 *.ogg *.m4a *.aif *.aiff"),
+                       ("Alle Dateien", "*.*")])
+        if not paths:
+            return
+        paths = list(paths)
+        mp3_ok = core.mp3_supported()
+        win = tk.Toplevel(self.root)
+        win.title("Stapel: Play-Along-Mixe")
+        win.configure(bg=COL_BG)
+        win.transient(self.root)
+        tk.Label(win, text="Stapel: Play-Along-Mixe", font=self.f_h1, bg=COL_BG,
+                 fg=COL_FG).pack(pady=(12, 2))
+        tk.Label(win, text=f"{len(paths)} Datei(en) gewählt. Jede wird einmal in "
+                 "Stems getrennt (hohe Qualität, dauert einige Minuten pro Stück) "
+                 "und dann als Mix gespeichert.", font=self.f_tiny, bg=COL_BG,
+                 fg=COL_MUTED, justify="left", wraplength=420).pack(
+                     padx=20, pady=(0, 8))
+        body = tk.Frame(win, bg=COL_BG)
+        body.pack(padx=20, pady=4, anchor="w")
+        v_db = tk.BooleanVar(value=True)
+        v_kar = tk.BooleanVar(value=True)
+        for var, lbl in ((v_db, "Nur Drums + Bass (Gesang und Rest ausgeblendet)"),
+                         (v_kar, "Alles ohne Gesang (Karaoke)")):
+            tk.Checkbutton(body, text=lbl, variable=var, font=self.f_small,
+                           bg=COL_BG, fg=COL_FG, selectcolor=COL_SURFACE,
+                           activebackground=COL_BG, activeforeground=COL_FG,
+                           bd=0, highlightthickness=0, anchor="w").pack(anchor="w")
+        # BandHelper: je Datei Automationsspur + ChordPro sammeln (Karaoke)
+        whisper_ok = core.whisper_available()
+        v_bh = tk.BooleanVar(value=False)
+        cb_bh = tk.Checkbutton(body, text="BandHelper-Automation + ChordPro je "
+                               "Datei (Karaoke; braucht Transkription – deutlich "
+                               "langsamer)", variable=v_bh, font=self.f_small,
+                               bg=COL_BG, fg=COL_FG if whisper_ok else COL_MUTED,
+                               selectcolor=COL_SURFACE, activebackground=COL_BG,
+                               activeforeground=COL_FG, bd=0, highlightthickness=0,
+                               anchor="w", wraplength=400, justify="left")
+        if not whisper_ok:
+            v_bh.set(False)
+            cb_bh.config(state="disabled")
+        cb_bh.pack(anchor="w", pady=(4, 0))
+        fmtf = tk.Frame(win, bg=COL_BG)
+        fmtf.pack(padx=20, pady=(6, 0), anchor="w")
+        tk.Label(fmtf, text="Format:", font=self.f_tiny, bg=COL_BG,
+                 fg=COL_MUTED).pack(side="left", padx=(0, 6))
+        fmtv = tk.StringVar(value=(cfg.get("mixout_fmt", "mp3")
+                                   if mp3_ok else "wav"))
+        for val, lbl in (("mp3", "MP3 (320 kbit/s)"), ("wav", "WAV")):
+            rb = tk.Radiobutton(fmtf, text=lbl, variable=fmtv, value=val,
+                                font=self.f_small, bg=COL_BG, fg=COL_FG,
+                                selectcolor=COL_SURFACE, activebackground=COL_BG,
+                                activeforeground=COL_FG, bd=0, highlightthickness=0)
+            if val == "mp3" and not mp3_ok:
+                rb.config(state="disabled", fg=COL_MUTED)
+            rb.pack(side="left", padx=(0, 8))
+        status = tk.Label(win, text="", font=self.f_tiny, bg=COL_BG, fg=COL_MUTED)
+        status.pack(pady=(6, 2))
+
+        def _go():
+            variants = []
+            if v_db.get():
+                variants.append(("nur_Drums-Bass", ("other", "vocals")))
+            if v_kar.get():
+                variants.append(("ohne_Gesang", ("vocals",)))
+            if not variants:
+                status.config(text="Keine Variante gewählt.")
+                return
+            out_dir = filedialog.askdirectory(
+                title="Zielordner für die Play-Along-Mixe",
+                initialdir=load_config().get("last_save_dir") or "")
+            if not out_dir:
+                return
+            fmt = fmtv.get()
+            bh = bool(v_bh.get())
+            save_config({**load_config(), "last_save_dir": out_dir,
+                         "mixout_fmt": fmt})
+            win.destroy()
+            log = self._stem_log_open("Stapel: Play-Along-Mixe")
+            self._stem_log(log, f"{len(paths)} Datei(en) → {len(variants)} "
+                           f"Variante(n) je Datei, Format {fmt.upper()}"
+                           + (", + BandHelper-Automation/ChordPro" if bh else "")
+                           + ".")
+            threading.Thread(target=self._batch_playalong_worker,
+                             args=(paths, variants, fmt, out_dir, bh, log),
+                             daemon=True).start()
+
+        self._small_button(win, "Los…", _go).pack(pady=(2, 2))
+        self._small_button(win, "Abbrechen", win.destroy).pack(pady=(0, 10))
+        win._a2m_batch_vars = (v_db, v_kar, fmtv, v_bh)  # Tk-Vars vor GC schuetzen
+
+    def _batch_playalong_worker(self, paths, variants, fmt, out_dir, bh, log):
+        """Hintergrund-Stapel: je Datei EINMAL trennen, dann alle gewaehlten
+        Varianten mischen und speichern; mit bh zusaetzlich je Datei die
+        BandHelper-Automationsspur (Karaoke) und am Ende EIN ChordPro-Zip fuer
+        den BandHelper-Import. Ein Fehler bei einer Datei stoppt den Stapel
+        nicht -- es geht mit der naechsten weiter."""
+        cb = lambda m: self._stem_log(log, m)
+        total = len(paths)
+        ok = 0
+        pros = []                          # (Titel, ChordPro) fuers Sammel-Zip
+        cfgb = load_config()
+        lang = cfgb.get("sheet_lang", "auto")
+        for i, path in enumerate(paths):
+            name = os.path.splitext(os.path.basename(path))[0]
+            self._stem_progress(log, i, total, name)
+            self._stem_log(log, f"== [{i + 1}/{total}] {os.path.basename(path)} ==")
+            try:
+                stems, ssr = core.separate_stems(path, model="htdemucs",
+                                                 log=cb, overlap=0.25)
+                mix = None
+                for suffix, drop in variants:
+                    mix = core.mix_from_stems(stems, drop=drop, log=cb)
+                    p = os.path.join(out_dir,
+                                     core.sanitize_filename(f"{name}_{suffix}")
+                                     + "." + fmt)
+                    core.save_mix_file(p, mix, ssr, log=cb)
+                ok += 1
+                if bh and mix is not None:
+                    # BandHelper-Fehler zaehlen die Datei NICHT als gescheitert
+                    try:
+                        self._stem_log(log, "-- BandHelper-Automation "
+                                       "(Transkription + Akkorde) --")
+                        sh = core.song_sheet_from_stems(
+                            stems, ssr, title=name,
+                            whisper_size=cfgb.get("sheet_model", "medium"),
+                            language=None if lang == "auto" else lang,
+                            log=cb, online=bool(cfgb.get("online_ref")))
+                        _tp, cptxt = core.write_bandhelper_automation(
+                            out_dir, core.sanitize_filename(name), sh,
+                            len(mix) / float(ssr), log=cb)
+                        if cptxt is not None:
+                            pros.append((name, cptxt))
+                    except Exception as ex:
+                        self._stem_log(log, f"BandHelper-Automation "
+                                       f"fehlgeschlagen: {ex}")
+            except Exception as ex:
+                self._stem_log(log, f"FEHLER bei {os.path.basename(path)}: {ex} "
+                               "– weiter mit der nächsten Datei.")
+        if pros:
+            try:
+                core.write_bandhelper_zip(
+                    os.path.join(out_dir, "chordsheets_bandhelper.zip"),
+                    pros, log=cb)
+            except Exception as ex:
+                self._stem_log(log, f"ChordPro-Zip fehlgeschlagen: {ex}")
+        self._stem_progress(log, total, total, "fertig")
+        self._stem_log(log, f"Stapel fertig – {ok} von {total} Datei(en) "
+                       "erfolgreich verarbeitet.")
 
     def _drum_settings(self):
         """Schlagzeug-Zuordnung {key:{'on','note'}} + Empfindlichkeit (0..1) aus
@@ -3164,6 +3550,13 @@ class DisplayApp:
                                ("off", "bar1", "groove", "beat") else "off")
         dl_instr = {n: tk.BooleanVar(value=True)
                     for n in ("bass", "drums", "other", "vocals")}
+        # Play-Along-Mix: welche Spuren AUSBLENDEN + Zielformat (gemerkt)
+        mp3_ok = core.mp3_supported()
+        v_mixout = tk.BooleanVar(value=False)
+        mo_drop = {n: tk.BooleanVar(value=(n in cfg.get("mixout_drop", ["vocals"])))
+                   for n in ("bass", "drums", "other", "vocals")}
+        mo_fmt = tk.StringVar(value=(cfg.get("mixout_fmt", "mp3")
+                                     if mp3_ok else "wav"))
 
         def _section(text):
             tk.Label(body, text=text, font=self.f_tiny, bg=COL_BG, fg=COL_ACCENT,
@@ -3203,6 +3596,76 @@ class DisplayApp:
             _cb("MIDI-Clock-Ausgabe (Datei abspielen, driftfreie Clock)", v_clock)
         _cb("Stems exportieren (einzelne WAVs speichern)", v_export, demucs_ok,
             "" if demucs_ok else "braucht: pip install demucs")
+
+        # Play-Along-Mix + (nur dann sichtbare) Ausblenden-/Format-Auswahl
+        mixf = tk.Frame(body, bg=COL_BG)
+        mxr1 = tk.Frame(mixf, bg=COL_BG)
+        mxr1.pack(anchor="w")
+        tk.Label(mxr1, text="Ausblenden:", font=self.f_tiny, bg=COL_BG,
+                 fg=COL_ACCENT).pack(side="left", padx=(0, 6))
+        for nm, lbl in (("bass", "Bass"), ("drums", "Drums"),
+                        ("other", "Rest"), ("vocals", "Gesang")):
+            tk.Checkbutton(mxr1, text=lbl, variable=mo_drop[nm], font=self.f_small,
+                           bg=COL_BG, fg=COL_FG, selectcolor=COL_SURFACE,
+                           activebackground=COL_BG, activeforeground=COL_FG, bd=0,
+                           highlightthickness=0).pack(side="left", padx=(0, 4))
+        mxr2 = tk.Frame(mixf, bg=COL_BG)
+        mxr2.pack(anchor="w", pady=(2, 0))
+        tk.Label(mxr2, text="Format:", font=self.f_tiny, bg=COL_BG,
+                 fg=COL_ACCENT).pack(side="left", padx=(0, 6))
+        for val, lbl in (("mp3", "MP3 (320 kbit/s)"), ("wav", "WAV")):
+            rb = tk.Radiobutton(mxr2, text=lbl, variable=mo_fmt, value=val,
+                                font=self.f_small, bg=COL_BG, fg=COL_FG,
+                                selectcolor=COL_SURFACE, activebackground=COL_BG,
+                                activeforeground=COL_FG, bd=0, highlightthickness=0)
+            if val == "mp3" and not mp3_ok:
+                rb.config(state="disabled", fg=COL_MUTED)
+            rb.pack(side="left", padx=(0, 8))
+        # BandHelper: Karaoke-Automationsspur (+ ChordPro-Zip) mit erzeugen
+        v_bh = tk.BooleanVar(value=bool(cfg.get("mixout_bh", False)) and whisper_ok)
+        bh_ref = {"text": ""}
+        mxr3 = tk.Frame(mixf, bg=COL_BG)
+        mxr3.pack(anchor="w", pady=(2, 0))
+        cb_bh = tk.Checkbutton(mxr3, text="BandHelper-Automation (Karaoke-"
+                               "Zeilenmarkierung)", variable=v_bh,
+                               font=self.f_small, bg=COL_BG,
+                               fg=COL_FG if whisper_ok else COL_MUTED,
+                               selectcolor=COL_SURFACE, activebackground=COL_BG,
+                               activeforeground=COL_FG, bd=0, highlightthickness=0)
+        if not whisper_ok:
+            v_bh.set(False)
+            cb_bh.config(state="disabled")
+        cb_bh.pack(side="left")
+        bh_lbl = tk.Label(mixf, text=("kein Text – ChordPro-Zip wird miterzeugt"
+                                      if whisper_ok
+                                      else "braucht: pip install faster-whisper"),
+                          font=self.f_tiny, bg=COL_BG, fg=COL_MUTED)
+        self._small_button(mxr3, "Text aus BandHelper…",
+                           lambda: self._bh_text_dialog(win, bh_ref, bh_lbl)).pack(
+                               side="left", padx=(8, 0))
+        bh_lbl.pack(anchor="w", padx=(18, 0))
+        tk.Label(mixf, text="Die übrigen Spuren werden wieder zu EINER Datei "
+                 "gemischt – z. B. ohne Gesang = Karaoke-Version, ohne Bass = "
+                 "Übe-Playback zum Mitspielen. BandHelper-Automation: Textdatei "
+                 "mit Zeilenmarkierungen je Gesangseinsatz (0,3 s Vorlauf) – Inhalt "
+                 "in BandHelper unter „Automationsspur → Einfügen“ einsetzen; die "
+                 "Zeiten passen zum Play-Along-Mix als angehängter Aufnahme. Ohne "
+                 "eingefügten BandHelper-Text entsteht dazu ein ChordPro-Zip für "
+                 "den Import.", font=self.f_tiny, bg=COL_BG,
+                 fg=COL_MUTED, justify="left", wraplength=460).pack(
+                     anchor="w", pady=(2, 0))
+
+        def _toggle_mixopts():
+            if v_mixout.get():
+                mixf.pack(after=mix_cb, anchor="w", fill="x", pady=(2, 6))
+            else:
+                mixf.pack_forget()
+
+        mix_cb = _cb("Play-Along-Mix erstellen (Instrumente aus dem Mix ausblenden)",
+                     v_mixout, demucs_ok,
+                     "" if demucs_ok else "braucht: pip install demucs",
+                     command=_toggle_mixopts)
+
         _cb("Stems anschließend abspielen (zusammen/getrennt)", v_play, demucs_ok)
         midi_note = ("" if (demucs_ok and bass_ok and midi_ok)
                      else "braucht: pip install basic-pitch" if not bass_ok
@@ -3337,12 +3800,21 @@ class DisplayApp:
 
         def _ok():
             if not (v_clock.get() or v_export.get() or v_sheet.get()
-                    or v_play.get() or v_stemmidi.get() or v_deluge.get()):
+                    or v_play.get() or v_stemmidi.get() or v_deluge.get()
+                    or v_mixout.get()):
                 return                       # nichts gewaehlt -> Dialog offen lassen
+            mix_cfg = None
+            if v_mixout.get():
+                drops = [n for n in ("bass", "drums", "other", "vocals")
+                         if mo_drop[n].get()]
+                if not drops or len(drops) >= 4:
+                    return                   # nichts/alles ausgeblendet -> offen lassen
+                mix_cfg = {"drop": drops, "fmt": mo_fmt.get(),
+                           "bh": bool(v_bh.get()), "bh_ref": bh_ref.get("text", "")}
             out_dir = None
-            if v_export.get():
+            if v_export.get() or mix_cfg:
                 out_dir = filedialog.askdirectory(
-                    title="Zielordner für die Stems",
+                    title="Zielordner (Stems/Play-Along-Mix)",
                     initialdir=cfg.get("last_save_dir") or "")
                 if not out_dir:
                     return                   # Abbruch der Ordnerwahl -> zurueck
@@ -3367,6 +3839,10 @@ class DisplayApp:
                        "stem_quality": qual, "stem_barcut": bool(v_barcut.get()),
                        "deluge_gridlock": dl_grid.get(),
                        "online_ref": bool(v_online.get())}
+            if mix_cfg:
+                new_cfg["mixout_drop"] = mix_cfg["drop"]
+                new_cfg["mixout_fmt"] = mix_cfg["fmt"]
+                new_cfg["mixout_bh"] = mix_cfg["bh"]
             if out_dir:
                 new_cfg["last_save_dir"] = out_dir
             save_config(new_cfg)
@@ -3386,7 +3862,8 @@ class DisplayApp:
                 overlap = 0.1
             else:
                 overlap = (0.25 if (v_export.get() or v_play.get()
-                                    or v_stemmidi.get() or v_deluge.get()) else 0.1)
+                                    or v_stemmidi.get() or v_deluge.get()
+                                    or v_mixout.get()) else 0.1)
             qts = 0
             if v_qt.get():
                 try:
@@ -3398,6 +3875,7 @@ class DisplayApp:
                           play=bool(v_play.get()), stemmidi=bool(v_stemmidi.get()),
                           barcut=bool(v_barcut.get()), quicktest_s=qts,
                           deluge=deluge_cfg, sheet_online=bool(v_online.get()),
+                          mixout=mix_cfg,
                           out_dir=out_dir, overlap=overlap, shifts=shifts,
                           sep_model=sep_model, sep_backend=sep_backend,
                           language=None if lang == "auto" else lang, model=model)
@@ -3421,7 +3899,8 @@ class DisplayApp:
         sich spaeter _material_res); False sonst (Clock-/Leerfall) -- so weiss die
         Stueck-Schlange, ob sie auf das Ergebnis warten oder gleich weitermachen muss."""
         needs_stems = (actions["export"] or actions["sheet"] or actions["play"]
-                       or actions.get("stemmidi") or actions.get("deluge"))
+                       or actions.get("stemmidi") or actions.get("deluge")
+                       or actions.get("mixout"))
         if not needs_stems:
             if actions.get("clock") and not isinstance(source, tuple):
                 self._begin_file_clock(source)
@@ -3436,6 +3915,7 @@ class DisplayApp:
         log = self._stem_log_open("Verarbeitung")
         self._stem_log(log, title)
         bits = [n for n, on in (("Export", actions["export"]),
+                                ("Play-Along-Mix", actions.get("mixout")),
                                 ("Song-Sheet", actions["sheet"]),
                                 ("Abspielen", actions["play"]),
                                 ("Stems-MIDI", actions.get("stemmidi")),
@@ -3470,7 +3950,8 @@ class DisplayApp:
             # Phasen fuer den Fortschrittsbalken zaehlen (Trennen ist immer dabei)
             total = (1 + int(bool(actions["export"])) + int(bool(actions["sheet"]))
                      + int(bool(actions.get("stemmidi")))
-                     + int(bool(actions.get("deluge"))))
+                     + int(bool(actions.get("deluge")))
+                     + int(bool(actions.get("mixout"))))
             step = 0
             self._stem_progress(log, step, total, "Stems trennen")
             backend = actions.get("sep_backend", "demucs")
@@ -3521,6 +4002,44 @@ class DisplayApp:
                             mix = mix[:m] + a[:m]
                     out["sheet"]["mix"] = mix
                     out["sheet"]["sr"] = ssr
+                step += 1
+            if actions.get("mixout"):
+                self._stem_progress(log, step, total, "Play-Along-Mix")
+                mo = actions["mixout"]
+                ohne = "-".join(core.STEM_LABELS.get(n, n) for n in mo["drop"])
+                self._stem_log(log, f"== Play-Along-Mix (ohne {ohne}) ==")
+                # Fehler hier sollen die weiteren Aktionen (MIDI/Deluge) nicht stoppen
+                try:
+                    pmix = core.mix_from_stems(stems, drop=mo["drop"], log=cb)
+                    p = os.path.join(
+                        actions["out_dir"],
+                        core.sanitize_filename(f"{title}_ohne_{ohne}")
+                        + "." + mo["fmt"])
+                    core.save_mix_file(p, pmix, ssr, log=cb)
+                    if mo.get("bh"):
+                        # Karaoke-Automation: das Sheet der Sheet-Aktion wieder-
+                        # verwenden, sonst nur dafuer berechnen (oeffnet KEIN
+                        # Sheet-Fenster)
+                        sh = out.get("sheet")
+                        if sh is None:
+                            self._stem_log(
+                                log, "== Transkription für BandHelper-Automation ==")
+                            sh = core.song_sheet_from_stems(
+                                stems, ssr, title=title,
+                                whisper_size=actions["model"],
+                                language=actions["language"], log=cb,
+                                online=bool(actions.get("sheet_online")))
+                        bb = core.sanitize_filename(title)
+                        _tp, cptxt = core.write_bandhelper_automation(
+                            actions["out_dir"], bb, sh, len(pmix) / float(ssr),
+                            ref_text=mo.get("bh_ref"), log=cb)
+                        if cptxt is not None:
+                            core.write_bandhelper_zip(
+                                os.path.join(actions["out_dir"],
+                                             bb + "_bandhelper.zip"),
+                                [(sh.get("title") or title, cptxt)], log=cb)
+                except Exception as ex:
+                    self._stem_log(log, f"Play-Along-Mix fehlgeschlagen: {ex}")
                 step += 1
             if actions.get("stemmidi"):
                 self._stem_progress(log, step, total, "Stems → MIDI")

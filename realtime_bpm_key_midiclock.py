@@ -3139,6 +3139,62 @@ def write_stems_to_files(stems, sr, out_dir, base="stems", log=None):
     return written
 
 
+def mp3_supported():
+    """True, wenn die installierte libsndfile MP3 SCHREIBEN kann (ab 1.1, mit
+    LAME -- in aktuellen soundfile-Wheels enthalten)."""
+    try:
+        return sf is not None and "MP3" in sf.available_formats()
+    except Exception:
+        return False
+
+
+def mix_from_stems(stems, drop=(), log=None):
+    """Play-Along-Mix: summiert alle NICHT ausgeblendeten Stems wieder zu einem
+    Gesamtmix (z. B. drop=('vocals',) = Karaoke-Version). Die Demucs-Stems
+    summieren sich praktisch exakt zum Original, daher klingt der Rest wie der
+    Song ohne die Spur(en). Uebersteuerung wird nur abgefangen (Peak > 1 ->
+    leise skalieren), der Pegel sonst nicht angetastet."""
+    drop = set(drop)
+    keep = [n for n in stems if n not in drop and stems[n] is not None]
+    if not keep:
+        raise ValueError("Alle Spuren ausgeblendet – nichts mehr zu mischen.")
+    mix = None
+    for n in keep:
+        a = np.asarray(stems[n], dtype=np.float32)
+        if mix is None:
+            mix = a.copy()
+        else:
+            m = min(len(mix), len(a))
+            mix = mix[:m] + a[:m]
+    peak = float(np.max(np.abs(mix))) if len(mix) else 0.0
+    if peak > 0.999:
+        mix *= 0.999 / peak
+    dropped = ", ".join(STEM_LABELS.get(n, n) for n in STEM_NAMES if n in drop)
+    _emit(log, f"Mix ohne {dropped or '–'} ({len(keep)} Spuren summiert).")
+    return mix
+
+
+def save_mix_file(path, audio, sr, log=None):
+    """Schreibt einen Mix als WAV (PCM_16) oder MP3 (320 kbit/s CBR) -- das
+    Format bestimmt die Dateiendung. Rueckgabe: der Pfad."""
+    if sf is None:
+        raise RuntimeError("soundfile nicht verfuegbar (pip install soundfile)")
+    audio = np.asarray(audio, dtype=np.float32)
+    if str(path).lower().endswith(".mp3"):
+        if not mp3_supported():
+            raise RuntimeError("MP3 braucht eine neuere libsndfile "
+                               "(pip install -U soundfile) – oder WAV wählen.")
+        try:
+            sf.write(path, audio, int(sr), format="MP3",
+                     compression_level=0.0, bitrate_mode="CONSTANT")  # 320 kbit/s
+        except TypeError:   # aeltere soundfile ohne Qualitaets-Parameter
+            sf.write(path, audio, int(sr), format="MP3")
+    else:
+        sf.write(path, audio, int(sr), subtype="PCM_16")
+    _emit(log, "  ✓ " + os.path.basename(str(path)))
+    return path
+
+
 def drums_downbeat_sec(drums, sr, frac=0.30):
     """Robuster Downbeat (Takt 1 des Grooves) = erster KLARER Schlagzeug-Einsatz:
     der erste Onset, der einen kraeftigen Bruchteil ('frac') der maximalen
@@ -4844,6 +4900,7 @@ def build_chord_sheet(lines, chords, title="", key="", bpm=0.0, width=84,
             text_lines.append("")
             cp_lines.append(" ".join(f"[{c}]" for c in seq))
             lmap.append({"chord_row": row, "lyric_row": None,
+                         "cp_row": len(cp_lines) - 1,
                          "start": float(t0), "end": float(t1), "words": []})
 
     first_t = next((ln["words"][0]["start"] for ln in lines if ln["words"]), None)
@@ -4885,7 +4942,10 @@ def build_chord_sheet(lines, chords, title="", key="", bpm=0.0, width=84,
             text_lines.append(chordline.rstrip())
             text_lines.append(lyric.rstrip())
             text_lines.append("")
+            # cp_row: die ChordPro-Zeile dieser Gesangszeile wird erst NACH der
+            # Umbruch-Schleife angehaengt -> len(cp_lines) ist ihr kuenftiger Index
             lmap.append({"chord_row": crow, "lyric_row": crow + 1,
+                         "cp_row": len(cp_lines),
                          "start": float(sub[0]["start"]),
                          "end": float(sub[-1]["end"]), "words": wspans})
         cp_lines.append(cp.rstrip())
@@ -4912,16 +4972,234 @@ def build_chord_sheet(lines, chords, title="", key="", bpm=0.0, width=84,
     # Zeilen-Indizes auf die Tk-Zeilen des Gesamttexts umrechnen (1-basiert) und
     # die Abdeckung luekenlos machen (jede Stelle gehoert genau einer Zeile)
     off = len(head)
+    cp_off = len(cp_head)                # Zeilennummer in der .chordpro-Datei
     out = []
     for e in lmap:
         out.append({
             "chord_row": e["chord_row"] + off + 1,
             "lyric_row": (e["lyric_row"] + off + 1) if e["lyric_row"] is not None else None,
+            "cp_line": e["cp_row"] + cp_off + 1,
             "start": e["start"], "end": e["end"], "words": e.get("words", [])})
     out.sort(key=lambda e: e["start"])
     for i in range(len(out) - 1):
         out[i]["end"] = max(out[i]["end"], out[i + 1]["start"])
     return text, chordpro, out
+
+
+# ----------------------------------------------------------------------
+# BandHelper: Automationsspur (Karaoke-Zeilenmarkierung) + ChordPro-Zip
+# ----------------------------------------------------------------------
+
+def bandhelper_track(events, duration):
+    """Baut den String fuer BandHelpers "Automationsspur -> Einfuegen":
+      0.00|playRecording|,5.00|highlightLyricsLine|2,...,240.00|end|
+    events = [(zeit_s, anzeige_zeile_0basiert)]; duration = Audiolaenge in s
+    (dort liegt das end-Ereignis). Zeiten werden auf 1/100 s gerundet und
+    strikt steigend gehalten."""
+    parts = ["0.00|playRecording|"]
+    last = 0.0
+    for t, n in sorted(events):
+        t = round(max(0.01, float(t)), 2)
+        if t <= last:
+            t = round(last + 0.01, 2)
+        last = t
+        parts.append(f"{t:.2f}|highlightLyricsLine|{int(n)}")
+    end_t = max(round(float(duration), 2), round(last + 0.01, 2))
+    parts.append(f"{end_t:.2f}|end|")
+    return ",".join(parts)
+
+
+def _bh_display_rows(lines_raw):
+    """BandHelpers ANZEIGE-Zeilennummern (darauf zaehlt highlightLyricsLine,
+    am Geraet beobachtet): Zaehlung beginnt bei 0; Zeilen mit [..]-Klammern
+    UND Text rendert BandHelper ZWEIZEILIG (Akkordzeile UEBER der Textzeile),
+    Klammer-Zeilen OHNE Text (z. B. Interlude '[A ][G ]') nur EINZEILIG,
+    {Direktiven} zeigt es nicht an. Rueckgabe je Quellzeile:
+    (textzeile, akkordzeile|None) als Anzeige-Nummern (0-basiert) bzw.
+    (None, None) fuer Direktiven; bei einzeiligen Klammer-Zeilen zeigen
+    beide Werte auf dieselbe Zeile."""
+    import re
+    rows, r = [], 0
+    for raw in lines_raw:
+        s = raw.strip()
+        if s.startswith("{") and s.endswith("}") and len(s) > 1:
+            rows.append((None, None))            # Direktive: nicht angezeigt
+        elif re.search(r"\[[^\]]*\]", raw):
+            if re.sub(r"\[[^\]]*\]", "", raw).strip():
+                rows.append((r + 1, r))          # Akkordzeile r, Textzeile r+1
+                r += 2
+            else:                                # nur Klammern -> EINE Zeile
+                rows.append((r, r))
+                r += 1
+        else:
+            rows.append((r, None))
+            r += 1
+    return rows
+
+
+def bandhelper_events_from_sheet(sheet):
+    """Karaoke-Events OHNE vorgegebenen Text: Zeiten aus dem eigenen Sheet,
+    Zeilennummern beziehen sich auf die ANZEIGE der MITERZEUGTEN ChordPro-Datei
+    in BandHelper (die per Zip importiert wird; [Akkord]-Zeilen werden dort
+    zweizeilig gerendert). Damit die Nummerierung deterministisch ist, kommt
+    die Datei OHNE Leerzeile zwischen Direktiven-Kopf und Text.
+    Rueckgabe (events, chordpro)."""
+    import re
+    _t, chordpro, lmap = build_chord_sheet(
+        sheet["lines"], sheet["chords"], title=sheet.get("title", ""),
+        key=sheet.get("key", ""), bpm=float(sheet.get("bpm", 0.0)),
+        chord_lead=float(sheet.get("chord_lead", CHORD_LEAD)), with_map=True)
+    src = chordpro.rstrip("\n").split("\n")
+    h = 0                                # Kopf = Direktiven + Leerzeile
+    while h < len(src) and (src[h].startswith("{") or not src[h].strip()):
+        h += 1
+    head = [l for l in src[:h] if l.startswith("{")]
+    body = src[h:]
+    pro = "\n".join(head + body) + "\n"
+    rows = _bh_display_rows(head + body)
+    best = {}                            # Anzeige-Zeile -> fruehester Start
+    for e in lmap:
+        k = e.get("cp_line")             # Zeile in der Original-Datei (1-basiert)
+        if k is None:
+            continue
+        bi = k - 1 - h                   # Index im Body
+        if not (0 <= bi < len(body)):
+            continue
+        text_row, chord_row = rows[len(head) + bi]
+        # Instrumental-Zeilen (nur Akkorde): die Akkordzeile markieren
+        # (0 ist eine gueltige Zeilennummer -> explizit gegen None pruefen)
+        stripped = re.sub(r"\[[^\]]*\]", "", body[bi]).strip()
+        n = text_row if stripped else (chord_row if chord_row is not None
+                                       else text_row)
+        if n is None:
+            continue
+        t = float(e["start"])
+        if n not in best or t < best[n]:
+            best[n] = t
+    return sorted((t, n) for n, t in best.items()), pro
+
+
+def bandhelper_events_from_ref(ref_text, lines, log=None):
+    """Karaoke-Events fuer einen VORGEGEBENEN Text (z. B. aus BandHelper
+    kopiert): die eigenen Whisper-Wortzeiten werden per monotonem Alignment auf
+    dessen Zeilen gelegt. Zeilennummern = ANZEIGE-Zeilen in BandHelper, ab 0
+    gezaehlt (Zeilen mit [..]-Klammern rendert BandHelper zweizeilig:
+    Akkordzeile ueber Textzeile -- markiert wird die Textzeile; {Direktiven}
+    zaehlen nicht).
+    Reine Akkordzeilen liefern keine Events, verschieben aber die Nummerierung.
+    Unsicher verankerte Zeilen werden ausgelassen (kein Event ist besser als
+    ein falsches)."""
+    import re
+    import online_ref                    # nur Text-Alignment, KEIN Netzzugriff
+    rlines = str(ref_text).replace("\r\n", "\n").replace("\r", "\n").split("\n")
+    disp = _bh_display_rows(rlines)      # Quellzeile -> Anzeige-Textzeile
+    # Abschnitts-Marker (Intro/Interlude/Solo/...) erkennen: eigene Events,
+    # damit man auch in Instrumentalteilen sieht, wo man ist. Sie liefern
+    # KEINE Alignment-Tokens (sind ja nicht gesungen).
+    HEADER = re.compile(
+        r"^(intro|outro|interlude|solo|bridge|instrumental|zwischenspiel|"
+        r"vorspiel|nachspiel|strophe|refrain|verse|chorus|pre[- ]?chorus|"
+        r"hook)\b[\w .:\-]*$", re.I)
+    headers = []                         # (quellzeile, anzeige_zeile)
+    rtoks, rline = [], []
+    WORD = re.compile(r"[0-9A-Za-zÀ-ÿäöüÄÖÜß']+")
+    for i, raw in enumerate(rlines):
+        if disp[i][0] is None:
+            continue                                # Direktive (nicht angezeigt)
+        s = re.sub(r"\[[^\]]*\]", " ", raw).strip()  # [C]-Akkorde/[Chorus] weg
+        # Marker auch in Klammer-Schreibweise ([Verse 1]) erkennen
+        cand = s or " ".join(re.findall(r"\[([^\]]*)\]", raw)).strip()
+        if cand and len(cand.split()) <= 3 and HEADER.match(cand):
+            headers.append((i, disp[i][0]))
+            continue
+        parts = s.split()
+        if parts and (sum(1 for p in parts if online_ref._CHORD_RE.match(p))
+                      / len(parts)) >= 0.6:
+            continue                               # Akkordzeile (2-zeiliger Stil)
+        for t in WORD.findall(s):
+            rtoks.append(t.lower())
+            rline.append(i)
+    wtoks, wtimes = [], []
+    for ln in lines:
+        for w in ln.get("words", []):
+            for t in WORD.findall(str(w.get("word", ""))):
+                wtoks.append(t.lower())
+                wtimes.append(float(w.get("start", 0.0)))
+    match = online_ref._nw_word_align(rtoks, wtoks, wtimes)  # {ref_idx: zeit}
+    first, cnt, total = {}, {}, {}
+    for ri in range(len(rtoks)):
+        total[rline[ri]] = total.get(rline[ri], 0) + 1
+    for ri, t in match.items():
+        li = rline[ri]
+        cnt[li] = cnt.get(li, 0) + 1
+        if li not in first or t < first[li]:
+            first[li] = t
+    events = []
+    for li, t in sorted(first.items()):
+        need = 2 if total.get(li, 0) >= 4 else 1   # lange Zeilen: >=2 Treffer
+        if cnt.get(li, 0) >= need:
+            events.append((t, disp[li][0]))
+    n_txt = len(events)
+    # Abschnitts-Marker zeitlich einordnen: kurz (2 s) nach dem letzten
+    # gesungenen Wort davor, aber deutlich vor dem naechsten Gesangs-Event;
+    # vor dem ersten Gesang (Intro) direkt an den Anfang.
+    if match:
+        mtimes = sorted((rline[ri], t) for ri, t in match.items())
+        for i, row in headers:
+            before = [t for li, t in mtimes if li < i]
+            after = [t for li, t in mtimes if li > i]
+            t = (max(before) + 2.0) if before else 0.0
+            if after:
+                lo = (max(before) + 0.5) if before else 0.0
+                t = min(t, max(lo, min(after) - 2.0))
+            events.append((t, row))
+    events.sort()
+    _emit(log, f"BandHelper: {n_txt} von {len(set(rline))} Textzeilen verankert"
+          f" + {len(headers)} Abschnitts-Marker (Anzeige-Zeilen ab 0).")
+    return events
+
+
+def write_bandhelper_automation(out_dir, base, sheet, duration,
+                                ref_text=None, lead=0.3, log=None):
+    """Schreibt die BandHelper-Automationsspur als <base>_bandhelper_automation.txt
+    (Inhalt 1:1 in "Automationsspur -> Einfuegen" der Web-Oberflaeche kopieren).
+    Mit ref_text beziehen sich die Zeilennummern auf DIESEN Text; ohne auf die
+    miterzeugte ChordPro-Datei. lead (s) zieht jede Markierung VOR den
+    gesungenen Einsatz -- so sieht man rechtzeitig, wann man einsteigen muss.
+    Rueckgabe (pfad|None, chordpro|None) -- chordpro nur ohne ref_text (Zip)."""
+    chordpro = None
+    if ref_text and str(ref_text).strip():
+        events = bandhelper_events_from_ref(ref_text, sheet["lines"], log=log)
+    else:
+        events, chordpro = bandhelper_events_from_sheet(sheet)
+    if not events:
+        _emit(log, "BandHelper-Automation uebersprungen: keine Zeile verankert.")
+        return None, None
+    if lead:                              # Einsatz-Vorwarnung
+        events = [(max(0.01, t - float(lead)), n) for t, n in events]
+    track = bandhelper_track(events, duration)
+    p = os.path.join(out_dir, f"{base}_bandhelper_automation.txt")
+    with open(p, "w", encoding="utf-8") as fh:
+        fh.write(track + "\n")
+    _emit(log, "  ✓ " + os.path.basename(p) + f" ({len(events)} Markierungen)")
+    return p, chordpro
+
+
+def write_bandhelper_zip(zip_path, entries, log=None):
+    """ChordPro-Zip fuer den BandHelper-Import (wie beim Chordsheet-Konverter:
+    flaches Zip mit .pro-Dateien). entries = [(titel, chordpro_text), ...]."""
+    import zipfile
+    used = set()
+    with zipfile.ZipFile(zip_path, "w", zipfile.ZIP_DEFLATED) as z:
+        for title, cp in entries:
+            stem = sanitize_filename(title or "song")
+            name, k = stem + ".pro", 2
+            while name in used:
+                name, k = f"{stem} ({k}).pro", k + 1
+            used.add(name)
+            z.writestr(name, cp)
+    _emit(log, "  ✓ " + os.path.basename(zip_path))
+    return zip_path
 
 
 def accompaniment_from_stems(stems):
