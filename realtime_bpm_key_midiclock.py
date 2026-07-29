@@ -2904,7 +2904,9 @@ def save_wav_slice(audio, sr, s0, s1, path):
 # Feature einfach aus. torch wird ERST beim ersten Trennen importiert (sonst
 # wuerde es jeden Programmstart spuerbar verlangsamen).
 STEM_NAMES = ("drums", "bass", "other", "vocals")
-STEM_LABELS = {"drums": "Drums", "bass": "Bass", "vocals": "Vocals", "other": "Rest"}
+# "mix" = Gesamtmix als EINZIGE Spur (Deluge-Weg ohne Trennung)
+STEM_LABELS = {"drums": "Drums", "bass": "Bass", "vocals": "Vocals",
+               "other": "Rest", "mix": "Gesamtmix"}
 _demucs_sep = None
 _demucs_mod = None
 _demucs_model = None      # gecachtes Modell fuer den direkten Weg (ohne torchaudio)
@@ -3115,6 +3117,111 @@ def separate_stems(path, model="htdemucs", log=None, overlap=0.1, shifts=0):
             errors.append(f"{label}: {e}")
             _emit(log, f"Weg '{label}' fehlgeschlagen ({e}).")
     raise RuntimeError("Stem-Trennung fehlgeschlagen – " + "; ".join(errors))
+
+
+# Wortteile im Dateinamen, die eine Datei einem bekannten Stem zuordnen
+# (z. B. "Song_bass.wav" -> Spur 'bass'; so stimmen Farben, Frequenzbereiche
+# der MIDI-Erkennung und die Deluge-Spurnamen automatisch).
+_STEM_ALIASES = {
+    "drums": "drums", "drum": "drums", "schlagzeug": "drums", "perc": "drums",
+    "bass": "bass", "baesse": "bass",
+    "vocals": "vocals", "vocal": "vocals", "voc": "vocals", "gesang": "vocals",
+    "lead": "vocals",
+    "other": "other", "rest": "other", "instrumental": "other", "harmony": "other",
+    "mix": "mix", "master": "mix", "gesamtmix": "mix", "full": "mix",
+}
+
+
+def stem_name_from_filename(path, used=()):
+    """Spurname aus einem Dateinamen ableiten: enthaelt er einen bekannten
+    Stem-Begriff (bass/drums/vocals/...), wird daraus der Stem-Schluessel --
+    sonst der bereinigte Dateiname. 'used' verhindert Doppelnamen."""
+    import re as _re
+    base = os.path.splitext(os.path.basename(str(path)))[0]
+    toks = [t for t in _re.split(r"[^0-9A-Za-zÄÖÜäöüß]+", base.lower()) if t]
+    for t in reversed(toks):               # hinten steht meist der Stem
+        if t in _STEM_ALIASES and _STEM_ALIASES[t] not in used:
+            return _STEM_ALIASES[t]
+    name = base[:18] or "Spur"
+    if name in used:
+        k = 2
+        while f"{name} {k}" in used:
+            k += 1
+        name = f"{name} {k}"
+    return name
+
+
+def load_audio_tracks(paths, sr=None, log=None):
+    """Mehrere Audiodateien als SPUREN laden (z. B. fertig exportierte Stems).
+    Alle werden auf EINE Samplerate gebracht (die der ersten Datei, oder sr)
+    und auf gleiche Laenge gepolstert -- nur so lassen sie sich synchron
+    abspielen und gemeinsam schneiden. Rueckgabe (dict {name: audio}, sr)."""
+    if sf is None:
+        raise RuntimeError("soundfile nicht verfuegbar (pip install soundfile)")
+    import librosa
+    out, target = {}, int(sr) if sr else None
+    for p in paths:
+        a, s = sf.read(str(p), dtype="float32", always_2d=False)
+        if a.ndim == 2:
+            a = a.mean(axis=1)
+        if target is None:
+            target = int(s)
+        elif int(s) != target:
+            _emit(log, f"  {os.path.basename(str(p))}: {s} Hz → {target} Hz")
+            a = librosa.resample(np.ascontiguousarray(a), orig_sr=int(s),
+                                 target_sr=target)
+        nm = stem_name_from_filename(p, used=set(out))
+        out[nm] = np.ascontiguousarray(a, dtype=np.float32)
+        _emit(log, f"  ✓ {os.path.basename(str(p))} → Spur „{nm}“ "
+                   f"({len(a) / float(target):.1f} s)")
+    if not out:
+        raise ValueError("Keine Audiodatei gelesen.")
+    n = max(len(a) for a in out.values())
+    for k, a in out.items():               # gleiche Laenge (hinten mit Stille)
+        if len(a) < n:
+            out[k] = np.concatenate([a, np.zeros(n - len(a), dtype=np.float32)])
+    # bekannte Stems in die uebliche Reihenfolge bringen
+    order = [n_ for n_ in STEM_NAMES if n_ in out] + \
+            [n_ for n_ in out if n_ not in STEM_NAMES]
+    return {k: out[k] for k in order}, int(target)
+
+
+def separation_eta(source, backend="demucs", model="htdemucs", shifts=0):
+    """Grobe VORAB-Schaetzung der Trenn-Dauer als Text. Die teuren Stufen sind
+    nicht offensichtlich teuer: 'htdemucs_ft' ist ein Verbund aus VIER Modellen
+    (4x Rechenzeit), und der Shift-Trick multipliziert nochmal mit (1+shifts) --
+    'Maximum+' ist dadurch ~12x langsamer als die Standardtrennung. Kalibriert
+    an CPU-Messungen (~0.8x Audiodauer je Durchlauf); GPU ist ~10x schneller."""
+    try:
+        if isinstance(source, tuple):
+            dur = len(np.asarray(source[1])) / float(source[2])
+        elif sf is not None:
+            dur = float(sf.info(str(source)).duration)
+        else:
+            return "Dauer der Trennung unbekannt."
+    except Exception:
+        return "Dauer der Trennung unbekannt."
+    n_models = 4 if str(model).endswith("_ft") else 1
+    if backend == "roformer":
+        n_models = 8                       # Kaskade RoFormer + Demucs
+    passes = n_models * (1 + max(0, int(shifts)))
+    gpu = False
+    try:
+        import torch
+        gpu = bool(torch.cuda.is_available())
+    except Exception:
+        pass
+    rate = 0.08 if gpu else 0.8            # Faktor der Audiodauer je Durchlauf
+    est = dur * rate * passes
+    unit = f"{est / 60:.0f} min" if est >= 90 else f"{est:.0f} s"
+    # Stufe "Hoch" = ein einziger Durchlauf -> genau 'passes'-mal schneller
+    hint = ("" if passes <= 1 else
+            f"  Stem-Qualität „Hoch“ wäre hier rund {passes}x schneller.")
+    dl = "Durchlauf" if passes == 1 else "Durchläufe"
+    return (f"Geschätzte Dauer: ~{unit} INSGESAMT (alle Spuren entstehen "
+            f"gemeinsam) für {dur / 60:.1f} min Audio "
+            f"({model}{'' if shifts <= 0 else f', Shift-Trick x{shifts}'}, "
+            f"{'GPU' if gpu else 'CPU'}, {passes} {dl})." + hint)
 
 
 def write_stems_to_files(stems, sr, out_dir, base="stems", log=None):
@@ -5353,15 +5460,61 @@ def song_sheet(path, model="htdemucs", whisper_size="medium", language=None,
                                  language=language, log=log, online=online)
 
 
+def waveform_peaks(audio, block=64):
+    """Peak-Pyramide fuer die Wellenform-Anzeige: Min/Max je BLOCK Samples
+    (mono gemittelt). Einmal vorberechnet laesst sich daraus JEDER Zoom-
+    Ausschnitt in Millisekunden zeichnen, statt bei jedem Neuzeichnen ueber
+    Millionen Samples zu laufen. Rueckgabe (mins, maxs, block)."""
+    a = np.asarray(audio, dtype=np.float32)
+    if a.ndim == 2:
+        a = a.mean(axis=1)
+    block = max(1, int(block))
+    n = len(a) // block
+    if n < 1:
+        z = np.zeros(1, dtype=np.float32)
+        if len(a):
+            return np.array([a.min()]), np.array([a.max()]), block
+        return z, z.copy(), block
+    b = a[:n * block].reshape(n, block)
+    return b.min(axis=1), b.max(axis=1), block
+
+
+def peak_columns(peaks, t0, t1, n_cols, sr):
+    """Min/Max je Pixelspalte fuer den Zeitbereich [t0,t1) aus der Peak-
+    Pyramide (s. waveform_peaks). Bereiche ausserhalb des Materials werden 0.
+    Rueckgabe (mins, maxs) mit je n_cols Werten."""
+    mins, maxs, block = peaks
+    n_cols = max(0, int(n_cols))
+    if n_cols == 0:
+        return np.zeros(0), np.zeros(0)
+    n = len(mins)
+    idx = np.linspace(float(t0) * sr / block, float(t1) * sr / block, n_cols + 1)
+    starts = np.clip(np.floor(idx).astype(np.int64), 0, n - 1)
+    lo = np.minimum.reduceat(mins, starts)[:n_cols]
+    hi = np.maximum.reduceat(maxs, starts)[:n_cols]
+    out = (idx[:-1] >= n) | (idx[1:] <= 0)          # komplett ausserhalb
+    if out.any():
+        lo, hi = lo.copy(), hi.copy()
+        lo[out] = 0.0
+        hi[out] = 0.0
+    return lo, hi
+
+
 class StemPlayer:
     """Spielt mehrere Stem-Spuren gemischt ab -- Pegel je Spur live regelbar,
     eigener sounddevice-OutputStream (unabhaengig vom DJ-Modus). Fuer den
     Aufnahme->Stems-Ablauf."""
 
-    def __init__(self, stems, sr, names=None, device=None, blocksize=1024):
+    def __init__(self, stems, sr, names=None, device=None, blocksize=1024,
+                 latency=None):
         self.sr = int(sr)
         self.device = device
         self.blocksize = int(blocksize)
+        # latency='high' laesst PortAudio grosszuegig puffern. Der Callback
+        # selbst braucht nur Bruchteile einer Millisekunde, aber er ist
+        # PYTHON-Code: haelt ein anderer Thread gerade den GIL (Tk zeichnet,
+        # GC laeuft), kommt er zu spaet und es knackt. Puffer = Reserve.
+        self.latency = latency
         prepared = []
         for s in stems:
             a = np.asarray(s, dtype=np.float32)
@@ -5383,28 +5536,86 @@ class StemPlayer:
         self.pos = 0
         self.playing = False
         self.stream = None
+        self.loop = None                  # (start, ende) in Samples oder None
+        self.loop_tail = None             # ueberblendetes Loop-Ende je Spur
+        self.loop_nx = 0                  # Laenge dieser Kreuzblende (Samples)
         self.lock = threading.Lock()
 
     def _callback(self, outdata, frames, time_info, status):
         with self.lock:
             out = np.zeros((frames, self.channels), dtype=np.float32)
-            if self.playing and self.pos < self.total:
-                s = self.pos
-                e = min(s + frames, self.total)
-                n = e - s
-                for k, a in enumerate(self.stems):
-                    out[:n] += a[s:e] * self.gain[k]
-                self.pos = e
-                if self.pos >= self.total:
-                    self.playing = False
+            if self.playing:
+                lo, hi = self.loop if self.loop else (0, self.total)
+                if self.loop and not (lo <= self.pos < hi):
+                    self.pos = lo
+                tail, nx = self.loop_tail, self.loop_nx
+                off = 0
+                # blockweise fuellen: beim Loop-Ende OHNE Luecke vorn weiter
+                while off < frames:
+                    if self.pos >= hi:
+                        if not self.loop:
+                            self.playing = False
+                            break
+                        self.pos = lo
+                    n = min(frames - off, hi - self.pos)
+                    if n <= 0:
+                        break
+                    s, e = self.pos, self.pos + n
+                    for k, a in enumerate(self.stems):
+                        g = self.gain[k]
+                        if g == 0.0:
+                            continue           # stumme Spur kostet keine Zeit
+                        out[off:off + n] += a[s:e] * g
+                        # Im letzten Stueck vor dem Loop-Ende das VORBEREITETE,
+                        # ueberblendete Material einsetzen -> kein Klick an der
+                        # Naht (Differenz addieren spart eine Kopie pro Block)
+                        if tail is not None and e > hi - nx:
+                            ts = max(s, hi - nx)
+                            i0, j0, cnt = ts - s, ts - (hi - nx), e - ts
+                            out[off + i0:off + i0 + cnt] += (
+                                tail[k][j0:j0 + cnt] - a[ts:e]) * g
+                    self.pos = e
+                    off += n
             outdata[:] = out
+
+    def set_loop(self, start_sec=None, end_sec=None, xfade_ms=12.0):
+        """Loop-Bereich in Sekunden setzen (None/leer = Loop aus). Laeuft die
+        Wiedergabe ausserhalb, springt sie beim naechsten Block hinein.
+
+        Am Loop-Ende wird eine kurze KREUZBLENDE zum Material VOR dem
+        Loop-Start vorbereitet -- genau wie beim Deluge-Export (_loop_xfade).
+        Ohne sie knackt es bei jedem Durchlauf, weil die Wellenform an der
+        Naht springt; das klingt wie ein Aussetzer, obwohl das Audio sauber
+        ist. Nur das Loop-ENDE wird angefasst, der Anfang bleibt original."""
+        with self.lock:
+            self.loop_tail, self.loop_nx = None, 0
+            if start_sec is None or end_sec is None:
+                self.loop = None
+                return
+            a = max(0, int(float(start_sec) * self.sr))
+            b = min(self.total, int(float(end_sec) * self.sr))
+            if b - a < self.blocksize:
+                self.loop = None
+                return
+            self.loop = (a, b)
+            nx = int(max(0.0, float(xfade_ms)) / 1000.0 * self.sr)
+            nx = int(min(nx, (b - a) // 4, a))     # nur mit Vorlauf moeglich
+            if nx < 32:
+                return
+            f = np.linspace(0.0, 1.0, nx, dtype=np.float32).reshape(-1, 1)
+            self.loop_tail = [(arr[b - nx:b] * (1.0 - f) + arr[a - nx:a] * f)
+                              for arr in self.stems]
+            self.loop_nx = nx
 
     def start_stream(self):
         if sd is None:
             raise RuntimeError("sounddevice nicht verfuegbar")
+        kw = {}
+        if self.latency is not None:
+            kw["latency"] = self.latency
         self.stream = sd.OutputStream(
             samplerate=self.sr, channels=self.channels, blocksize=self.blocksize,
-            device=self.device, dtype='float32', callback=self._callback)
+            device=self.device, dtype='float32', callback=self._callback, **kw)
         self.stream.start()
 
     def toggle(self):

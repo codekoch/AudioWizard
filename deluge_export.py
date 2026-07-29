@@ -487,7 +487,14 @@ def write_deluge_parts(xml_path, warped_stems, sr, midi_notes, bpm, t_db, sectio
         lab = sec.get("label", "X")
         W = e - s                                         # Takte des Abschnitts
         sect = min(i, 11)                                 # Deluge-Section 0..11
-        s0, s1 = db_n + s * bar_n, db_n + e * bar_n
+        if sec.get("start_sec") is not None:
+            # EXAKTER Startpunkt (so, wie im Part-Editor markiert/gehoert).
+            # Die LAENGE bleibt taktgenau, sonst laeuft der Clip auf der
+            # Deluge gegen das Songtempo weg.
+            s0 = int(round(float(sec["start_sec"]) * sr))
+            s1 = s0 + W * bar_n
+        else:
+            s0, s1 = db_n + s * bar_n, db_n + e * bar_n
         for k, n in enumerate(audio_stems):
             a = np.asarray(warped_stems[n], dtype=np.float32)
             if a.ndim == 1:
@@ -515,8 +522,12 @@ def write_deluge_parts(xml_path, warped_stems, sr, midi_notes, bpm, t_db, sectio
     section_ranges = []
     for i, sec in enumerate(valid):
         s, e = int(sec["start_bar"]), int(sec["end_bar"])
-        lo = _sec_to_ticks(float(t_db) + s * bar_t, bpm)
-        hi = _sec_to_ticks(float(t_db) + e * bar_t, bpm)
+        # MIDI-Bereich am SELBEN Punkt wie der Audio-Schnitt beginnen lassen,
+        # damit Noten und Audio im Clip zusammenpassen
+        t0 = (float(sec["start_sec"]) if sec.get("start_sec") is not None
+              else float(t_db) + s * bar_t)
+        lo = _sec_to_ticks(t0, bpm)
+        hi = _sec_to_ticks(t0 + (e - s) * bar_t, bpm)
         section_ranges.append((lo, hi, (e - s) * TICKS_PER_BAR, min(i, 11),
                                sec_col[i], sec.get("label", "")))   # Farbe + Clip-Name
 

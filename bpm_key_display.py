@@ -102,6 +102,33 @@ COL_SURFACE = "#222226"   # Listen/Buttons im Setup
 COL_SURF_HI = "#33333a"   # Hover/Active
 
 
+def _parse_time_str(s):
+    """Zeitangabe aus einem Eingabefeld lesen -- absichtlich TOLERANT:
+    '83', '83,4', '83.456', '1:23.456', '1:02:03.5' (h:mm:ss) sind alle gueltig,
+    Leerzeichen und ein angehaengtes 's' stoeren nicht. Rueckgabe Sekunden als
+    float (volle Genauigkeit) oder None, wenn nichts Sinnvolles drinsteht."""
+    s = str(s).strip().replace(",", ".").rstrip("sS ").strip()
+    if not s:
+        return None
+    try:
+        parts = [float(p) for p in s.split(":")]
+    except ValueError:
+        return None
+    if not parts or len(parts) > 3:
+        return None
+    t = 0.0
+    for p in parts:                       # 83 | mm:ss | h:mm:ss
+        t = t * 60.0 + p
+    return t if t >= 0 else None
+
+
+def _fmt_time(t):
+    """Sekunden als m:ss.mmm (millisekundengenau, so wie eingegeben werden darf)."""
+    t = max(0.0, float(t))
+    m, s = divmod(t, 60.0)
+    return f"{int(m)}:{s:06.3f}"
+
+
 def parallel_key(key):
     """Paralleltonart zu 'C Dur' / 'A Moll' usw.; '' wenn nicht bestimmbar."""
     parts = key.split()
@@ -538,6 +565,9 @@ class DisplayApp:
         # Stapel: viele Dateien -> Play-Along-Mixe (braucht keine Live-Quelle)
         self._small_button(bottom, "Stapel: Play-Along …",
                            self.on_batch_playalong).pack(side="left", padx=(8, 0))
+        # Fertige Spuren (z. B. exportierte Stems) direkt in den Part-Editor
+        self._small_button(bottom, "Spuren → Part-Editor …",
+                           self.on_open_tracks).pack(side="left", padx=(8, 0))
         tk.Button(bottom, text="Start", command=self.on_setup_start,
                   font=self.f_btn, bg="#1D9E75", fg="#04342C",
                   activebackground=COL_OK, activeforeground="#04342C",
@@ -2047,12 +2077,42 @@ class DisplayApp:
                     self.root.after(0, lambda e=ex: status.config(text=f"Fehler: {e}"))
             threading.Thread(target=_work, daemon=True).start()
 
+        def _do_editor():
+            """Part-Editor oeffnen: Warp (wie beim Export) im Hintergrund holen,
+            dann die Wellenform-Oberflaeche mit den GEWARPTEN Stems zeigen --
+            so entspricht jeder geloopte Part exakt dem, was exportiert wird."""
+            g = gridv.get()
+            gp = "groove" if g == "off" else g     # Parts brauchen ein Raster
+            _stop_preview()
+            status.config(text="richte Stems aufs Taktraster aus … (kann dauern)")
+
+            def _work():
+                try:
+                    ws, info = _ensure_warp(gp)
+                    wbpm = float(info["bpm"]) if info else (bpm or 120.0)
+                    wt_db = float(info["t_db"]) if info else _db_orig()
+                    wmidi = ({n: core.warp_notes(list(nt), info)
+                              for n, nt in midi.items()} if info else midi)
+
+                    def _open():
+                        status.config(text="Part-Editor geöffnet.")
+                        self._open_part_editor(win, dict(ws), sr, wbpm, wt_db,
+                                               wmidi, instruments, title,
+                                               gridlock=g, orig=stems_dict,
+                                               db_orig=_db_orig())
+                    self.root.after(0, _open)
+                except Exception as ex:
+                    self.root.after(0, lambda e=ex: status.config(text=f"Fehler: {e}"))
+            threading.Thread(target=_work, daemon=True).start()
+
         bsr = tk.Frame(win, bg=COL_BG)
         bsr.pack(pady=(2, 2))
         self._small_button(bsr, "Bundle speichern… (1 Stück)", _do).pack(
             side="left", padx=4)
         self._small_button(bsr, "Parts speichern… (Abschnitte)", _do_parts).pack(
             side="left", padx=4)
+        self._small_button(bsr, "✂ Part-Editor… (Marker selbst setzen)",
+                           _do_editor).pack(side="left", padx=4)
 
         def _close():
             _stop_preview()
@@ -2060,6 +2120,1263 @@ class DisplayApp:
         self._small_button(win, "Schließen", _close).pack(pady=(0, 10))
         win.protocol("WM_DELETE_WINDOW", _close)
         win._a2m_deluge = (dblbl, leadv, gridv)   # Tk-Variablen vor GC schuetzen
+
+    # Wellenform-Farbe je Spur im Part-Editor
+    WAVE_COL = {"drums": "#EF9F27", "bass": "#9FE1CB", "other": "#8AA9E6",
+                "vocals": "#E68AA9", "mix": "#B9B7AE"}
+
+    def on_open_tracks(self):
+        """Mehrere fertige Audiodateien (z. B. schon exportierte Stems) als
+        SPUREN in den Part-Editor laden -- ohne erneute KI-Trennung. Eine
+        einzelne Datei geht genauso (dann eine Spur)."""
+        cfg = load_config()
+        paths = filedialog.askopenfilenames(
+            title="Audiospuren wählen (Mehrfachauswahl: z. B. alle Stems eines Songs)",
+            initialdir=cfg.get("last_save_dir") or "",
+            filetypes=[("Audio", "*.wav *.flac *.mp3 *.ogg *.m4a *.aif *.aiff"),
+                       ("Alle Dateien", "*.*")])
+        if not paths:
+            return
+        paths = list(paths)
+        title = os.path.splitext(os.path.basename(paths[0]))[0]
+        for suf in ("_drums", "_bass", "_vocals", "_other", "_mix"):
+            if title.lower().endswith(suf):
+                title = title[:-len(suf)]
+                break
+        log = self._stem_log_open("Spuren laden")
+        self._stem_log(log, f"{len(paths)} Datei(en) → Part-Editor")
+        cb = lambda m: self._stem_log(log, m)
+
+        def _work():
+            try:
+                self._stem_progress(log, 0, 2, "Spuren laden")
+                stems, ssr = core.load_audio_tracks(paths, log=cb)
+                self._stem_progress(log, 1, 2, "Taktraster")
+                pe = self._prepare_part_editor(stems, ssr, title, log, cb)
+                self._stem_progress(log, 2, 2, "Fertig")
+
+                def _open():
+                    self._open_part_editor(
+                        self.root, pe["stems"], pe["sr"], pe["bpm"], pe["t_db"],
+                        None, list(pe["stems"].keys()), pe["title"],
+                        gridlock=pe.get("gridlock", "groove"),
+                        orig=pe.get("orig"), db_orig=pe.get("db_orig"))
+                self.root.after(0, _open)
+            except Exception as ex:
+                self._stem_log_error(log)
+                self._msg_later(self.err_label, f"Spuren laden fehlgeschlagen: {ex}")
+        threading.Thread(target=_work, daemon=True).start()
+
+    def _msg_later(self, widget, text):
+        """Statuszeile thread-sicher setzen (kurze Meldung aus einem Worker)."""
+        self.root.after(0, lambda t=str(text): widget.config(text=t[:160]))
+
+    def _part_export_dialog(self, parent, names):
+        """Vor dem Deluge-Export fragen, WAS hinein soll: je Spur Audio-Clip
+        und/oder MIDI-Clip. Die MIDI-Noten werden anschliessend aus genau den
+        gewaehlten Spuren frisch erkannt (basic-pitch bzw. Onset-Erkennung fuer
+        Drums) -- deshalb steht die Auswahl erst hier und nicht vorab.
+        Rueckgabe {'audio': [...], 'midi': [...]} oder None (Abbruch)."""
+        bp_ok = core.basic_pitch_available()
+        win = tk.Toplevel(self.root)
+        win.title("Deluge-Song exportieren")
+        win.configure(bg=COL_BG)
+        win.transient(parent)
+        prev = self.root.grab_current()
+        try:
+            win.grab_set()
+        except Exception:
+            pass
+        tk.Label(win, text="Was soll in den Deluge-Song?", font=self.f_h1,
+                 bg=COL_BG, fg=COL_FG).pack(pady=(12, 2))
+        tk.Label(win, text="Je Part und Spur entsteht ein Audio-Clip; MIDI-Clips "
+                 "werden JETZT aus genau diesen Spuren erkannt (dauert je Spur "
+                 "etwas).", font=self.f_tiny, bg=COL_BG, fg=COL_MUTED,
+                 justify="left", wraplength=430).pack(padx=18, pady=(0, 8))
+        grid = tk.Frame(win, bg=COL_BG)
+        grid.pack(padx=22, pady=2, anchor="w")
+        tk.Label(grid, text="Spur", font=self.f_tiny, bg=COL_BG, fg=COL_ACCENT,
+                 width=12, anchor="w").grid(row=0, column=0, sticky="w")
+        tk.Label(grid, text="Audio", font=self.f_tiny, bg=COL_BG,
+                 fg=COL_ACCENT).grid(row=0, column=1, padx=8)
+        tk.Label(grid, text="MIDI", font=self.f_tiny, bg=COL_BG,
+                 fg=COL_ACCENT).grid(row=0, column=2, padx=8)
+        av, mv = {}, {}
+        for r, n in enumerate(names, start=1):
+            tk.Label(grid, text=core.STEM_LABELS.get(n, n), font=self.f_small,
+                     bg=COL_BG, fg=self.WAVE_COL.get(n, COL_FG), width=12,
+                     anchor="w").grid(row=r, column=0, sticky="w")
+            av[n] = tk.BooleanVar(value=True)
+            # MIDI kostet Rechenzeit -> nur Bass ist vorausgewaehlt (haeufigster
+            # Fall). Drums brauchen KEIN basic-pitch (eigene Onset-Erkennung).
+            can_midi = bp_ok or n == "drums"
+            mv[n] = tk.BooleanVar(value=(n == "bass" and bp_ok))
+            # Angehakt = GRUEN gefuelltes Kaestchen: auf dunklem Grund ist ein
+            # schwarzer Haken in einem hellen Kaestchen kaum zu erkennen.
+            _mk = dict(bg=COL_BG, fg=COL_BG, selectcolor=COL_OK,
+                       activebackground=COL_BG, activeforeground=COL_BG,
+                       bd=0, highlightthickness=0)
+            tk.Checkbutton(grid, variable=av[n], **_mk).grid(row=r, column=1)
+            cb = tk.Checkbutton(grid, variable=mv[n], **_mk)
+            if not can_midi:
+                mv[n].set(False)
+                cb.config(state="disabled", selectcolor=COL_SURFACE)
+            cb.grid(row=r, column=2)
+        note = ("Drums werden per Onset-Erkennung zum 808-Kit, tonale Spuren "
+                "per Basic Pitch." if bp_ok else
+                "MIDI braucht: pip install basic-pitch (Drums gingen auch ohne).")
+        tk.Label(win, text=note, font=self.f_tiny, bg=COL_BG, fg=COL_MUTED,
+                 justify="left", wraplength=430).pack(padx=18, pady=(6, 0))
+        err = tk.Label(win, text="", font=self.f_tiny, bg=COL_BG, fg=COL_WARN)
+        err.pack(pady=(2, 0))
+        res = {}
+
+        def _close():
+            win.destroy()
+            if prev is not None:
+                try:
+                    prev.grab_set()
+                except Exception:
+                    pass
+
+        def _ok():
+            a = [n for n in names if av[n].get()]
+            if not a:
+                err.config(text="Mindestens eine Audio-Spur wählen.")
+                return
+            res.update(audio=a, midi=[n for n in names if mv[n].get()])
+            _close()
+
+        row = tk.Frame(win, bg=COL_BG)
+        row.pack(pady=(8, 12))
+        tk.Button(row, text="Weiter zum Speichern…", command=_ok, font=self.f_btn,
+                  bg="#1D9E75", fg="#04342C", activebackground=COL_OK,
+                  activeforeground="#04342C", bd=0, padx=18, pady=6,
+                  highlightthickness=0, cursor="hand2").pack(side="left", padx=4)
+        self._small_button(row, "Abbrechen", _close).pack(side="left", padx=4)
+        win.protocol("WM_DELETE_WINDOW", _close)
+        win._a2m_exp = (av, mv)
+        self.root.wait_window(win)
+        return res or None
+
+    def _open_part_editor(self, parent, stems, sr, bpm, t_db, midi,
+                          instruments, title, gridlock="off", orig=None,
+                          db_orig=None):
+        """Wellenform-Editor („Audio-Editor“) fuer die Deluge-Parts: Abschnitte
+        per Start-/End-Marker SELBST in der Wellenform definieren, einzeln
+        nahtlos als LOOP vorhoeren (so hoert man sofort, ob der Part als Loop
+        traegt) und daraus den Deluge-Parts-Song schreiben.
+
+        stems/midi liegen BEREITS gewarpt vor (rastergenaue Zeit, t_db =
+        Downbeat darin) -- dadurch sind Taktraster, Loop-Vorschau und Export
+        identisch. Angezeigt werden der Gesamtmix und je Stem eine Spur, die
+        sich einzeln zu-/abschalten laesst (Haekchen = sichtbar UND hoerbar)."""
+        names = ([n for n in core.STEM_NAMES if stems.get(n) is not None]
+                 + [n for n in stems if n not in core.STEM_NAMES
+                    and stems.get(n) is not None])
+        if not names:
+            messagebox.showinfo("Part-Editor", "Keine Stems vorhanden.")
+            return
+        bpm = float(bpm) if bpm and bpm > 0 else 120.0
+        bar_t = 4.0 * 60.0 / bpm                       # Sekunden je Takt (4/4)
+        total = max(len(np.asarray(stems[n])) for n in names) / float(sr)
+        t_db = max(0.0, float(t_db))
+        n_bars = max(1, int((total - t_db) / bar_t))
+
+        win = tk.Toplevel(self.root)
+        win.title(f"Part-Editor – {title}")
+        win.configure(bg=COL_BG)
+        win.transient(parent)
+        # An den Bildschirm anpassen: Taskleiste und Fensterrahmen abziehen,
+        # sonst rutschen die unteren Knoepfe aus dem Bild.
+        sw, sh = win.winfo_screenwidth(), win.winfo_screenheight()
+        win.geometry(f"{min(1180, max(760, sw - 80))}x"
+                     f"{min(800, max(520, sh - 150))}+20+20")
+        win.minsize(760, 500)
+        # Zustand: sichtbarer Ausschnitt, Auswahl (Sekunden), Parts (in TAKTEN
+        # relativ zum Downbeat -- das ist die Einheit, die die Deluge braucht)
+        st = {"t0": 0.0, "dur": total, "sel": None, "parts": [], "peaks": None,
+              "player": None, "drag": False, "cursor": None,
+              "grid": gridlock,
+              # Downbeat in ORIGINAL-Zeit -- Anker fuer einen spaeteren Neu-Warp
+              "db_orig": float(db_orig if db_orig is not None else t_db)}
+
+        tk.Label(win, text=f"Part-Editor – {title}", font=self.f_h1, bg=COL_BG,
+                 fg=COL_FG).pack(pady=(10, 0))
+        head = tk.Label(win, text="", font=self.f_tiny, bg=COL_BG, fg=COL_MUTED)
+        head.pack(pady=(0, 6))
+
+        def _upd_head():
+            head.config(text=f"{bpm:.1f} BPM · {n_bars} Takte · "
+                        f"{len(names)} Spur(en) · Downbeat bei {t_db:.2f} s")
+        _upd_head()
+
+        # ---------------- Werkzeugleiste ----------------
+        tb = tk.Frame(win, bg=COL_BG)
+        tb.pack(fill="x", padx=14)
+        self._small_button(tb, "🔍−", lambda: _zoom(2.0)).pack(side="left")
+        self._small_button(tb, "🔍+", lambda: _zoom(0.5)).pack(side="left")
+        # Lambda, weil _zoom_sel erst weiter unten definiert wird
+        self._small_button(tb, "Auswahl", lambda: _zoom_sel()).pack(side="left")
+        self._small_button(tb, "Alles", lambda: _set_view(0.0, total)).pack(
+            side="left", padx=(0, 12))
+        tk.Label(tb, text="Marker fangen auf:", font=self.f_tiny, bg=COL_BG,
+                 fg=COL_ACCENT).pack(side="left", padx=(0, 4))
+        snapv = tk.StringVar(value="bar")
+        for val, lbl in (("bar", "Takt"), ("beat", "Beat"), ("off", "frei")):
+            tk.Radiobutton(tb, text=lbl, variable=snapv, value=val,
+                           font=self.f_small, bg=COL_BG, fg=COL_FG,
+                           selectcolor=COL_SURFACE, activebackground=COL_BG,
+                           activeforeground=COL_FG, bd=0,
+                           highlightthickness=0).pack(side="left")
+        # Takt-1 (Downbeat) feinjustieren: verschiebt NUR das Raster, kein
+        # teures Neu-Warpen. Am besten VOR dem Setzen der Parts machen -- die
+        # Parts haengen am Raster und wandern mit.
+        tk.Label(tb, text="Takt-1:", font=self.f_tiny, bg=COL_BG,
+                 fg=COL_ACCENT).pack(side="left", padx=(14, 4))
+        self._small_button(tb, "◀", lambda: _shift_db(-1)).pack(side="left")
+        dblbl = tk.Label(tb, text=f"{t_db:.2f} s", font=self.f_tiny, bg=COL_BG,
+                         fg=COL_FG, width=7)
+        dblbl.pack(side="left")
+        self._small_button(tb, "▶", lambda: _shift_db(1)).pack(side="left")
+
+        tb2 = tk.Frame(win, bg=COL_BG)
+        tb2.pack(fill="x", padx=14, pady=(2, 0))
+        # Taktraster: bestimmt, wie stark das Audio aufs gleichmaessige Raster
+        # gezogen wird. Wechsel = neu warpen (Hintergrund), daher hier und nicht
+        # im Vorab-Dialog.
+        tk.Label(tb2, text="Taktraster (verändert das Audio!):",
+                 font=self.f_tiny, bg=COL_BG, fg=COL_ACCENT).pack(side="left",
+                                                                  padx=(0, 4))
+        gridv = tk.StringVar(value=gridlock if gridlock in
+                             ("off", "bar1", "groove", "beat") else "off")
+        for val, lbl in (("off", "Aus (Original)"), ("bar1", "Takt-1"),
+                         ("groove", "Groove"), ("beat", "Pro Beat")):
+            tk.Radiobutton(tb2, text=lbl, variable=gridv, value=val,
+                           command=lambda: _regrid(gridv.get()),
+                           font=self.f_small, bg=COL_BG, fg=COL_FG,
+                           selectcolor=COL_SURFACE, activebackground=COL_BG,
+                           activeforeground=COL_FG, bd=0,
+                           highlightthickness=0).pack(side="left")
+        tk.Label(tb2, text="   Spuren (Häkchen = sichtbar und hörbar):",
+                 font=self.f_tiny, bg=COL_BG, fg=COL_ACCENT).pack(side="left",
+                                                                  padx=(0, 6))
+        shown = {}
+        for n in names:
+            v = tk.BooleanVar(value=True)
+            shown[n] = v
+            tk.Checkbutton(tb2, text=core.STEM_LABELS.get(n, n), variable=v,
+                           command=lambda: (_apply_gains(), _draw()),
+                           font=self.f_small, bg=COL_BG,
+                           fg=self.WAVE_COL.get(n, COL_FG),
+                           selectcolor=COL_SURFACE, activebackground=COL_BG,
+                           activeforeground=COL_FG, bd=0,
+                           highlightthickness=0).pack(side="left")
+
+        # ---------------- Wellenform ----------------
+        RULER_H, BAND_H = 20, 26
+        # Gepackt wird erst GANZ am Ende (von unten nach oben), damit die
+        # Bedienleisten auf kleinen Bildschirmen sichtbar bleiben und nur die
+        # Wellenform schrumpft.
+        cvs = tk.Canvas(win, bg="#101014", highlightthickness=0, bd=0, height=240)
+        sbx = tk.Scrollbar(win, orient="horizontal",
+                           command=lambda *a: _xview(*a))
+
+        # Part-Farbe nach TYP (fuehrende Zahl im Label) -- gleiche Namen wie
+        # 1a/1b bekommen dieselbe Farbe, so wie spaeter auf der Deluge.
+        PART_COLS = ["#2f6f5b", "#2b5f74", "#6b4f7a", "#7a5a35", "#4a6b35",
+                     "#7a3f4f"]
+
+        def _pcol(label):
+            m = re.match(r"(\d+)", str(label).strip())
+            i = (int(m.group(1)) - 1) if m else 0
+            return PART_COLS[i % len(PART_COLS)]
+
+        def _t2x(t, W):
+            return (t - st["t0"]) / st["dur"] * W
+
+        def _x2t(x, W):
+            return st["t0"] + float(x) / max(1, W) * st["dur"]
+
+        def _snap(t):
+            m = snapv.get()
+            if m == "off":
+                return t
+            step = bar_t if m == "bar" else bar_t / 4.0
+            return t_db + round((t - t_db) / step) * step
+
+        def _bar_of(t):
+            return (t - t_db) / bar_t
+
+        def _mix_peaks(act):
+            """Peak-Pyramide der Summe der AKTIVEN Spuren -- die Mix-Zeile zeigt
+            damit genau das, was auch zu hoeren ist. Je Kombination gecacht
+            (Neuberechnung ~50 ms, danach sofort)."""
+            key = tuple(act)
+            cache = st.setdefault("mixpk", {})
+            if key not in cache:
+                if len(cache) > 8:                     # Speicher im Zaum halten
+                    cache.clear()
+                m = None
+                for nm in act:
+                    a = np.asarray(stems[nm], dtype=np.float32)
+                    a = a.mean(axis=1) if a.ndim == 2 else a
+                    if m is None:
+                        m = a.copy()
+                    else:
+                        k = min(len(m), len(a))
+                        m = m[:k] + a[:k]
+                cache[key] = None if m is None else core.waveform_peaks(m)
+            return cache[key]
+
+        def _draw():
+            cvs.delete("all")
+            W = max(1, cvs.winfo_width())
+            H = max(1, cvs.winfo_height())
+            if st["peaks"] is None:
+                cvs.create_text(W // 2, H // 2 - 10,
+                                text=st.get("busy") or "berechne Wellenform …",
+                                fill=COL_ACCENT, font=self.f_h1)
+                cvs.create_text(W // 2, H // 2 + 18,
+                                text="bitte warten – das Fenster reagiert "
+                                "danach wieder", fill=COL_MUTED,
+                                font=self.f_small)
+                return
+            act = [n for n in names if shown[n].get()]
+            rows = ["__mix__"] + act
+            row_h = max(38, (H - RULER_H - BAND_H) // max(1, len(rows)))
+            # --- Taktlineal + Taktlinien ---
+            px_bar = W / (st["dur"] / bar_t)
+            step = 1
+            while px_bar * step < 55:
+                step *= 2
+            b0 = int(np.floor(_bar_of(st["t0"])))
+            b1 = int(np.ceil(_bar_of(st["t0"] + st["dur"]))) + 1
+            for b in range(max(0, b0), max(0, b1)):
+                x = _t2x(t_db + b * bar_t, W)
+                if x < -2 or x > W + 2:
+                    continue
+                major = (b % step == 0)
+                cvs.create_line(x, 0, x, RULER_H, fill="#4a4a52" if major else "#2a2a30")
+                if major:
+                    cvs.create_text(x + 3, 2, text=str(b + 1), anchor="nw",
+                                    fill=COL_MUTED, font=self.f_tiny)
+                    cvs.create_line(x, RULER_H, x, H, fill="#212128")
+            # --- Parts-Band ---
+            y0 = RULER_H
+            cvs.create_rectangle(0, y0, W, y0 + BAND_H, fill="#17171c", width=0)
+            for p in st["parts"]:
+                xa = _t2x(_p_t0(p), W)
+                xb = _t2x(_p_t1(p), W)
+                if xb < 0 or xa > W:
+                    continue
+                cvs.create_rectangle(xa, y0 + 2, xb, y0 + BAND_H - 2,
+                                     fill=_pcol(p["label"]), outline=COL_ACCENT,
+                                     width=1)
+                if xb - xa > 26:
+                    cvs.create_text((max(0, xa) + min(W, xb)) / 2, y0 + BAND_H / 2,
+                                    text=p["label"], fill=COL_FG, font=self.f_tiny)
+            # --- Wellenformen ---
+            for k, n in enumerate(rows):
+                top = RULER_H + BAND_H + k * row_h
+                mid = top + row_h / 2.0
+                amp = (row_h / 2.0) - 4
+                cvs.create_line(0, mid, W, mid, fill="#2a2a30")
+                pk = _mix_peaks(act) if n == "__mix__" else st["peaks"].get(n)
+                if pk is not None:
+                    lo, hi = core.peak_columns(pk, st["t0"], st["t0"] + st["dur"],
+                                               W, sr)
+                    xs = np.arange(W, dtype=np.float64)
+                    ytop = mid - np.clip(hi, -1, 1) * amp
+                    ybot = mid - np.clip(lo, -1, 1) * amp
+                    pts = np.concatenate([
+                        np.column_stack([xs, ytop]).ravel(),
+                        np.column_stack([xs[::-1], ybot[::-1]]).ravel()])
+                    cvs.create_polygon(
+                        pts.tolist(), width=0,
+                        fill=(COL_MUTED if n == "__mix__"
+                              else self.WAVE_COL.get(n, COL_ACCENT)))
+                if n == "__mix__":
+                    lbl = ("Mix (alle Spuren)" if len(act) == len(names)
+                           else f"Mix ({len(act)} von {len(names)} Spuren)"
+                           if act else "Mix (keine Spur aktiv)")
+                else:
+                    lbl = core.STEM_LABELS.get(n, n)
+                cvs.create_text(6, top + 2, text=lbl, anchor="nw",
+                                fill=COL_MUTED, font=self.f_tiny)
+                cvs.create_line(0, top, W, top, fill="#212128")
+            # --- Auswahl (mit greifbaren Marker-Griffen an den Raendern) ---
+            if st["sel"]:
+                a, b = sorted(st["sel"])
+                xa, xb = _t2x(a, W), _t2x(b, W)
+                cvs.create_rectangle(xa, RULER_H, xb, H, fill=COL_ACCENT,
+                                     stipple="gray12", width=0)
+                for x, side in ((xa, 1), (xb, -1)):
+                    cvs.create_line(x, 0, x, H, fill=COL_ACCENT, width=2)
+                    cvs.create_rectangle(x, RULER_H + 2, x + side * 7,
+                                         RULER_H + 14, fill=COL_ACCENT, width=0)
+            _draw_cursor()
+            sbx.set(st["t0"] / total, (st["t0"] + st["dur"]) / total)
+
+        def _draw_cursor():
+            """Nur die Abspiellinie -- waehrend der Wiedergabe wird 20x/s NUR
+            diese aktualisiert (die Wellenform bleibt stehen)."""
+            cvs.delete("cursor")
+            if st["cursor"] is None:
+                return
+            W, H = max(1, cvs.winfo_width()), max(1, cvs.winfo_height())
+            x = _t2x(st["cursor"], W)
+            if -2 <= x <= W + 2:
+                cvs.create_line(x, 0, x, H, fill=COL_WARN, width=2,
+                                tags="cursor")
+
+        def _set_view(t0, dur):
+            dur = max(bar_t * 0.5, min(total, float(dur)))
+            st["dur"] = dur
+            st["t0"] = max(0.0, min(total - dur, float(t0)))
+            _draw()
+
+        def _zoom(f, center=None):
+            dur = max(bar_t * 0.5, min(total, st["dur"] * f))
+            if center is not None:
+                # Zoom am Mauszeiger: der Punkt unter dem Zeiger bleibt stehen
+                _set_view(center - (center - st["t0"]) * (dur / st["dur"]), dur)
+                return
+            # Zoom-Knoepfe: ist ein Loop markiert, kommt DESSEN Mitte in die
+            # Bildmitte -- man zoomt immer auf den Bereich, an dem man arbeitet.
+            c = ((st["sel"][0] + st["sel"][1]) / 2.0 if st["sel"]
+                 else st["t0"] + st["dur"] / 2.0)
+            _set_view(c - dur / 2.0, dur)
+
+        def _zoom_sel():
+            """Ansicht genau auf den markierten Loop legen (mit etwas Rand)."""
+            if not st["sel"]:
+                stat.config(text="Erst einen Bereich markieren.")
+                return
+            a, b = st["sel"]
+            pad = max(bar_t * 0.25, (b - a) * 0.15)
+            _set_view(a - pad, (b - a) + 2 * pad)
+
+        def _shift_db(n):
+            """Takt-1 um einen Beat verschieben (nur das Raster, kein Neu-Warp)."""
+            nonlocal t_db
+            t_db = max(0.0, min(total, t_db + n * bar_t / 4.0))
+            dblbl.config(text=f"{t_db:.2f} s")
+            _upd_head()
+            _draw()
+            _upd_status()
+
+        def _regrid(g):
+            """Taktraster wechseln: die ORIGINAL-Spuren neu aufs Raster ziehen
+            (Phase-Vocoder, daher im Hintergrund). Parts bleiben gueltig -- sie
+            haengen an Takten, nicht an Sekunden."""
+            if orig is None or g == st.get("grid"):
+                st["grid"] = g
+                return
+            _stop()
+            lbl = {"off": "Original", "bar1": "Takt-1", "groove": "Groove",
+                   "beat": "Pro Beat"}.get(g, g)
+            # Sofort SICHTBAR machen, dass gerechnet wird: die Wellenform
+            # verschwindet und der Canvas zeigt gross, was gerade laeuft.
+            st["busy"] = (f"richte Spuren aufs Taktraster „{lbl}“ aus …"
+                          if g != "off" else "stelle das Original-Audio her …")
+            st["peaks"] = None
+            st["mixpk"] = {}
+            _draw()
+            stat.config(text=st["busy"] + "  (Phase-Vocoder – bei langen "
+                        "Stücken dauert das ein bis zwei Minuten)")
+            win.update_idletasks()
+
+            def _work():
+                try:
+                    if g == "off":
+                        ws, info = dict(orig), None
+                    else:
+                        ws, info = core.warp_stems_to_grid(
+                            orig, sr, per=g, db_orig=st.get("db_orig", t_db))
+
+                    def _apply():
+                        nonlocal bpm, t_db, total, bar_t, n_bars
+                        # Player muss weg (er haelt die alten Arrays)
+                        p = st["player"]
+                        if p is not None:
+                            try:
+                                p.stop()
+                            except Exception:
+                                pass
+                            if p in self._stem_players:
+                                try:
+                                    self._stem_players.remove(p)
+                                except ValueError:
+                                    pass
+                            st["player"] = None
+                        # dict-INHALT tauschen -> alle Referenzen bleiben gueltig
+                        stems.clear()
+                        stems.update({n: ws[n] for n in ws if n in names})
+                        bpm = float(info["bpm"]) if info else bpm
+                        t_db = float(info["t_db"]) if info else st.get("db_orig", t_db)
+                        bar_t = 4.0 * 60.0 / bpm
+                        total = max(len(np.asarray(stems[n])) for n in names) / float(sr)
+                        n_bars = max(1, int((total - t_db) / bar_t))
+                        st["grid"] = g
+                        st["parts"] = []           # Zeiten passen nicht mehr
+                        st["busy"] = "berechne Wellenform …"
+                        save_config({**load_config(), "editor_gridlock": g})
+                        dblbl.config(text=f"{t_db:.2f} s")
+                        _upd_head()
+                        _set_sel(None, None)
+                        _set_view(0.0, total)
+                        _refresh_list()
+                        msg = (f"Taktraster „{g}“ – {bpm:.1f} BPM. "
+                               + ("Audio unverändert (Original)." if g == "off"
+                                  else "ACHTUNG: Das Audio wurde zeitlich "
+                                  "gedehnt (Phase-Vocoder) – klingt anders als "
+                                  "das Original.")
+                               + " Parts wurden zurückgesetzt, weil sich die "
+                               "Zeiten geändert haben.")
+                        stat.config(text=msg)
+                        threading.Thread(target=_peaks_work, args=(msg,),
+                                         daemon=True).start()
+                    self.root.after(0, _apply)
+                except Exception as ex:
+                    self.root.after(0, lambda e=ex: stat.config(
+                        text=f"Taktraster-Wechsel fehlgeschlagen: {e}"))
+            threading.Thread(target=_work, daemon=True).start()
+
+        def _xview(*a):
+            if not a:
+                return
+            if a[0] == "moveto":
+                _set_view(float(a[1]) * total, st["dur"])
+            elif a[0] == "scroll":
+                d = float(a[1]) * st["dur"] * (0.15 if a[2] == "units" else 0.9)
+                _set_view(st["t0"] + d, st["dur"])
+
+        # ---------------- Maus ----------------
+        GRAB = 6                                       # Fangbreite der Marker (px)
+
+        def _hit(ev):
+            """Was liegt unter dem Zeiger? 'left'/'right' = Loop-Marker,
+            'move' = innerhalb des Loops, sonst None."""
+            if not st["sel"] or ev.y < RULER_H:
+                return None
+            W = max(1, cvs.winfo_width())
+            a, b = sorted(st["sel"])
+            xa, xb = _t2x(a, W), _t2x(b, W)
+            if abs(ev.x - xa) <= GRAB:
+                return "left"
+            if abs(ev.x - xb) <= GRAB:
+                return "right"
+            if xa < ev.x < xb:
+                return "move"
+            return None
+
+        def _on_motion(ev):
+            """Mauszeiger zeigt an, was ein Ziehen jetzt bewirken wuerde."""
+            if st["drag"]:
+                return
+            h = _hit(ev)
+            cvs.config(cursor=("sb_h_double_arrow" if h in ("left", "right")
+                               else "fleur" if h == "move" else ""))
+
+        def _on_press(ev):
+            W = max(1, cvs.winfo_width())
+            if ev.y < RULER_H + BAND_H and _hit(ev) not in ("left", "right"):
+                t = _x2t(ev.x, W)                      # Klick ins Parts-Band
+                for i, p in enumerate(st["parts"]):
+                    if _p_t0(p) <= t <= _p_t1(p):
+                        _select_part(i)
+                        return
+                return
+            h = _hit(ev)
+            t = _x2t(ev.x, W)
+            if h in ("left", "right", "move"):
+                # bestehende Auswahl greifen statt eine neue aufzuziehen
+                st["drag"] = {"mode": h, "t": t, "sel": tuple(sorted(st["sel"]))}
+            else:
+                ts = _snap(t)
+                _set_sel(ts, ts)
+                st["drag"] = {"mode": "new", "t": ts, "sel": (ts, ts)}
+
+        def _on_drag(ev):
+            d = st["drag"]
+            if not d:
+                return
+            W = max(1, cvs.winfo_width())
+            if ev.x < 12:                              # am Rand mitscrollen
+                _set_view(st["t0"] - st["dur"] * 0.03, st["dur"])
+            elif ev.x > W - 12:
+                _set_view(st["t0"] + st["dur"] * 0.03, st["dur"])
+            t = _x2t(ev.x, W)
+            a0, b0 = d["sel"]
+            if d["mode"] == "move":
+                # ganzen Loop verschieben: Laenge bleibt EXAKT erhalten
+                na = _snap(a0 + (t - d["t"]))
+                na = max(0.0, min(total - (b0 - a0), na))
+                _set_sel(na, na + (b0 - a0))
+            elif d["mode"] == "left":
+                _set_sel(min(_snap(t), b0 - 1e-3), b0)
+            elif d["mode"] == "right":
+                _set_sel(a0, max(_snap(t), a0 + 1e-3))
+            else:
+                _set_sel(a0, _snap(t))
+
+        def _on_release(_ev):
+            was_new = bool(st["drag"]) and st["drag"]["mode"] == "new"
+            st["drag"] = None
+            if was_new and st["sel"] and abs(st["sel"][1] - st["sel"][0]) < 1e-3:
+                _set_sel(None, None)                   # reiner Klick = Auswahl weg
+            cvs.config(cursor="")
+
+        def _on_wheel(ev):
+            W = max(1, cvs.winfo_width())
+            if ev.state & 0x0004:                      # Strg = Zoom am Zeiger
+                _zoom(0.8 if ev.delta > 0 else 1.25, center=_x2t(ev.x, W))
+            else:
+                _set_view(st["t0"] - np.sign(ev.delta) * st["dur"] * 0.15,
+                          st["dur"])
+
+        cvs.bind("<Button-1>", _on_press)
+        cvs.bind("<B1-Motion>", _on_drag)
+        cvs.bind("<ButtonRelease-1>", _on_release)
+        cvs.bind("<Motion>", _on_motion)
+        cvs.bind("<MouseWheel>", _on_wheel)
+        cvs.bind("<Configure>", lambda e: _draw())
+
+        # ---------------- Auswahl / Status ----------------
+        stat = tk.Label(win, text="Auswahl: –", font=self.f_small, bg=COL_BG,
+                        fg=COL_MUTED, anchor="w")
+        # Marker auch per Zeitangabe setzen (exakt, ohne Fangraster)
+        tf = tk.Frame(win, bg=COL_BG)
+        tk.Label(tf, text="Loop-Marker:", font=self.f_tiny, bg=COL_BG,
+                 fg=COL_ACCENT).pack(side="left", padx=(0, 6))
+        e_a, e_b, e_len = tk.StringVar(), tk.StringVar(), tk.StringVar()
+        e_bars = tk.StringVar()            # Laenge in TAKTEN (Deluge-Einheit)
+
+        def _nudge_btn(parent, text, cmd):
+            """Kleiner Schrittknopf -- gedrueckt halten wiederholt (Spinner)."""
+            return tk.Button(parent, text=text, command=cmd, font=self.f_tiny,
+                             bg=COL_SURFACE, fg=COL_FG,
+                             activebackground=COL_SURF_HI, activeforeground=COL_FG,
+                             bd=0, padx=5, pady=0, highlightthickness=0,
+                             cursor="hand2", repeatdelay=400, repeatinterval=45)
+
+        for lbl, var, which, w in (("Start", e_a, "a", 10), ("Ende", e_b, "b", 10),
+                                   ("Länge", e_len, "len", 10),
+                                   ("Takte", e_bars, "bars", 4)):
+            tk.Label(tf, text=lbl, font=self.f_tiny, bg=COL_BG,
+                     fg=(COL_ACCENT if which == "bars" else COL_MUTED)).pack(
+                         side="left", padx=(8, 2))
+            _nudge_btn(tf, "−", lambda x=which: _nudge(x, -1)).pack(side="left")
+            ent = tk.Entry(tf, textvariable=var, width=w, font=self.f_small,
+                           bg=COL_SURFACE, fg=COL_FG, insertbackground=COL_FG,
+                           bd=0, highlightthickness=0, justify="right")
+            ent.pack(side="left", padx=1)
+            ent.bind("<Return>", lambda e: _apply_times())
+            _nudge_btn(tf, "+", lambda x=which: _nudge(x, 1)).pack(side="left")
+        self._small_button(tf, "Übernehmen", lambda: _apply_times()).pack(
+            side="left", padx=(8, 0))
+        tk.Button(tf, text="⟲ Tempo aus Auswahl",
+                  command=lambda: _tempo_from_sel(), font=self.f_small,
+                  bg=COL_SURFACE, fg=COL_ACCENT, activebackground=COL_SURF_HI,
+                  activeforeground=COL_FG, bd=0, padx=8, pady=2,
+                  highlightthickness=0, cursor="hand2").pack(side="left",
+                                                             padx=(10, 0))
+        tk.Label(tf, text="Loop markieren → Takte eintragen → „Tempo aus "
+                 "Auswahl“: dann bestimmt DEIN Loop das BPM-Raster",
+                 font=self.f_tiny, bg=COL_BG, fg=COL_MUTED).pack(side="left",
+                                                                 padx=(8, 0))
+
+        def _sel_bars():
+            """Auswahl als (start_takt, end_takt) fuer den Deluge-Export.
+
+            Gerundet wird die LAENGE, nicht die beiden Grenzen einzeln -- sonst
+            entsteht aus 4,36 Takten schnell ein 5-Takt-Part, wenn der Start
+            knapp unter und das Ende knapp ueber einer Taktlinie liegt."""
+            if not st["sel"]:
+                return None
+            a, b = sorted(st["sel"])
+            bars = int(round((b - a) / bar_t))
+            if bars < 1:
+                return None
+            s = max(0, int(round(_bar_of(a))))
+            return (s, s + bars)
+
+        def _set_sel(a, b):
+            """Zentrale Stelle fuer JEDE Auswahl-Aenderung (Maus, Zeitfelder,
+            Schrittknoepfe, Part-Klick): begrenzen, Felder nachziehen, neu
+            zeichnen -- und einen LAUFENDEN Loop sofort mitziehen."""
+            if a is None or b is None:
+                st["sel"] = None
+            else:
+                lo, hi = (float(a), float(b)) if a <= b else (float(b), float(a))
+                st["sel"] = (max(0.0, lo), min(total, hi))
+            p = st["player"]
+            if (st.get("looping") and p is not None and st["sel"]
+                    and st["sel"][1] - st["sel"][0] > 0.05):
+                # Der Player springt selbst hinein, wenn die Abspielposition
+                # ausserhalb liegt -- winzige Korrekturen laufen nahtlos weiter.
+                p.set_loop(st["sel"][0], st["sel"][1])
+            _sync_fields()
+            _draw()
+            _upd_status()
+
+        def _sync_fields():
+            if not st["sel"]:
+                vals = ("", "", "", "")
+            else:
+                a, b = st["sel"]
+                # Taktzahl aus der LAENGE (mit einer Stelle, damit man sieht,
+                # ob die Auswahl krumm ist: 4.4 statt glatt 4)
+                nb = (b - a) / bar_t
+                vals = (_fmt_time(a), _fmt_time(b), _fmt_time(b - a),
+                        f"{nb:.0f}" if abs(nb - round(nb)) < 0.02
+                        else f"{nb:.1f}")
+            e_a.set(vals[0])
+            e_b.set(vals[1])
+            e_len.set(vals[2])
+            e_bars.set(vals[3])
+            st["shown"] = vals             # Merker: was steht gerade drin?
+
+        def _apply_times():
+            """Zeitfelder uebernehmen. Entscheidend ist, WELCHES Feld der Nutzer
+            angefasst hat: eine geaenderte Laenge zieht das Ende nach, sonst
+            gelten Start und Ende."""
+            sa, sb, sl, sbar = st.get("shown", ("", "", "", ""))
+            ga, gb, gl = e_a.get().strip(), e_b.get().strip(), e_len.get().strip()
+            gbar = e_bars.get().strip()
+            a, b, ln = (_parse_time_str(ga), _parse_time_str(gb),
+                        _parse_time_str(gl))
+            try:
+                nb = float(gbar.replace(",", ".")) if gbar else None
+            except ValueError:
+                nb = None
+            if a is None and b is None and ln is None and nb is None:
+                stat.config(text="Zeitangabe nicht verstanden – z. B. 1:23.456, "
+                            "83,4 oder 83")
+                _sync_fields()
+                return
+            cur = st["sel"] or (0.0, 0.0)
+            if a is None:
+                a = cur[0]
+            if gbar != sbar and nb is not None and nb > 0:
+                # Taktzahl hat Vorrang: Laenge EXAKT auf ganze Takte legen ->
+                # geloopter Bereich und exportierter Part sind dann identisch
+                b = a + max(1, int(round(nb))) * bar_t
+            elif gl != sl and ln is not None:          # Laenge wurde geaendert
+                b = a + ln
+            elif b is None:
+                b = cur[1]
+            if b <= a:
+                stat.config(text="Das Ende muss nach dem Start liegen.")
+                _sync_fields()
+                return
+            _set_sel(a, b)
+
+        def _tempo_from_sel():
+            """DER musikalische Weg: Der markierte Loop IST der Maßstab. Man
+            sagt, wie viele Takte er umfasst -- daraus folgen Tempo und
+            Taktraster (Takt-1 auf den Loop-Start). Die automatische
+            BPM-Schaetzung wird damit ueberstimmt, und weil das Raster fuer den
+            ganzen Song gilt, haben alle weiteren Parts dasselbe Tempo."""
+            nonlocal bpm, bar_t, t_db, n_bars
+            if not st["sel"]:
+                stat.config(text="Erst den Loop markieren, dann die Taktzahl "
+                            "eintragen und „Tempo aus Auswahl“ drücken.")
+                return
+            a, b = st["sel"]
+            try:
+                nb = int(round(float(e_bars.get().strip().replace(",", "."))))
+            except ValueError:
+                nb = 0
+            if nb < 1:
+                stat.config(text="Bitte im Feld „Takte“ eintragen, wie viele "
+                            "Takte der Loop umfasst (z. B. 4).")
+                return
+            new_bar = (b - a) / nb
+            new_bpm = 4.0 * 60.0 / new_bar
+            if not (20.0 <= new_bpm <= 400.0):
+                stat.config(text=f"Daraus ergäbe sich {new_bpm:.1f} BPM – das "
+                            "passt nicht. Taktzahl prüfen.")
+                return
+            old = bpm
+            bpm, bar_t = new_bpm, new_bar
+            # Raster so legen, dass der Loop-Start GENAU auf eine Taktlinie
+            # faellt (Takt-1 bleibt dabei im ersten Takt des Stuecks)
+            t_db = a - np.floor(a / bar_t) * bar_t
+            n_bars = max(1, int((total - t_db) / bar_t))
+            dblbl.config(text=f"{t_db:.2f} s")
+            _upd_head()
+            _sync_fields()
+            _refresh_list()
+            _draw()
+            stat.config(text=f"Tempo aus dem Loop: {nb} Takte in "
+                        f"{_fmt_time(b - a)} → {bpm:.2f} BPM "
+                        f"(vorher {old:.2f}). Takt-1 liegt jetzt auf "
+                        f"{_fmt_time(t_db)}; alle Parts nutzen dieses Raster.")
+
+        NUDGE = 0.001                      # kleinster Schritt = 1 ms (Anzeige)
+
+        def _nudge(which, sign):
+            """Marker per Knopf um den kleinsten Zeitschritt verschieben.
+            Start/Ende bleiben dabei immer mindestens einen Schritt auseinander;
+            bei „Länge“ wandert das Ende."""
+            if not st["sel"]:
+                stat.config(text="Erst einen Bereich markieren.")
+                return
+            a, b = st["sel"]
+            d = sign * NUDGE
+            if which == "a":
+                _set_sel(min(max(0.0, a + d), b - NUDGE), b)
+            elif which == "b":
+                _set_sel(a, max(b + d, a + NUDGE))
+            elif which == "bars":
+                # ganze Takte: auf die naechste Taktzahl auf-/abrunden
+                nb = max(1, int(round((b - a) / bar_t)) + sign)
+                _set_sel(a, a + nb * bar_t)
+            else:                          # Laenge: Ende nachziehen
+                _set_sel(a, max(a + NUDGE, b + d))
+
+        def _upd_status():
+            if not st["sel"]:
+                stat.config(text="Auswahl: – (in die Wellenform ziehen; Ränder "
+                            "greifen verschiebt einzeln, Mitte den ganzen Loop; "
+                            "Strg+Mausrad zoomt)")
+                return
+            a, b = st["sel"]
+            sb = _sel_bars()
+            txt = (f"Auswahl: {_fmt_time(a)} – {_fmt_time(b)}  "
+                   f"(Länge {_fmt_time(b - a)})")
+            if sb:
+                nb = sb[1] - sb[0]
+                soll = nb * bar_t
+                txt += f"   ·   als Part: {nb} Takte ({_fmt_time(soll)})"
+                # Weicht die Auswahl von ganzen Takten ab, wird der Part
+                # entsprechend gekuerzt/verlaengert -- das muss man sehen.
+                if abs(soll - (b - a)) > 0.02:
+                    d = soll - (b - a)
+                    txt += (f"  ⚠ {abs(d) * 1000:.0f} ms "
+                            f"{'länger' if d > 0 else 'kürzer'} als die "
+                            "Auswahl – „Takte“ setzt es exakt")
+            else:
+                txt += "   ·   für einen Part zu kurz (unter einem Takt)"
+            p = st["player"]
+            if st.get("looping") and p is not None and p.is_playing():
+                txt += "   ·   ▶ Loop läuft (folgt den Markern)"
+            stat.config(text=txt)
+
+        # ---------------- Parts ----------------
+        lst = None                                     # Vorwaertsdeklaration
+
+        def _p_t0(p):
+            """Exakter Start eines Parts."""
+            return float(p.get("t0", t_db + p.get("s", 0) * bar_t))
+
+        def _p_t1(p):
+            """Exaktes Ende eines Parts."""
+            if p.get("t1") is not None:
+                return float(p["t1"])
+            return _p_t0(p) + (p.get("e", 1) - p.get("s", 0)) * bar_t
+
+        def _p_bars(p):
+            """Taktzahl des Parts -- ABGELEITET aus der Laenge und dem aktuellen
+            Tempo (deshalb stimmt sie auch nach „Tempo aus Auswahl“ noch)."""
+            return max(1, int(round((_p_t1(p) - _p_t0(p)) / bar_t)))
+
+        def _refresh_list(sel_i=None):
+            lst.delete(0, "end")
+            for p in st["parts"]:
+                d = _p_t1(p) - _p_t0(p)
+                nb = _p_bars(p)
+                mark = "" if abs(d - nb * bar_t) <= 0.02 else " ⚠"
+                lst.insert("end", f"{p['label']:>4}   {_fmt_time(_p_t0(p))}"
+                           f"   {nb} Takte   ({_fmt_time(d)}){mark}")
+            if sel_i is not None and 0 <= sel_i < len(st["parts"]):
+                lst.selection_clear(0, "end")
+                lst.selection_set(sel_i)
+            _draw()
+
+        def _add_part():
+            sb = _sel_bars()
+            if not sb:
+                stat.config(text="Erst einen Bereich in der Wellenform ziehen.")
+                return
+            s, e = sb
+            if e > n_bars:
+                e = n_bars
+            if e <= s:
+                stat.config(text="Der Part muss mindestens einen Takt lang sein.")
+                return
+            # Part = EXAKTER Zeitbereich der Auswahl (t0/t1). Die Taktzahl wird
+            # daraus abgeleitet, nicht umgekehrt -- so bleibt der Part genau
+            # das, was geloopt wurde, auch wenn das Tempo spaeter noch aus
+            # einem Loop neu bestimmt wird.
+            t0 = float(st["sel"][0]) if st["sel"] else (t_db + s * bar_t)
+            t1 = float(st["sel"][1]) if st["sel"] else (t0 + (e - s) * bar_t)
+            # Label: naechste FREIE Typ-Nummer (nach Loeschungen sonst doppelt --
+            # und gleiche Nummer hiesse gleicher Teil/gleiche Farbe)
+            used = set()
+            for q in st["parts"]:
+                m = re.match(r"(\d+)", q["label"])
+                if m:
+                    used.add(int(m.group(1)))
+            num = next(i for i in range(1, 999) if i not in used)
+            st["parts"].append({"t0": t0, "t1": t1, "label": f"{num}a"})
+            st["parts"].sort(key=lambda p: p["t0"])
+            _refresh_list(next((i for i, p in enumerate(st["parts"])
+                                if p["t0"] == t0), None))
+            nb = int(round((t1 - t0) / bar_t))
+            krumm = abs((t1 - t0) - nb * bar_t) > 0.02
+            stat.config(text=f"Part hinzugefügt: {_fmt_time(t0)} – "
+                        f"{_fmt_time(t1)} ({_fmt_time(t1 - t0)}) = {nb} Takte"
+                        + ("  ⚠ passt nicht auf ganze Takte – „Tempo aus "
+                           "Auswahl“ macht daraus ein exaktes Raster"
+                           if krumm else " (exakt)")
+                        + f". Insgesamt {len(st['parts'])}.")
+
+        def _select_part(i):
+            if not (0 <= i < len(st["parts"])):
+                return
+            p = st["parts"][i]
+            namev.set(p["label"])
+            lst.selection_clear(0, "end")
+            lst.selection_set(i)
+            _set_sel(_p_t0(p), _p_t1(p))   # genau der gespeicherte Bereich
+
+        def _cur_index():
+            s = lst.curselection()
+            return int(s[0]) if s else None
+
+        def _del_part():
+            i = _cur_index()
+            if i is None:
+                stat.config(text="Erst einen Part in der Liste wählen.")
+                return
+            st["parts"].pop(i)
+            _refresh_list()
+            stat.config(text=f"Part gelöscht – noch {len(st['parts'])}.")
+
+        def _rename_part():
+            i = _cur_index()
+            # Das Label landet im WAV-Dateinamen -> Pfad-Sonderzeichen raus
+            nm = re.sub(r"[^0-9A-Za-zÄÖÜäöüß _-]", "", namev.get()).strip()[:12]
+            if i is None or not nm:
+                stat.config(text="Part wählen und einen Namen eintragen "
+                            "(Buchstaben/Ziffern).")
+                return
+            st["parts"][i]["label"] = nm
+            _refresh_list(i)
+            stat.config(text="Umbenannt. Gleiche Namen = gleiche Farbe auf der "
+                        "Deluge (z. B. 1a und 1b für zwei Strophen).")
+
+        def _auto_parts():
+            stat.config(text="erkenne Abschnitte automatisch … (dauert kurz)")
+
+            def _work():
+                try:
+                    secs = core.detect_sections(stems, sr, t_db=t_db, bpm=bpm,
+                                                target_bars=8)
+
+                    def _apply():
+                        if not secs:
+                            stat.config(text="Keine Abschnitte erkannt.")
+                            return
+                        st["parts"] = [
+                            {"t0": t_db + int(s["start_bar"]) * bar_t,
+                             "t1": t_db + int(s["end_bar"]) * bar_t,
+                             "label": s.get("label", "1a")} for s in secs]
+                        _refresh_list()
+                        stat.config(text=f"{len(secs)} Abschnitte vorgeschlagen – "
+                                    "jetzt anhören und nachjustieren.")
+                    self.root.after(0, _apply)
+                except Exception as ex:
+                    self.root.after(0, lambda e=ex: stat.config(
+                        text=f"Automatik fehlgeschlagen: {e}"))
+            threading.Thread(target=_work, daemon=True).start()
+
+        # ---------------- Wiedergabe ----------------
+        def _apply_gains():
+            p = st["player"]
+            if p is None:
+                return
+            for k, n in enumerate(names):
+                p.set_gain(k, 1.0 if shown[n].get() else 0.0)
+
+        def _ensure_player():
+            if st["player"] is None:
+                # Grosszuegig puffern: hier wird nur vorgehoert, Latenz ist
+                # egal -- Aussetzer waeren fatal (siehe StemPlayer.latency).
+                p = core.StemPlayer([stems[n] for n in names], sr, names=names,
+                                    blocksize=4096, latency="high")
+                p.start_stream()
+                st["player"] = p
+                self._stem_players.append(p)
+                _apply_gains()
+            return st["player"]
+
+        def _play(loop=True):
+            # EXAKT die eingestellte Auswahl loopen (nicht die Takt-Rundung) --
+            # sonst hoert man nicht das, was man gerade eingestellt hat.
+            if not st["sel"]:
+                stat.config(text="Erst einen Bereich (oder Part) wählen.")
+                return
+            a, b = st["sel"]
+            if b - a < 0.05:
+                stat.config(text="Der Bereich ist zu kurz zum Abspielen.")
+                return
+            try:
+                p = _ensure_player()
+            except Exception as ex:
+                stat.config(text=f"Wiedergabe nicht möglich: {ex}")
+                return
+            st["looping"] = bool(loop)     # merkt: Loop live nachfuehren
+            if loop:
+                p.set_loop(a, b)
+            else:
+                p.set_loop(None, None)
+            p.seek(a)
+            p.play()
+            _tick()
+            stat.config(text=(f"Loop läuft: {_fmt_time(a)} – {_fmt_time(b)} "
+                              f"(Länge {_fmt_time(b - a)}) – trägt der Part?"
+                              if loop else f"Wiedergabe ab {_fmt_time(a)}."))
+
+        def _stop():
+            p = st["player"]
+            if p is not None:
+                p.pause()
+            st["looping"] = False
+            st["cursor"] = None
+            _draw_cursor()
+
+        def _tick():
+            p = st["player"]
+            if p is None or not win.winfo_exists():
+                return
+            if p.is_playing():
+                st["cursor"] = p.position()[0]
+                _draw_cursor()
+                # 10x/s reicht fuer die Laufmarke und laesst dem Audio-Thread
+                # mehr Luft (jedes Zeichnen haelt kurz den GIL)
+                win.after(100, _tick)
+            else:
+                st["cursor"] = None
+                _draw_cursor()
+
+        # ---------------- Speichern ----------------
+        def _save():
+            if not st["parts"]:
+                stat.config(text="Noch keine Parts definiert.")
+                return
+            sel = self._part_export_dialog(win, names)
+            if not sel:
+                return
+            cfg = load_config()
+            p = filedialog.asksaveasfilename(
+                title="Parts-Deluge-Song speichern (.XML; Abschnitts-WAVs daneben)",
+                defaultextension=".XML",
+                initialfile=core.sanitize_filename(title or "AudioWizard") + "_Parts.XML",
+                initialdir=cfg.get("last_save_dir") or "",
+                filetypes=[("Deluge-Song", "*.XML"), ("Alle", "*.*")])
+            if not p:
+                return
+            _stop()
+            # start_sec = EXAKT der markierte Punkt, Taktzahl aus der Laenge
+            secs = []
+            for i, q in enumerate(st["parts"]):
+                sb = max(0, int(round((_p_t0(q) - t_db) / bar_t)))
+                secs.append({"start_bar": sb, "end_bar": sb + _p_bars(q),
+                             "label": q["label"], "start_sec": _p_t0(q),
+                             "type": i})
+            a_names, m_names = sel["audio"], sel["midi"]
+            stat.config(text="schneide Parts & schreibe Deluge-Song …")
+            savebtn.config(state="disabled", text="speichert …")
+
+            def _work():
+                try:
+                    # MIDI JETZT aus genau den gewaehlten Spuren erkennen -- und
+                    # zwar aus den GEWARPTEN (die Noten liegen damit schon in der
+                    # Export-Zeitbasis, kein Nachrechnen noetig).
+                    notes = dict(midi or {})
+                    if m_names:
+                        min_ms = float(load_config().get("bass_min_ms", 130))
+                        for i, nm in enumerate(m_names):
+                            self.root.after(0, lambda n=nm, i=i: stat.config(
+                                text=f"erkenne MIDI-Noten "
+                                f"({i + 1}/{len(m_names)}): "
+                                f"{core.STEM_LABELS.get(n, n)} …"))
+                            try:
+                                if nm == "drums":
+                                    dmap, dsens = self._drum_settings()
+                                    notes[nm] = core.drums_to_midi_notes(
+                                        stems[nm], sr, mapping=dmap,
+                                        sensitivity=dsens)
+                                else:
+                                    lo, hi = core.STEM_MIDI_RANGE.get(
+                                        nm, (40.0, 2000.0))
+                                    notes[nm] = core.stem_to_midi_notes(
+                                        stems[nm], sr, min_freq=lo, max_freq=hi,
+                                        min_note_ms=min_ms,
+                                        label=core.STEM_LABELS.get(nm, nm))
+                            except Exception as ex:
+                                self._msg_later(
+                                    stat, f"{core.STEM_LABELS.get(nm, nm)}"
+                                    f"→MIDI übersprungen: {ex}")
+                    self.root.after(0, lambda: stat.config(
+                        text="schneide Parts & schreibe Deluge-Song …"))
+                    xmlp, wavs = deluge.write_deluge_parts(
+                        p, {n: stems[n] for n in a_names}, sr,
+                        {n: notes[n] for n in m_names if notes.get(n)},
+                        bpm, t_db, secs, instruments=a_names,
+                        log=lambda m: None)
+                    save_config({**load_config(),
+                                 "last_save_dir": os.path.dirname(p)})
+                    n_notes = sum(len(notes.get(n) or []) for n in m_names)
+                    extra = ("  ACHTUNG: Die Deluge kennt 12 Sections – die "
+                             "weiteren Parts landen in der letzten."
+                             if len(secs) > 12 else "")
+                    msg = (f"Gespeichert: {os.path.basename(xmlp)} – {len(secs)} "
+                           f"Parts, {len(wavs)} Audio-Clips"
+                           + (f" + {n_notes} MIDI-Noten aus "
+                              f"{len(m_names)} Spur(en)" if m_names else
+                              " (ohne MIDI)")
+                           + ". XML → SONGS/, WAVs → SAMPLES/AudioWizard/ "
+                           "auf die SD." + extra)
+
+                    def _done():
+                        stat.config(text=msg)
+                        savebtn.config(state="normal",
+                                       text="Deluge-Song speichern…")
+                        # Klare Rueckmeldung -- die Statuszeile allein wird
+                        # leicht uebersehen
+                        messagebox.showinfo("Deluge-Song gespeichert",
+                                            msg.replace("  ", "\n\n"),
+                                            parent=win)
+                    self.root.after(0, _done)
+                except Exception as ex:
+                    def _err(e=ex):
+                        stat.config(text=f"Fehler: {e}")
+                        savebtn.config(state="normal",
+                                       text="Deluge-Song speichern…")
+                        messagebox.showerror("Speichern fehlgeschlagen",
+                                             str(e), parent=win)
+                    self.root.after(0, _err)
+            threading.Thread(target=_work, daemon=True).start()
+
+        # ---------------- Bedienleisten ----------------
+        r1 = tk.Frame(win, bg=COL_BG)
+        self._small_button(r1, "➕ Part aus Auswahl", _add_part).pack(side="left")
+        self._small_button(r1, "▶ Auswahl loopen", lambda: _play(True)).pack(
+            side="left", padx=(8, 0))
+        self._small_button(r1, "▶ ab Auswahl", lambda: _play(False)).pack(
+            side="left", padx=(4, 0))
+        self._small_button(r1, "■ Stop", _stop).pack(side="left", padx=(4, 0))
+        self._small_button(r1, "Automatisch vorschlagen", _auto_parts).pack(
+            side="left", padx=(16, 0))
+
+        body = tk.Frame(win, bg=COL_BG)
+        lst = tk.Listbox(body, height=5, width=52, bg=COL_SURFACE, fg=COL_FG,
+                         font=self.f_tiny, bd=0, highlightthickness=0,
+                         selectbackground=COL_SURF_HI, activestyle="none")
+        lst.pack(side="left", fill="x", expand=True)
+        lst.bind("<<ListboxSelect>>",
+                 lambda e: (_select_part(_cur_index())
+                            if _cur_index() is not None else None))
+        lst.bind("<Double-Button-1>", lambda e: _play(True))
+        side = tk.Frame(body, bg=COL_BG)
+        side.pack(side="left", padx=(10, 0))
+        namev = tk.StringVar(value="")
+        tk.Entry(side, textvariable=namev, width=10, font=self.f_small,
+                 bg=COL_SURFACE, fg=COL_FG, insertbackground=COL_FG, bd=0,
+                 highlightthickness=0).pack(anchor="w")
+        self._small_button(side, "Umbenennen", _rename_part).pack(anchor="w")
+        self._small_button(side, "Part löschen", _del_part).pack(anchor="w")
+        self._small_button(side, "Alle löschen",
+                           lambda: (st.update(parts=[]), _refresh_list())).pack(
+                               anchor="w")
+
+        hint = tk.Label(win, text="Bereich ziehen → „Auswahl loopen“ zum Prüfen "
+                        "→ „Part aus Auswahl“. Ränder greifen verschiebt einzeln, "
+                        "Mitte den ganzen Loop. Gleiche Namen (1a/1b) = gleiche "
+                        "Farbe auf der Deluge.",
+                        font=self.f_tiny, bg=COL_BG, fg=COL_MUTED,
+                        justify="left", wraplength=1050)
+
+        r2 = tk.Frame(win, bg=COL_BG)
+        savebtn = tk.Button(r2, text="Deluge-Song speichern…", command=_save,
+                            font=self.f_btn, bg="#1D9E75", fg="#04342C",
+                            activebackground=COL_OK, activeforeground="#04342C",
+                            bd=0, padx=20, pady=6, highlightthickness=0,
+                            cursor="hand2")
+        savebtn.pack(side="left", padx=4)
+
+        def _close():
+            p = st["player"]
+            if p is not None:
+                try:
+                    p.stop()
+                except Exception:
+                    pass
+                if p in self._stem_players:
+                    try:
+                        self._stem_players.remove(p)
+                    except ValueError:
+                        pass
+                st["player"] = None
+            win.destroy()
+
+        self._small_button(r2, "Schließen", _close).pack(side="left", padx=4)
+        win.protocol("WM_DELETE_WINDOW", _close)
+        win._a2m_editor = (snapv, shown, namev)   # Tk-Variablen vor GC schuetzen
+
+        # --- Layout: von UNTEN nach oben packen ---
+        # Pack-Reihenfolge = Prioritaet bei knappem Platz. Die Bedienleisten
+        # kommen zuerst (side=bottom) und bleiben damit auch auf kleinen
+        # Bildschirmen vollstaendig sichtbar; die Wellenform bekommt den Rest
+        # und schrumpft als erste.
+        r2.pack(side="bottom", pady=(6, 8))
+        hint.pack(side="bottom", fill="x", padx=14, pady=(4, 0))
+        body.pack(side="bottom", fill="x", padx=14, pady=(6, 0))
+        r1.pack(side="bottom", fill="x", padx=14, pady=(6, 0))
+        tf.pack(side="bottom", fill="x", padx=14, pady=(2, 0))
+        stat.pack(side="bottom", fill="x", padx=14, pady=(6, 0))
+        sbx.pack(side="bottom", fill="x", padx=14)
+        cvs.pack(side="top", fill="both", expand=True, padx=14, pady=(6, 0))
+
+        # Peak-Pyramiden im Hintergrund (Mix + je Stem), dann erst zeichnen
+        def _peaks_work(after_msg=None):
+            """Peak-Pyramiden im Hintergrund. after_msg wird ZULETZT in die
+            Statuszeile geschrieben -- sonst ueberschreibt der Neuaufbau eine
+            wichtige Meldung (z. B. die Warnung nach einem Raster-Wechsel)."""
+            try:
+                pk = {}
+                mix = None
+                for n in names:
+                    a = np.asarray(stems[n], dtype=np.float32)
+                    m = a.mean(axis=1) if a.ndim == 2 else a
+                    pk[n] = core.waveform_peaks(m)
+                    if mix is None:
+                        mix = m.copy()
+                    else:
+                        k = min(len(mix), len(m))
+                        mix = mix[:k] + m[:k]
+                # Mix ALLER Spuren gleich in den Kombinations-Cache legen
+                full = core.waveform_peaks(
+                    mix if mix is not None else np.zeros(1, dtype=np.float32))
+
+                def _done():
+                    st["peaks"] = pk
+                    st["mixpk"] = {tuple(names): full}
+                    st["busy"] = None
+                    _draw()
+                    _upd_status()
+                    if after_msg:
+                        stat.config(text=after_msg)
+                self.root.after(0, _done)
+            except Exception as ex:
+                self.root.after(0, lambda e=ex: stat.config(
+                    text=f"Wellenform fehlgeschlagen: {e}"))
+        threading.Thread(target=_peaks_work, daemon=True).start()
 
     def _save_stems_dialog(self, parent_win, stems_dict, sr, bpm=0.0):
         """Dialog: welche Stems speichern (einzeln/alle) + optional „auf Takt
@@ -3606,14 +4923,10 @@ class DisplayApp:
         v_stemmidi = tk.BooleanVar(value=False)
         v_barcut = tk.BooleanVar(value=bool(cfg.get("stem_barcut", False)))
         v_deluge = tk.BooleanVar(value=False)
-        dl_bars = tk.StringVar(value="2")          # Vorlauf-Takte (Lead-in)
-        _gl0 = cfg.get("deluge_gridlock", "off")          # off/bar1/groove/beat
-        if _gl0 == "bar":                                 # altes "Pro Takt" -> Takt auf Eins
-            _gl0 = "bar1"
-        dl_grid = tk.StringVar(value=_gl0 if _gl0 in
-                               ("off", "bar1", "groove", "beat") else "off")
-        dl_instr = {n: tk.BooleanVar(value=True)
-                    for n in ("bass", "drums", "other", "vocals")}
+        # Deluge: einzige Vorab-Frage ist, ob die Instrumentspuren getrennt
+        # werden sollen (teuer) -- ohne Trennung geht es sofort in den Editor.
+        dl_split = tk.BooleanVar(value=bool(cfg.get("deluge_split", False))
+                                 and demucs_ok)
         # Play-Along-Mix: welche Spuren AUSBLENDEN + Zielformat (gemerkt)
         mp3_ok = core.mp3_supported()
         v_mixout = tk.BooleanVar(value=False)
@@ -3771,51 +5084,25 @@ class DisplayApp:
                        else "braucht: pip install faster-whisper",
                        command=_toggle_sheetopts)
 
-        # Deluge-Bundle + (nur dann sichtbare) Vorlauf-/Instrument-Auswahl
+        # Deluge-Song: EINE Frage -- getrennte Instrumentspuren oder nur der
+        # Gesamtmix. Alles Weitere (Parts, Taktraster, Downbeat, Spur- und
+        # MIDI-Auswahl) passiert danach direkt im Part-Editor.
         delf = tk.Frame(body, bg=COL_BG)
-        dlr1 = tk.Frame(delf, bg=COL_BG)
-        dlr1.pack(anchor="w")
-        tk.Label(dlr1, text="Vorlauf:", font=self.f_tiny, bg=COL_BG,
-                 fg=COL_ACCENT).pack(side="left", padx=(0, 6))
-        tk.Entry(dlr1, textvariable=dl_bars, width=3, font=self.f_small,
-                 bg=COL_SURFACE, fg=COL_FG, insertbackground=COL_FG, bd=0,
-                 highlightthickness=0, justify="center").pack(side="left", padx=4)
-        tk.Label(dlr1, text="Takte vor dem Downbeat (Auftakt liegt im Vorlauf)",
-                 font=self.f_tiny, bg=COL_BG, fg=COL_MUTED).pack(side="left")
-        dlr2 = tk.Frame(delf, bg=COL_BG)
-        dlr2.pack(anchor="w", pady=(2, 0))
-        tk.Label(dlr2, text="Instrumente:", font=self.f_tiny, bg=COL_BG,
-                 fg=COL_ACCENT).pack(side="left", padx=(0, 6))
-        for nm, lbl in (("bass", "Bass"), ("drums", "Drums"),
-                        ("other", "Rest"), ("vocals", "Gesang")):
-            tk.Checkbutton(dlr2, text=lbl, variable=dl_instr[nm], font=self.f_small,
-                           bg=COL_BG, fg=COL_FG, selectcolor=COL_SURFACE,
-                           activebackground=COL_BG, activeforeground=COL_FG, bd=0,
-                           highlightthickness=0).pack(side="left", padx=(0, 4))
-        # Raster-Bindung: A) Original-Audio (kann driften) / B) auf Takt-Raster ziehen
-        dlr3 = tk.Frame(delf, bg=COL_BG)
-        dlr3.pack(anchor="w", pady=(2, 0))
-        tk.Label(dlr3, text="Taktraster:", font=self.f_tiny, bg=COL_BG,
-                 fg=COL_ACCENT).pack(side="left", padx=(0, 6))
-        for val, lbl in (("off", "Aus"), ("bar1", "Takt auf Eins"),
-                         ("groove", "Groove"), ("beat", "Pro Beat")):
-            tk.Radiobutton(dlr3, text=lbl, variable=dl_grid, value=val,
-                           font=self.f_small, bg=COL_BG, fg=COL_FG,
-                           selectcolor=COL_SURFACE, activebackground=COL_BG,
-                           activeforeground=COL_FG, bd=0, highlightthickness=0).pack(
-                               side="left", padx=(0, 4))
-        tk.Label(delf, text="Bundle: ausgerichtete Stems (WAV) + MIDI, gemeinsamer "
-                 "Downbeat auf Takt-1-Raster. Tonale Spuren brauchen basic-pitch; "
-                 "Drums = 808-Kit. Nach der Trennung öffnet sich ein Probehör-/Tuning-"
-                 "Fenster (Stems + Metronom hören, Downbeat per ◀/▶ setzen, dann "
-                 "speichern); WAVs danach in SAMPLES/AudioWizard/ auf die SD.\n"
-                 "Taktraster gegen Driften (alle halten den Click synchron, dehnen "
-                 "das Audio tonhöhen-erhaltend; Drums evtl. etwas weicher): „Takt auf "
-                 "Eins“ legt je Takt die 1 aufs Raster, Groove dazwischen voll erhalten "
-                 "(lebendigste). „Groove“ zieht die Schläge 2–4 zusätzlich halb "
-                 "Richtung Raster (straffer, Feeling bleibt) – empfohlen. „Pro Beat“ "
-                 "jeden Schlag exakt aufs Raster (am straffsten, kann steif klingen). "
-                 "„Aus“ = Original (kann driften).",
+        tk.Checkbutton(delf, text="Instrumentspuren trennen (Bass/Drums/Rest/"
+                       "Gesang – dauert je nach Qualität einige Minuten)",
+                       variable=dl_split, font=self.f_small, bg=COL_BG,
+                       fg=COL_FG if demucs_ok else COL_MUTED,
+                       selectcolor=COL_SURFACE, activebackground=COL_BG,
+                       activeforeground=COL_FG, bd=0, highlightthickness=0,
+                       state=("normal" if demucs_ok else "disabled"),
+                       wraplength=460, justify="left").pack(anchor="w")
+        tk.Label(delf, text="Ohne Häkchen geht es SOFORT weiter – der Editor "
+                 "arbeitet dann mit dem Gesamtmix (eine Spur). Mit Häkchen "
+                 "stehen im Editor zusätzlich die einzelnen Instrumente zum "
+                 "Anhören und Exportieren bereit.\nDanach öffnet sich der "
+                 "Part-Editor: Abschnitte in der Wellenform markieren, als Loop "
+                 "prüfen, und beim Speichern wählen, welche Spuren als Audio "
+                 "und MIDI in den Deluge-Song kommen.",
                  font=self.f_tiny, bg=COL_BG, fg=COL_MUTED, justify="left",
                  wraplength=460).pack(anchor="w", pady=(2, 0))
 
@@ -3826,8 +5113,7 @@ class DisplayApp:
                 delf.pack_forget()
 
         del_cb = _cb("Deluge-Song erstellen (.XML für Synthstrom Deluge)", v_deluge,
-                     demucs_ok, "" if demucs_ok else "braucht: pip install demucs",
-                     command=_toggle_delopts)
+                     True, "", command=_toggle_delopts)
 
         # ---- Optionen ----
         _section("Optionen")
@@ -3884,24 +5170,16 @@ class DisplayApp:
                     return                   # Abbruch der Ordnerwahl -> zurueck
             deluge_cfg = None
             if v_deluge.get():
-                instruments = [n for n in ("bass", "drums", "other", "vocals")
-                               if dl_instr[n].get()]
-                if not instruments:
-                    return                   # kein Instrument gewaehlt
-                try:
-                    dlead = max(0, int(float(dl_bars.get().replace(",", "."))))
-                except ValueError:
-                    dlead = 2
-                # KEINE Pfad-Abfrage hier: nach der Trennung oeffnet sich der Probehoer-/
-                # Tuning-Dialog, der das Taktraster (cfg) + den Downbeat per Ohr setzt
-                # und beim Speichern den Pfad fragt.
-                deluge_cfg = {"lead": dlead, "instruments": instruments}
+                # KEINE weiteren Fragen: nach (optionaler) Trennung oeffnet sich
+                # direkt der Part-Editor -- Parts, Downbeat, Spur-/MIDI-Auswahl
+                # und der Speicherpfad kommen dort.
+                deluge_cfg = {"split": bool(dl_split.get()) and demucs_ok}
             lang = next(v for lbl, v in lang_map if lbl == lvar.get())
             model = next(v for lbl, v in model_map if lbl == mvar.get())
             qual = next(v for lbl, v in qual_map if lbl == qvar.get())
             new_cfg = {**load_config(), "sheet_lang": lang, "sheet_model": model,
                        "stem_quality": qual, "stem_barcut": bool(v_barcut.get()),
-                       "deluge_gridlock": dl_grid.get(),
+                       "deluge_split": bool(dl_split.get()),
                        "online_ref": bool(v_online.get())}
             if mix_cfg:
                 new_cfg["mixout_drop"] = mix_cfg["drop"]
@@ -3990,6 +5268,67 @@ class DisplayApp:
                          args=(source, actions, title, log), daemon=True).start()
         return True
 
+    def _prepare_part_editor(self, stems, ssr, title, log, cb, bpm_hint=0.0):
+        """Alles, was der Part-Editor braucht: Tempo + Auto-Downbeat bestimmen
+        und die Spuren EINMAL aufs Taktraster ziehen (gleichmaessige Takte ->
+        Loops und Schnitte sitzen). Rueckgabe-dict fuer _open_part_editor."""
+        self._stem_log(log, "== Deluge-Song vorbereiten ==")
+        dbpm = float(bpm_hint or 0.0)
+        if dbpm <= 0:
+            try:
+                ts = stems.get("drums")
+                if ts is None:
+                    ts = core.accompaniment_from_stems(stems)
+                ts = ts.mean(axis=1) if getattr(ts, "ndim", 1) == 2 else ts
+                dbpm = float(core.estimate_tempo(ts, ssr) or 0.0)
+            except Exception:
+                dbpm = 0.0
+        # WICHTIG: standardmaessig NICHT warpen. Jede Raster-Stufe zieht das
+        # Audio durch einen Phase-Vocoder -- das veraendert den Klang hoerbar
+        # (und kann bei "Pro Beat" wie Aussetzer klingen). Bei produzierten
+        # Songs mit konstantem Tempo ist das ueberfluessig. Wer es braucht,
+        # schaltet das Raster im Editor bewusst ein.
+        grid = load_config().get("editor_gridlock", "off")
+        if grid not in ("off", "bar1", "groove", "beat"):
+            grid = "off"
+        t_db, ws, info = 0.0, stems, None
+        try:
+            t_db, gbpm = core.detect_downbeat(stems, ssr, log=cb)
+            if gbpm > 0:
+                dbpm = gbpm
+        except Exception as ex:
+            self._stem_log(log, f"Downbeat-Erkennung fehlgeschlagen: {ex}")
+        if grid != "off":
+            self._stem_log(log, f"Ziehe aufs Taktraster („{grid}“) – "
+                           "gleichmäßige Takte für saubere Loops …")
+            try:
+                ws, info = core.warp_stems_to_grid(stems, ssr, per=grid,
+                                                   db_orig=t_db, log=cb)
+            except Exception as ex:
+                self._stem_log(log, f"Taktraster übersprungen: {ex}")
+                ws, info = stems, None
+        wbpm = float(info["bpm"]) if info else (dbpm or 120.0)
+        wt_db = float(info["t_db"]) if info else t_db
+        self._stem_log(log, f"Bereit – Part-Editor öffnet sich ({wbpm:.1f} BPM).")
+        return {"stems": ws, "orig": stems, "sr": ssr, "bpm": wbpm,
+                "t_db": wt_db, "db_orig": t_db, "title": title,
+                "gridlock": grid}
+
+    def _material_deluge_only(self, stems, ssr, actions, title, out, log, cb,
+                              step, total):
+        """Kurzweg: NUR Deluge-Song ohne Stem-Trennung -- Vorbereitung und
+        Ergebnis setzen, ohne die uebrigen (Stem-)Phasen zu durchlaufen."""
+        try:
+            self._stem_progress(log, step, total, "Deluge-Song")
+            out["part_editor"] = self._prepare_part_editor(
+                stems, ssr, title, log, cb)
+            self._stem_progress(log, total, total, "Fertig")
+            self._material_res = (out, None)
+        except Exception as e:
+            self._stem_log_error(log)
+            self._material_res = (None, str(e))
+        return
+
     def _material_worker(self, source, actions, title, log):
         try:
             cb = lambda m: self._stem_log(log, m)
@@ -4011,18 +5350,45 @@ class DisplayApp:
             ov = float(actions.get("overlap", 0.1))
             sh = int(actions.get("shifts", 0))
             sm = actions.get("sep_model", "htdemucs")
-            # Phasen fuer den Fortschrittsbalken zaehlen (Trennen ist immer dabei)
+            # Braucht ueberhaupt jemand getrennte Spuren? Der Deluge-Weg kommt
+            # auf Wunsch OHNE Trennung aus (nur Gesamtmix) -- das spart bei
+            # hoher Qualitaet leicht eine halbe Stunde.
+            dcfg0 = actions.get("deluge") or {}
+            need_sep = bool(actions["export"] or actions["sheet"]
+                            or actions["play"] or actions.get("stemmidi")
+                            or actions.get("mixout")
+                            or (dcfg0 and dcfg0.get("split")))
+            # Phasen fuer den Fortschrittsbalken zaehlen
             total = (1 + int(bool(actions["export"])) + int(bool(actions["sheet"]))
                      + int(bool(actions.get("stemmidi")))
                      + int(bool(actions.get("deluge")))
                      + int(bool(actions.get("mixout"))))
             step = 0
+            if not need_sep:
+                # --- Ohne Trennung: Audio als EINE Spur laden (sofort) ---
+                self._stem_progress(log, step, total, "Audio laden")
+                self._stem_log(log, "== Audio laden (ohne Trennung) ==")
+                if isinstance(source, tuple):
+                    _tag, rec, srr = source
+                    stems = {"mix": np.asarray(rec, dtype=np.float32)}
+                    ssr = int(srr)
+                else:
+                    _yan, audio, sr_play = core.load_audio_file(source)
+                    stems, ssr = {"mix": np.asarray(audio, dtype=np.float32)}, int(sr_play)
+                dur_s = len(stems["mix"]) / float(ssr)
+                self._stem_log(log, f"Gesamtmix geladen ({dur_s / 60:.1f} min) – "
+                               "keine Stem-Trennung nötig.")
+                step += 1
+                return self._material_deluge_only(stems, ssr, actions, title,
+                                                  out, log, cb, step, total)
             self._stem_progress(log, step, total, "Stems trennen")
             backend = actions.get("sep_backend", "demucs")
             qtag = ("[Ultra: RoFormer SOTA]" if backend == "roformer"
                     else "[Maximum: htdemucs_ft + Shift-Trick x%d]" % sh if sh > 0
                     else "[hohe Qualität]" if ov >= 0.2 else "[schnell]")
             self._stem_log(log, "== Stems trennen (einmalig) == " + qtag)
+            self._stem_log(log, core.separation_eta(source, backend=backend,
+                                                    model=sm, shifts=sh))
             if backend == "roformer" and isinstance(source, tuple):
                 _tag, rec, srr = source
                 stems, ssr = core.separate_stems_roformer_array(rec, srr, log=cb)
@@ -4124,47 +5490,9 @@ class DisplayApp:
                 step += 1                          # Stems→MIDI fertig
             if actions.get("deluge"):
                 self._stem_progress(log, step, total, "Deluge-Song")
-                self._stem_log(log, "== Deluge-Song vorbereiten ==")
-                dcfg = actions["deluge"]
                 dbpm = float((out.get("sheet") or {}).get("bpm", 0.0))
-                if dbpm <= 0:
-                    try:
-                        ts = stems.get("drums")
-                        if ts is None:
-                            ts = core.accompaniment_from_stems(stems)
-                        ts = ts.mean(axis=1) if getattr(ts, "ndim", 1) == 2 else ts
-                        dbpm = float(core.estimate_tempo(ts, ssr) or 0.0)
-                    except Exception:
-                        dbpm = 0.0
-                # MIDI je gewaehltem Instrument aus den (Original-)Stems. Das Aufs-
-                # Raster-Ziehen UND die Downbeat-Feinjustage passieren INTERAKTIV im
-                # Probehoer-/Tuning-Dialog, der sich nach der Trennung oeffnet.
-                midi = out.get("midi_notes") or {}
-                min_ms = float(load_config().get("bass_min_ms", 130))
-                for nm in dcfg["instruments"]:
-                    if midi.get(nm) is not None or stems.get(nm) is None:
-                        continue
-                    try:
-                        if nm == "drums":
-                            dmap, dsens = self._drum_settings()
-                            midi[nm] = core.drums_to_midi_notes(
-                                stems["drums"], ssr, mapping=dmap,
-                                sensitivity=dsens, log=cb)
-                        else:
-                            lo, hi = core.STEM_MIDI_RANGE.get(nm, (40.0, 2000.0))
-                            midi[nm] = core.stem_to_midi_notes(
-                                stems[nm], ssr, min_freq=lo, max_freq=hi,
-                                min_note_ms=min_ms,
-                                label=core.STEM_LABELS.get(nm, nm), log=cb)
-                    except Exception as ex:
-                        self._stem_log(log, f"{nm}→MIDI übersprungen: {ex}")
-                out["midi_notes"] = midi
-                out["deluge_tune"] = {
-                    "stems": stems, "sr": ssr,
-                    "midi": {n: midi[n] for n in dcfg["instruments"] if midi.get(n)},
-                    "bpm": dbpm, "instruments": list(dcfg["instruments"]),
-                    "lead": int(dcfg.get("lead", 2)), "title": title}
-                self._stem_log(log, "Bereit – das Probehör-/Tuning-Fenster öffnet sich.")
+                out["part_editor"] = self._prepare_part_editor(
+                    stems, ssr, title, log, cb, bpm_hint=dbpm)
                 step += 1                          # Deluge-Vorbereitung fertig
             # Stem-Player oeffnen, wenn Abspielen ODER Stems-MIDI gewaehlt ist
             # (die MIDI-Spuren laufen synchron zur Stem-Position mit).
@@ -4631,15 +5959,17 @@ class DisplayApp:
                 if out.get("sheet"):
                     self._open_sheet_window(out["sheet"], player=player)
                     msgs.append("Song-Sheet erstellt")
-                # Deluge: nach der Trennung den Probehör-/Tuning-Dialog oeffnen
-                # (Stems + Click probehoeren, Downbeat per ◀/▶ setzen, dann speichern).
-                dt = out.get("deluge_tune")
-                if dt:
-                    msgs.append("Deluge-Tuning offen")
-                    self._deluge_tune_dialog(dt["stems"], dt["sr"], dt["midi"],
-                                             dt["bpm"], dt["instruments"],
-                                             lead=int(dt.get("lead", 2)),
-                                             title=dt.get("title", "AudioWizard"))
+                # Deluge: direkt in den Part-Editor (Wellenform, Marker, Loops);
+                # Spur-/MIDI-Auswahl und Speicherpfad kommen dort beim Export.
+                pe = out.get("part_editor")
+                if pe:
+                    msgs.append("Part-Editor offen")
+                    self._open_part_editor(
+                        self.root, pe["stems"], pe["sr"], pe["bpm"], pe["t_db"],
+                        None, list(pe["stems"].keys()),
+                        pe.get("title", "AudioWizard"),
+                        gridlock=pe.get("gridlock", "groove"),
+                        orig=pe.get("orig"), db_orig=pe.get("db_orig"))
                 if msgs:
                     self.err_label.config(text="Fertig: " + ", ".join(msgs))
                 # MIDI-Clock (nur Datei) erst jetzt starten, nach der Verarbeitung

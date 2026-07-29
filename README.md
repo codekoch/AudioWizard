@@ -44,6 +44,7 @@ Eingänge; unter macOS leistet das ein virtuelles Ausgabegerät wie
 | **MIDI-Datei laden** | Eine `.mid` spurweise (an/aus + Kanal) über den MIDI-Ausgang abspielen. |
 | **Deluge-Song (Bundle)** | Synthstrom-Deluge-Songdatei (`.XML`) aus **Stems + MIDI**: ausgerichtete Audio-Spuren parallel zu internen Synths/Kit, gemeinsam **aufs Taktraster gezogen** (driftfrei, Groove erhalten). |
 | **Deluge-Song (Parts)** | Erkannte **Song-Abschnitte** (Strophe/Refrain/Instrumental, Labels 1a/2b …) als **launchbare Deluge-Sections**: je Abschnitt Audio-Clip + MIDI-Clip, loopbar, farblich nach Stem; Struktur optional per **Online-Referenz** (Lyrics-Blöcke) abgesichert. |
+| **Part-Editor** | **Audio-Editor-Oberfläche**: Parts per Start-/End-Marker selbst in der **Wellenform** setzen (Marker einzeln greifbar, Loop längentreu verschiebbar, auch per Zeitangabe millisekundengenau), jeden Part **nahtlos als Loop vorhören**, Spuren einzeln zu-/abschalten, **zoomen/scrollen**. **Tempo aus dem Loop bestimmen** („das sind 4 Takte") statt sich auf die Schätzung zu verlassen – daraus dann der Deluge-Song mit Audio- und MIDI-Parts. Lädt auch **mehrere fertige Audiodateien** als Spuren. |
 | **DJ-Modus** | Zwei Decks, Equal-Power-Crossfade; die Clock folgt dem Ziel-Deck. |
 | **Aufnahme** | Live-Signal mitschneiden und als Datei(en) speichern. |
 
@@ -83,11 +84,22 @@ siehe [Webversion](#webversion-browser).
 - **Schlagzeug → MIDI:** im Stem-Player **„Schlagzeug…"** → je Komponente Note wählen
   (Default GM-Drum-Map, Kanal 10), **Empfindlichkeit** justieren → **Anwenden**.
 - **Datei als MIDI-Clock:** **Datei …** → nur **MIDI-Clock-Ausgabe** → **▶ Start / ■ Stopp**.
-- **Deluge-Song (Bundle) bauen:** **Datei …** (oder nach einer **Aufnahme** → **Weiter**)
-  → **Deluge-Song erstellen** anhaken, **Instrumente** + **Vorlauf-Takte** + **Taktraster**
-  (z. B. **„Groove"**) wählen → **Los**. Nach der Trennung öffnet sich das **Tuning-Fenster**:
-  **„▶ Probehören"**, die Takt-1 per **◀/▶** auf den Click ziehen, dann **„Bundle speichern…"**
-  – oder **„Parts speichern…"** für launchbare **Song-Abschnitte** (Strophe/Refrain/…).
+- **Deluge-Song bauen:** **Datei …** (oder nach einer **Aufnahme** → **Weiter**)
+  → **Deluge-Song erstellen** anhaken. Einzige Vorab-Frage: **Instrumentspuren
+  trennen?** Ohne Häkchen geht es **sofort** weiter (Gesamtmix als eine Spur),
+  mit Häkchen laufen erst Demucs und dann derselbe Weg. Danach öffnet sich
+  direkt der **Part-Editor**: Takt-1 prüfen, Abschnitte in der Wellenform
+  markieren, als **Loop** anhören, **„Deluge-Song speichern…"** → dort wählen,
+  welche Spuren als **Audio** und welche als **MIDI** hineinkommen.
+  Tipp: Stimmt das erkannte Tempo nicht, einen Loop über eine klare Phrase
+  legen, die Taktzahl eintragen und **„⟲ Tempo aus Auswahl"** drücken – dann
+  richtet sich das Raster nach der Musik statt umgekehrt.
+- **Vorhandene Stems weiterverwenden:** Einstellungen → **„Spuren → Part-Editor …"**
+  → mehrere Audiodateien wählen (z. B. `Song_bass.wav`, `Song_drums.wav`, …) →
+  sie erscheinen als eigene Spuren im Editor, ohne erneute Trennung.
+- **Deluge-Bundle (1 Stück statt Parts):** im **Stem-Player** → **„Deluge-Song…"**
+  → Tuning-Fenster mit **„▶ Probehören"**, Takt-1 per **◀/▶**, dann
+  **„Bundle speichern…"**.
   Die `.XML` in den **SONGS**-Ordner, die Stem-WAVs nach **`SAMPLES/AudioWizard/`** auf die SD.
 - **MIDI-Ausgang prüfen:** Einstellungen → **▶ MIDI-Ausgang testen** (Dreiklang hörbar?).
 
@@ -192,6 +204,15 @@ siehe [Webversion](#webversion-browser).
   (Test-Time-Augmentation) – hörbar saubere Bass-/Drum-Stems, aber **~4–8× langsamer**
   und beim ersten Mal **~1 GB Modell-Download**. **„Maximum+"** verdoppelt den
   Shift-Trick (`shifts=2`) – noch etwas sauberer, nochmal deutlich langsamer.
+  **Was die Stufen wirklich kosten:** `htdemucs_ft` ist kein einzelnes Modell,
+  sondern ein **Verbund aus vier** – schon das ist 4× die Rechenzeit; der
+  Shift-Trick multipliziert nochmal mit `1+shifts`. **„Maximum+"** landet damit
+  bei **12 Durchläufen** (auf CPU gut **40 Minuten für 4 Minuten Audio**),
+  **„Hoch"** braucht **einen**. Vor jedem Lauf steht deshalb eine
+  **Dauer-Schätzung** im Log-Fenster, inklusive Hinweis, wie viel schneller
+  „Hoch" wäre. Wer die Einzelspuren gar nicht braucht (z. B. für einen
+  Deluge-Song aus dem Gesamtmix), lässt die Trennung einfach weg – dann
+  entfällt die Wartezeit komplett.
   **„Ultra"** nutzt die **2026-SOTA-Modelle (Mel-Band-RoFormer)** als **Kaskade**:
   RoFormer entfernt zuerst den Gesang in Top-Qualität, dann trennt Demucs das
   **vokalfreie** Instrumental in Drums/Bass/Rest (am deutlichsten **sauberere
@@ -390,6 +411,97 @@ siehe [Webversion](#webversion-browser).
   `…_02_2a_bass.wav`). Parts brauchen ein Taktraster; steht es auf **„Aus"**, nutzt der
   Parts-Export intern **Groove**, damit die Teile loopbar bleiben. Wie beim Bundle:
   `.XML` nach **SONGS/**, die Abschnitts-WAVs nach **`SAMPLES/AudioWizard/`** auf die SD.
+- **Part-Editor (der Weg zum Deluge-Song)** – nach **„Deluge-Song erstellen"**
+  landet man direkt hier: eine **Audio-Editor-Oberfläche mit Wellenform**, in der
+  die Parts entstehen. **Vorab wird nur eine Frage gestellt** – ob die
+  Instrumentspuren getrennt werden sollen. Ohne Trennung öffnet sich der Editor
+  **sofort** mit dem Gesamtmix als einziger Spur (keine Wartezeit); mit Trennung
+  stehen zusätzlich Drums/Bass/Rest/Gesang zur Verfügung. Angezeigt werden der
+  **Gesamtmix** und darunter **jede vorhandene Spur einzeln**; ein Häkchen je
+  Spur schaltet sie **sichtbar und hörbar** – so lässt sich z. B. nur am
+  Schlagzeug hören und sehen, wo ein Teil wirklich beginnt. Die **Mix-Zeile
+  zeigt dabei genau die aktiven Spuren** (Beschriftung „Mix (3 von 4 Spuren)"),
+  ist also immer das Bild dessen, was gerade zu hören ist. **Bedienung:** mit gedrückter
+  Maustaste einen Bereich in der Wellenform ziehen (die Marker **fangen auf
+  ganze Takte**, wahlweise Beats oder frei). Anschließend lässt sich der
+  **linke und der rechte Marker einzeln greifen** (der jeweils andere bleibt
+  stehen) und der **ganze Loop-Bereich in der Mitte anfassen und
+  längentreu verschieben** – der Mauszeiger zeigt an, was gerade passieren
+  würde. Alternativ stehen die Marker als **Zeitangabe** in drei Feldern
+  (Start / Ende / Länge): Eingaben sind **tolerant** (`83`, `83,4`, `1:23.456`,
+  `1:02:03.5`) und **millisekundengenau**; wird die Länge geändert, folgt das
+  Ende dem Start. Ein viertes Feld zeigt die Länge in **Takten** – glatte Werte
+  als `4`, krumme als `4.4`, sodass man sofort sieht, ob die Auswahl aufs Raster
+  passt; eine Eingabe dort setzt die Länge **exakt auf ganze Takte**. Neben jedem
+  Feld schieben **−/+** den Wert um den kleinsten Schritt (**1 ms**, beim
+  Takte-Feld **1 Takt**) – gedrückt halten läuft schnell durch.
+  Mit **„▶ Auswahl loopen"** den
+  Bereich **nahtlos in Schleife** anhören – gespielt wird **exakt** die
+  eingestellte Auswahl, so hört man sofort, ob der Part als
+  Loop trägt. Am Loop-Ende liegt eine kurze **Kreuzblende** (12 ms, wie beim
+  Deluge-Clip selbst), sonst knackt jede Wiederholung an der Naht. Der
+  **laufende Loop folgt den Markern in Echtzeit**: Ziehen,
+  Zeiteingabe oder −/+ wirken sofort, ohne Stoppen und Neustarten (liegt die
+  Abspielposition außerhalb, springt sie in den neuen Bereich) – und ihn dann
+  mit **„➕ Part aus Auswahl"** übernehmen. Der Part ist dann **genau der
+  markierte Bereich**, nicht eine auf Takte gerundete Version davon.
+  Zoomen per
+  **🔍−/🔍+** – ist ein Loop markiert, **bleibt dessen Mitte in der Bildmitte**,
+  man zoomt also immer auf die Stelle, an der man gerade arbeitet; **„Auswahl"**
+  legt die Ansicht in einem Schritt genau auf den Loop, **„Alles"** zeigt den
+  ganzen Song. **Strg+Mausrad** zoomt am Zeiger (dort bleibt der Punkt unter der
+  Maus stehen), Mausrad und Bildlaufleiste scrollen; ein **Taktlineal** mit
+  Taktnummern läuft über die ganze Breite.
+  Definierte Parts erscheinen als farbige Blöcke im Band über der Wellenform und
+  in einer Liste (Klick = auswählen, Doppelklick = loopen) und lassen sich
+  **umbenennen** oder löschen. **Gleiche Namen bedeuten denselben Typ** (z. B.
+  *1a* und *1b* für zwei Strophen) – sie bekommen dieselbe Farbe, im Editor wie
+  später auf der Deluge. **„Automatisch vorschlagen"** füllt die Liste mit der
+  erkannten Struktur als Startpunkt, die man dann nur noch nachjustiert.
+
+  **Das Tempo aus dem Loop bestimmen (⟲ Tempo aus Auswahl).** Die automatische
+  BPM-Schätzung kann daneben liegen – dann passt kein Part sauber aufs Raster.
+  Der musikalisch sichere Weg geht deshalb umgekehrt: einen Bereich markieren,
+  der eine klare Phrase umfasst (Anfang und Ende auf der Eins), im Feld
+  **„Takte"** eintragen, wie viele Takte das sind, und **„⟲ Tempo aus Auswahl"**
+  drücken. Daraus werden **Tempo und Taktraster berechnet** (Takt-1 rutscht auf
+  den Loop-Start), die Schätzung wird überstimmt, und weil das Raster für den
+  ganzen Song gilt, fallen **alle weiteren Parts im selben Puls glatt aus**.
+  Beispiel: 9,142 s für 4 Takte ergibt **105,01 BPM** statt geschätzter 114,4 –
+  dieses Tempo landet auch im Deluge-Song. Unplausible Angaben werden abgelehnt.
+  Passt die Länge eines Parts nicht auf ganze Takte, markieren Liste und
+  Statuszeile das mit **⚠** und nennen die Abweichung – denn der Deluge-Clip muss
+  taktlang sein, um im Songtempo zu laufen.
+
+  **Takt-1** lässt sich per **◀/▶** beatweise verschieben (am besten vor dem
+  Setzen der Parts – sie hängen am Raster). Das **Taktraster**
+  (Aus/Takt-1/Groove/Pro Beat) ist im Editor umschaltbar, steht aber
+  standardmäßig auf **„Aus (Original)"**: Jede andere Stufe zieht das Audio durch
+  einen **Phase-Vocoder** und verändert damit hörbar den Klang – bei produzierten
+  Stücken mit konstantem Tempo völlig unnötig. Wer es braucht (driftende
+  Live-Mitschnitte), schaltet es bewusst ein; der Editor meldet dann deutlich,
+  dass gedehnt wurde, zeigt währenddessen groß an, dass gerechnet wird, und setzt
+  die Parts zurück, weil deren Zeiten danach nicht mehr stimmen.
+  **„Deluge-Song speichern…"** fragt zuerst, **was hinein soll**: je Spur ein
+  Häkchen für **Audio** und eines für **MIDI**. Die **MIDI-Noten werden erst
+  jetzt erkannt** – aus genau den gewählten Spuren und direkt in der
+  Export-Zeitbasis (tonale Spuren per Basic Pitch, Drums per Onset-Erkennung
+  zum 808-Kit). Man wartet also nie auf eine Notenerkennung für Spuren, die man
+  gar nicht braucht; hat man nur den Gesamtmix, wird dieser verwendet.
+  Geschnitten wird **exakt am markierten Startpunkt** (nicht auf die nächste
+  Taktlinie gerundet); nur die **Länge** ist taktgenau, damit der Clip im
+  Songtempo läuft. Nach dem Speichern kommt eine **Rückmeldung mit
+  Zusammenfassung**. Hinweis: Die Deluge kennt
+  **12 Sections**; werden mehr Parts angelegt, landen die weiteren in der letzten.
+  **Fertige Spuren direkt laden:** Einstellungen → **„Spuren → Part-Editor …"**
+  öffnet den Editor mit **beliebig vielen vorhandenen Audiodateien** – z. B. den
+  schon einmal exportierten Stems eines Songs, ohne erneute KI-Trennung. Die
+  Dateien erscheinen **untereinander mit Namen** und lassen sich einzeln
+  zu-/abschalten; unterschiedliche Sampleraten und Längen werden dabei
+  angeglichen. Enthält ein Dateiname einen bekannten Spurbegriff (`…_bass.wav`,
+  `…_drums.wav`, `…_vocals.wav`, `…_other.wav`), wird die Datei automatisch
+  dieser Spur zugeordnet – dann stimmen Farbe, Frequenzbereich der
+  MIDI-Erkennung und der Spurname im Deluge-Song.
 - **Song-Sheet (Text + Akkorde)** (optional) – aus einer Datei entsteht ein
   **Chord-Sheet wie bei Ultimate Guitar**: die Akkorde stehen über den jeweiligen
   Wörtern des gesungenen Textes. Ablauf komplett **lokal/offline**: Demucs trennt
