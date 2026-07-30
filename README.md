@@ -44,7 +44,8 @@ Eingänge; unter macOS leistet das ein virtuelles Ausgabegerät wie
 | **MIDI-Datei laden** | Eine `.mid` spurweise (an/aus + Kanal) über den MIDI-Ausgang abspielen. |
 | **Deluge-Song (Bundle)** | Synthstrom-Deluge-Songdatei (`.XML`) aus **Stems + MIDI**: ausgerichtete Audio-Spuren parallel zu internen Synths/Kit, gemeinsam **aufs Taktraster gezogen** (driftfrei, Groove erhalten). |
 | **Deluge-Song (Parts)** | Erkannte **Song-Abschnitte** (Strophe/Refrain/Instrumental, Labels 1a/2b …) als **launchbare Deluge-Sections**: je Abschnitt Audio-Clip + MIDI-Clip, loopbar, farblich nach Stem; Struktur optional per **Online-Referenz** (Lyrics-Blöcke) abgesichert. |
-| **Part-Editor** | **Audio-Editor-Oberfläche**: Parts per Start-/End-Marker selbst in der **Wellenform** setzen (Marker einzeln greifbar, Loop längentreu verschiebbar, auch per Zeitangabe millisekundengenau), jeden Part **nahtlos als Loop vorhören**, Spuren einzeln zu-/abschalten, **zoomen/scrollen**. **Tempo aus dem Loop bestimmen** („das sind 4 Takte") statt sich auf die Schätzung zu verlassen – daraus dann der Deluge-Song mit Audio- und MIDI-Parts. Lädt auch **mehrere fertige Audiodateien** als Spuren. |
+| **Mashup (bis 4 Songs)** | Im Part-Editor mehrere Songs hinter **Reitern** (beim Laden optional gleich **KI-getrennt**): ein wählbarer **Tempo-Master** gibt den Takt vor, bei den anderen gibt man nur die **Taktzahl** des Loops an – der Bereich wird automatisch gedehnt (Tonhöhe halten oder mitgehen). Alle Loops lassen sich **parallel hören** und dabei einzeln nachjustieren; ein Part **kombiniert Spuren mehrerer Songs** – z. B. Drums ← Song 1, Bass ← Song 2, Gesang ← Song 4. |
+| **Part-Editor** | **Audio-Editor-Oberfläche**: Parts per Start-/End-Marker selbst in der **Wellenform** setzen (Marker einzeln greifbar, Loop längentreu verschiebbar, auch per Zeitangabe millisekundengenau), jeden Part **nahtlos als Loop vorhören** – optional mit **regelbarem Metronom** (Takt-1 betont) –, Spuren einzeln zu-/abschalten, **zoomen/scrollen**. **Tempo aus dem Loop bestimmen** („das sind 4 Takte") statt sich auf die Schätzung zu verlassen – daraus dann der Deluge-Song mit Audio- und MIDI-Parts. Lädt auch **mehrere fertige Audiodateien** als Spuren. |
 | **DJ-Modus** | Zwei Decks, Equal-Power-Crossfade; die Clock folgt dem Ziel-Deck. |
 | **Aufnahme** | Live-Signal mitschneiden und als Datei(en) speichern. |
 
@@ -97,6 +98,12 @@ siehe [Webversion](#webversion-browser).
 - **Vorhandene Stems weiterverwenden:** Einstellungen → **„Spuren → Part-Editor …"**
   → mehrere Audiodateien wählen (z. B. `Song_bass.wav`, `Song_drums.wav`, …) →
   sie erscheinen als eigene Spuren im Editor, ohne erneute Trennung.
+- **Mashup aus mehreren Songs:** im Part-Editor **„+ Song laden…"** (Reiterleiste)
+  → im Dialog wählen, ob die Instrumente **getrennt** werden sollen → im neuen
+  Song einen Loop markieren und **„Takte"** eintragen (der Bereich wird
+  automatisch aufs Tempo von Song 1 gedehnt) → **„▶ Alle Songs parallel"** zum
+  Prüfen (Reiterwechsel und Marker-Korrekturen laufen dabei weiter) →
+  **„➕ Part aus ALLEN Songs"** → **„Deluge-Song speichern…"**.
 - **Deluge-Bundle (1 Stück statt Parts):** im **Stem-Player** → **„Deluge-Song…"**
   → Tuning-Fenster mit **„▶ Probehören"**, Takt-1 per **◀/▶**, dann
   **„Bundle speichern…"**.
@@ -439,7 +446,14 @@ siehe [Webversion](#webversion-browser).
   Bereich **nahtlos in Schleife** anhören – gespielt wird **exakt** die
   eingestellte Auswahl, so hört man sofort, ob der Part als
   Loop trägt. Am Loop-Ende liegt eine kurze **Kreuzblende** (12 ms, wie beim
-  Deluge-Clip selbst), sonst knackt jede Wiederholung an der Naht. Der
+  Deluge-Clip selbst), sonst knackt jede Wiederholung an der Naht.
+  Zum Beurteilen des Beats lässt sich ein **Metronom** dazumischen
+  (**„🥁 Click"** + Regler, stufenlos von 0 bis 100 %): Klick auf jedem Schlag,
+  die **Takt-1 deutlich betont** (höherer, lauterer Ton). Läuft der Klick
+  synchron zur Musik, sitzt der Loop im Tempo – driftet er auseinander, stimmt
+  das Raster oder die Loop-Länge nicht. Der Klick folgt Tempo- und
+  Downbeat-Änderungen sofort, und **◀/▶** verschiebt, welcher Schlag die
+  betonte Eins ist. Der
   **laufende Loop folgt den Markern in Echtzeit**: Ziehen,
   Zeiteingabe oder −/+ wirken sofort, ohne Stoppen und Neustarten (liegt die
   Abspielposition außerhalb, springt sie in den neuen Bereich) – und ihn dann
@@ -493,6 +507,61 @@ siehe [Webversion](#webversion-browser).
   Songtempo läuft. Nach dem Speichern kommt eine **Rückmeldung mit
   Zusammenfassung**. Hinweis: Die Deluge kennt
   **12 Sections**; werden mehr Parts angelegt, landen die weiteren in der letzten.
+  **Mashup aus bis zu vier Songs.** Über die **Reiterleiste** oben lassen sich
+  weitere Songs dazuladen (**„+ Song laden…"**). Beim Laden fragt ein Dialog,
+  ob die Datei **direkt als Spur(en)** übernommen wird (mehrere Dateien =
+  mehrere Spuren, z. B. schon exportierte Stems) oder ob **die Instrumente erst
+  getrennt** werden sollen (KI: Drums · Bass · Vocals · Rest) – Letzteres
+  braucht man, wenn aus diesem Song nur *ein* Instrument ins Mashup soll. Die
+  **Trennqualität** ist im selben Dialog wählbar, mit **Dauerschätzung** für
+  genau diese Datei; der Fortschritt läuft in einem eigenen Fenster. Jeder Song
+  liegt hinter seinem Reiter und behält eigenes Tempo, Taktraster, Downbeat,
+  Auswahl und Ansicht – der aktive Song füllt dabei die ganze Wellenform-Fläche,
+  sodass die Bedienung dieselbe bleibt.
+
+  **Das Tempo gibt ein Song vor – standardmäßig der erste.** Bei allen weiteren
+  Songs trägt man nur ein, um **wie viele Takte** es sich beim markierten Loop
+  handelt – der Bereich wird daraufhin automatisch **gestreckt oder gestaucht**.
+  Die Statuszeile zeigt sofort das errechnete Tempo und den Faktor (z. B.
+  *10 s = 4 Takte → 96 BPM → ×0.8000*), der Reiter trägt ihn mit. Verschiebt man
+  den Loop oder zieht ihn länger, bleibt die Taktzahl stehen und der Faktor
+  zieht nach – man sucht also frei die Stelle, die passt. Beim **ersten Loop**
+  eines neuen Songs wird so viele Takte angenommen, wie der Loop des
+  Tempo-Masters hat (meist sucht man denselben Ausschnitt); damit **sitzt auch
+  das Metronom sofort richtig**. Dass es nur eine Annahme ist, steht in der
+  Statuszeile, bis man sie mit „Übernehmen" bestätigt oder korrigiert.
+  Welcher Song den Takt vorgibt, ist **umwählbar**: Reiter anwählen →
+  **„⏱ Dieser Song gibt das Tempo vor"**; die Faktoren aller anderen rechnen
+  sich sofort neu. Pro Song ist wählbar, **wie** gedehnt wird:
+  **„Tonhöhe halten"** (Phase-Vocoder, Standard) oder **„Tonhöhe mit"**
+  (Resampling wie Bandgeschwindigkeit – artefaktfrei, aber die Tonart wandert).
+
+  **Alle Loops parallel hören.** **„▶ Alle Songs parallel"** spielt die
+  markierten Loops **aller** Songs gleichzeitig im Zieltempo – jeweils nur mit
+  den angehakten Spuren. Währenddessen kann man die **Reiter wechseln und den
+  Loop jedes Songs einzeln verschieben**: die Vorschau übernimmt die Änderung
+  automatisch und – solange Spuren und Länge gleich bleiben – **ohne
+  Unterbrechung**. So sucht man den passenden Ausschnitt im laufenden Mix
+  statt im Blindflug.
+
+  **Ein Part kombiniert Spuren aus mehreren Songs.** **„➕ Part aus ALLEN
+  Songs"** macht daraus mit einem Klick einen Part: aus jedem Song der gerade
+  markierte Loop mit seinen aktiven Spuren. Wer einzeln vorgehen will, nimmt
+  **„➕ neuer Part"** (aktueller Song) und ergänzt später mit **„＋ zu Part"**
+  weitere Quellen. So entsteht z. B. *Drums ← Song 1, Bass ← Song 2,
+  Gitarre ← Song 3, Gesang ← Song 4*. Alle Quellen eines Parts müssen dieselbe
+  **Taktzahl** haben (sonst nennt die Meldung genau die Songs, die abweichen).
+  **„▶ Part hören"** spielt die **fertige Kombination im Zieltempo** in
+  Schleife – alle Quellen werden dafür gedehnt und gemischt, man beurteilt das
+  Mashup also, bevor etwas geschrieben wird. Beim Export wird je Part und
+  Quellspur ein Clip in derselben **Deluge-Section** angelegt (Spuren heißen
+  z. B. *2. Bass*), sodass ein Launch der Section das Mashup startet.
+
+  **Fenster:** Der Editor lässt sich mit **„⛶ Vollbild"**, **F11** oder einem
+  **Doppelklick auf den Titel** maximieren – die Wellenform bekommt dann den
+  ganzen Bildschirm (ein Werkzeugfenster hat unter Windows keinen eigenen
+  Maximieren-Knopf im Rahmen).
+
   **Fertige Spuren direkt laden:** Einstellungen → **„Spuren → Part-Editor …"**
   öffnet den Editor mit **beliebig vielen vorhandenen Audiodateien** – z. B. den
   schon einmal exportierten Stems eines Songs, ohne erneute KI-Trennung. Die

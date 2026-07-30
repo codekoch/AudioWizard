@@ -3186,6 +3186,35 @@ def load_audio_tracks(paths, sr=None, log=None):
     return {k: out[k] for k in order}, int(target)
 
 
+def resample_tracks(tracks, src_sr, dst_sr, log=None):
+    """Alle Spuren eines dicts auf eine andere Samplerate bringen und auf
+    gleiche Laenge polstern. Gebraucht im Mashup: die KI-Trennung liefert
+    44,1 kHz, der Part-Editor arbeitet aber mit der Rate des ERSTEN Songs --
+    nur dann lassen sich die Spuren synchron mischen."""
+    src_sr, dst_sr = int(src_sr), int(dst_sr)
+    out = {}
+    if src_sr == dst_sr:
+        out = {k: np.asarray(a, dtype=np.float32) for k, a in tracks.items()}
+    else:
+        import librosa
+        _emit(log, f"Samplerate anpassen: {src_sr} Hz → {dst_sr} Hz")
+        for k, a in tracks.items():
+            a = np.asarray(a, dtype=np.float32)
+            if a.ndim == 2:
+                a = a.mean(axis=1)
+            out[k] = np.ascontiguousarray(
+                librosa.resample(np.ascontiguousarray(a), orig_sr=src_sr,
+                                 target_sr=dst_sr), dtype=np.float32)
+    n = max((len(a) for a in out.values()), default=0)
+    for k, a in out.items():
+        if a.ndim == 2:
+            out[k] = a.mean(axis=1)
+        if len(out[k]) < n:
+            out[k] = np.concatenate(
+                [out[k], np.zeros(n - len(out[k]), dtype=np.float32)])
+    return out
+
+
 def separation_eta(source, backend="demucs", model="htdemucs", shifts=0):
     """Grobe VORAB-Schaetzung der Trenn-Dauer als Text. Die teuren Stufen sind
     nicht offensichtlich teuer: 'htdemucs_ft' ist ein Verbund aus VIER Modellen
@@ -5460,6 +5489,42 @@ def song_sheet(path, model="htdemucs", whisper_size="medium", language=None,
                                  language=language, log=log, online=online)
 
 
+def stretch_audio(audio, sr, factor, mode="pitch", log=None):
+    """Einen Ausschnitt zeitlich dehnen/stauchen -- fuer Mashups, wenn ein Loop
+    aus einem anderen Song aufs Zieltempo gebracht werden muss.
+
+    factor = Ziel-Dauer / Quell-Dauer  (>1 laenger/langsamer, <1 kuerzer/schneller)
+    mode:
+      'pitch' = TONHOEHE BLEIBT (Phase-Vocoder). Standard fuers Tempo-Anpassen;
+                bei mehr als ~15 % werden Drums hoerbar weicher.
+      'speed' = wie Bandgeschwindigkeit: reines Resampling, artefaktfrei, aber
+                die Tonhoehe (und damit die Tonart) wandert mit.
+    Rueckgabe: Array in derselben Kanalform wie die Eingabe."""
+    import librosa
+    a = np.asarray(audio, dtype=np.float32)
+    factor = float(factor)
+    if a.size == 0 or abs(factor - 1.0) < 1e-4:
+        return a.copy()
+    n_out = max(1, int(round(a.shape[0] * factor)))
+    if a.ndim == 1:
+        chans = [a]
+    else:
+        chans = [np.ascontiguousarray(a[:, c]) for c in range(a.shape[1])]
+    out = []
+    for ch in chans:
+        if mode == "speed":
+            # Resampling: die Abspielrate aendert sich -> Tonhoehe geht mit
+            y = librosa.resample(ch, orig_sr=sr, target_sr=int(round(sr / factor)))
+        else:
+            # librosa.effects.time_stretch: rate>1 = schneller (kuerzer)
+            y = librosa.effects.time_stretch(ch, rate=1.0 / factor)
+        if len(y) < n_out:                 # exakt auf die Ziellaenge bringen
+            y = np.concatenate([y, np.zeros(n_out - len(y), dtype=np.float32)])
+        out.append(y[:n_out].astype(np.float32))
+    _emit(log, f"  gedehnt x{factor:.4f} ({mode}) -> {n_out / sr:.3f} s")
+    return out[0] if a.ndim == 1 else np.ascontiguousarray(np.stack(out, axis=1))
+
+
 def waveform_peaks(audio, block=64):
     """Peak-Pyramide fuer die Wellenform-Anzeige: Min/Max je BLOCK Samples
     (mono gemittelt). Einmal vorberechnet laesst sich daraus JEDER Zoom-
@@ -5539,6 +5604,7 @@ class StemPlayer:
         self.loop = None                  # (start, ende) in Samples oder None
         self.loop_tail = None             # ueberblendetes Loop-Ende je Spur
         self.loop_nx = 0                  # Laenge dieser Kreuzblende (Samples)
+        self._xfade_n = int(0.012 * self.sr)   # gewuenschte Blenden-Laenge
         self.lock = threading.Lock()
 
     def _callback(self, outdata, frames, time_info, status):
@@ -5578,6 +5644,48 @@ class StemPlayer:
                     off += n
             outdata[:] = out
 
+    def _prep(self, audio):
+        """Ein Array auf Form und Kanalzahl dieses Players bringen."""
+        a = np.asarray(audio, dtype=np.float32)
+        if a.ndim == 1:
+            a = a.reshape(-1, 1)
+        if a.shape[1] == 1 and self.channels == 2:
+            a = np.repeat(a, 2, axis=1)
+        elif a.shape[1] > self.channels:
+            a = a[:, :self.channels]
+        return np.ascontiguousarray(a, dtype=np.float32)
+
+    def replace_stem(self, k, audio):
+        """Eine Spur im LAUFENDEN Betrieb austauschen -- gedacht fuer eine
+        Klickspur, die nach einem Tempo-/Downbeat-Wechsel neu erzeugt wird.
+        Die Laenge wird auf die bisherige getrimmt bzw. mit Stille aufgefuellt,
+        damit Position und Loop weiter passen."""
+        a = self._prep(audio)
+        with self.lock:
+            if not (0 <= k < len(self.stems)):
+                return
+            n = self.stems[k].shape[0]
+            if a.shape[0] < n:
+                a = np.concatenate(
+                    [a, np.zeros((n - a.shape[0], self.channels),
+                                 dtype=np.float32)], 0)
+            self.stems[k] = np.ascontiguousarray(a[:n])
+            self._build_tail()             # Kreuzblende enthaelt altes Material
+
+    def _build_tail(self):
+        """Kreuzblende am Loop-Ende (neu) berechnen. Aufrufer haelt den Lock."""
+        self.loop_tail, self.loop_nx = None, 0
+        if not self.loop:
+            return
+        a, b = self.loop
+        nx = int(min(self._xfade_n, (b - a) // 4, a))
+        if nx < 32:
+            return
+        f = np.linspace(0.0, 1.0, nx, dtype=np.float32).reshape(-1, 1)
+        self.loop_tail = [(arr[b - nx:b] * (1.0 - f) + arr[a - nx:a] * f)
+                          for arr in self.stems]
+        self.loop_nx = nx
+
     def set_loop(self, start_sec=None, end_sec=None, xfade_ms=12.0):
         """Loop-Bereich in Sekunden setzen (None/leer = Loop aus). Laeuft die
         Wiedergabe ausserhalb, springt sie beim naechsten Block hinein.
@@ -5589,6 +5697,7 @@ class StemPlayer:
         ist. Nur das Loop-ENDE wird angefasst, der Anfang bleibt original."""
         with self.lock:
             self.loop_tail, self.loop_nx = None, 0
+            self._xfade_n = int(max(0.0, float(xfade_ms)) / 1000.0 * self.sr)
             if start_sec is None or end_sec is None:
                 self.loop = None
                 return
@@ -5598,14 +5707,7 @@ class StemPlayer:
                 self.loop = None
                 return
             self.loop = (a, b)
-            nx = int(max(0.0, float(xfade_ms)) / 1000.0 * self.sr)
-            nx = int(min(nx, (b - a) // 4, a))     # nur mit Vorlauf moeglich
-            if nx < 32:
-                return
-            f = np.linspace(0.0, 1.0, nx, dtype=np.float32).reshape(-1, 1)
-            self.loop_tail = [(arr[b - nx:b] * (1.0 - f) + arr[a - nx:a] * f)
-                              for arr in self.stems]
-            self.loop_nx = nx
+            self._build_tail()
 
     def start_stream(self):
         if sd is None:

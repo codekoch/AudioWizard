@@ -539,3 +539,95 @@ def write_deluge_parts(xml_path, warped_stems, sr, midi_notes, bpm, t_db, sectio
         log(f"Parts-Song: {len(valid)} Abschnitte ({labs}), {len(wavs)} Audio-Clips + "
             f"MIDI je Abschnitt. Stem-WAVs nach {sample_subdir} kopieren.")
     return xml_path, wavs
+
+
+def write_deluge_mashup(xml_path, clips, notes, sr, bpm, labels, bars,
+                        names=None, sample_subdir="SAMPLES/AudioWizard",
+                        log=None):
+    """Deluge-Song aus FERTIGEN Clips -- fuer Mashups aus mehreren Songs.
+
+    Anders als write_deluge_parts wird hier nichts mehr geschnitten oder
+    ausgerichtet: der Aufrufer (Part-Editor) liefert je Quellspur und Part ein
+    Audio-Stueck, das schon auf das Zieltempo gedehnt und taktgenau lang ist.
+    Damit laesst sich z. B. Drums aus Song 1 mit Bass aus Song 2 kombinieren.
+
+      clips  {spur_key: {part_index: audio}}   -- Audio-Clips
+      notes  {spur_key: {part_index: [(s,e,pitch,vel), ...]}} -- optional MIDI
+             (Zeiten RELATIV zum Part-Anfang)
+      labels [part_label, ...]   bars [takte_je_part, ...]
+      names  {spur_key: anzeigename}  (sonst wird der Key benutzt)
+    Rueckgabe (xml_path, [wav_paths], anzahl_midi_noten)."""
+    if sf is None:
+        raise RuntimeError("soundfile nicht verfuegbar (pip install soundfile)")
+    sr = int(sr)
+    bpm = float(bpm) if bpm and bpm > 0 else 120.0
+    bar_t = 4.0 * 60.0 / bpm
+    names = dict(names or {})
+    out_dir = os.path.dirname(xml_path) or "."
+    base = os.path.splitext(os.path.basename(xml_path))[0]
+    keys = list(clips.keys())
+    audio_tracks = [f"AUDIO_{names.get(k, k)}" for k in keys]
+    nxf = int(0.015 * sr)                     # kurze Loop-Kreuzblende
+    wavs, audio_clips = [], []
+    for pi, lab in enumerate(labels):
+        W = int(bars[pi])
+        sect = min(pi, 11)
+        col = _part_colour(lab)
+        for k in keys:
+            seg = (clips.get(k) or {}).get(pi)
+            if seg is None:
+                continue                      # diese Spur ist in dem Part nicht dabei
+            a = np.asarray(seg, dtype=np.float32)
+            if a.ndim == 1:
+                a = a[:, None]
+            # Clip ist schon genau W Takte lang -> nur die Naht weich machen
+            x = int(min(nxf, max(0, len(a) // 8)))
+            if x > 1:
+                f = np.linspace(1.0, 0.0, x, dtype=np.float32).reshape(
+                    (-1,) + (1,) * (a.ndim - 1))
+                a = a.copy()
+                a[len(a) - x:] *= f
+            nm = names.get(k, k)
+            wp = os.path.join(out_dir, f"{base}_{pi + 1:02d}_{lab}_{nm}.wav")
+            sf.write(wp, a, sr, subtype="PCM_16")
+            wavs.append(wp)
+            audio_clips.append(_audio_clip_xml(
+                f"AUDIO_{nm}", f"{sample_subdir.rstrip('/')}/{os.path.basename(wp)}",
+                len(a), W * TICKS_PER_BAR, section=sect, colour=col, label=lab))
+
+    # MIDI: je Spur EINE Spur, die Noten der Parts hintereinander gelegt
+    # (Part pi beginnt bei pi * bars-Summe der vorherigen Parts)
+    starts, acc = [], 0.0
+    for pi in range(len(labels)):
+        starts.append(acc)
+        acc += int(bars[pi]) * bar_t
+    synth_tracks, drum_track, n_notes = [], None, 0
+    for k in sorted(set(notes.keys())):
+        merged = []
+        for pi, nt in (notes.get(k) or {}).items():
+            off = starts[pi] if pi < len(starts) else 0.0
+            for (s0, e0, pitch, vel) in nt:
+                merged.append((off + float(s0), off + float(e0), int(pitch),
+                               int(vel)))
+        if not merged:
+            continue
+        merged.sort()
+        n_notes += len(merged)
+        if k.endswith(":drums"):
+            drum_track = {"notes": merged}
+        else:
+            synth_tracks.append({"name": names.get(k, k)[:14], "notes": merged})
+    section_ranges = []
+    for pi, lab in enumerate(labels):
+        lo = _sec_to_ticks(starts[pi], bpm)
+        hi = _sec_to_ticks(starts[pi] + int(bars[pi]) * bar_t, bpm)
+        section_ranges.append((lo, hi, int(bars[pi]) * TICKS_PER_BAR,
+                               min(pi, 11), _part_colour(lab), lab))
+
+    write_deluge_song(xml_path, bpm, synth_tracks=synth_tracks,
+                      drum_track=drum_track, audio_clips=audio_clips,
+                      audio_tracks=audio_tracks, section_ranges=section_ranges)
+    if log:
+        log(f"Mashup-Song: {len(labels)} Parts, {len(wavs)} Audio-Clips aus "
+            f"{len(keys)} Quellspur(en), {n_notes} MIDI-Noten, {bpm:.2f} BPM.")
+    return xml_path, wavs, n_notes
